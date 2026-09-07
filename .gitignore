@@ -1,0 +1,20 @@
+# 密钥——绝不上传
+Github_PAT.txt
+*.env
+.env*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# 节点
+node_modules/
+dist/
+
+# 系统/编辑器
+.DS_Store
+*.swp

@@ -24,8 +24,11 @@
   .item .nm{font-weight:600;font-size:15px}
   .item .dist{color:#6b7280;font-size:13px;margin-top:2px}
   .item .route{text-align:right;min-width:150px}
-  .item .route .t{font-weight:700;color:#0f766e;font-size:16px}
-  .item .route .d{color:#6b7280;font-size:13px}
+  .item .route{text-align:right;min-width:200px}
+  .mo{color:#6b7280;font-size:13px;padding:1px 0}
+  .mo b{color:#0f766e}
+  .mo-l{font-weight:600;color:#1f2937}
+  .mo-d{color:#6b7280;margin-left:6px}
   .empty{color:#6b7280;text-align:center;padding:20px 0}
   .tag{display:inline-block;background:#ccfbf1;color:#0f766e;font-size:12px;padding:2px 8px;border-radius:10px;margin-left:6px;font-weight:500}
   .spinner{display:none;text-align:center;color:#6b7280;padding:24px 0;font-size:14px}
@@ -61,7 +64,7 @@
   </div>
   <div class="spinner" id="spin"><span class="spin"></span>正在从免费数据源查询,公共源较慢,请稍候…(目的地检索可能需 10-30s; 较远分段可能更久)</div>
 </main>
-<footer>Where2Go 阶段0 POC · 数据:OpenStreetMap / OSRM(免费) · 驾车耗时为估算,仅供参考</footer>
+<footer>Where2Go 阶段0 POC · 数据:OpenStreetMap / OSRM(免费) · 驾车为 OSRM 估算;铁路(≥100km)/飞机(≥300km)为经验估算,均无实时班次,仅供参考</footer>
 <script>
 const $=id=>document.getElementById(id);
 $("go").onclick=async()=>{
@@ -86,12 +89,19 @@ function render(data){
   const list=$("list");
   if(!data.results.length){ list.innerHTML='<div class="empty">该范围/类别下暂无有名目的地,试试放宽距离</div>'; return; }
   list.innerHTML=data.results.map(p=>{
-    const rt=p.route
-      ? `<div class="t">驾车 ${p.route.duration_min} 分钟</div><div class="d">约 ${p.route.distance_km} km</div>`
-      : `<div class="d">驾车路线获取失败</div>`;
+    const modes=(p.modes||[]).map(m=>{
+      if(m.mode==='driving'){
+        const t=(m.duration_min!=null)?`驾车 <b>${m.duration_min}</b> 分钟`:'驾车 获取失败';
+        return `<div class="mo"><span class="mo-l">🚗 ${t}</span><span class="mo-d">${m.distance_km!=null?'约 '+m.distance_km+' km':'—'}</span></div>`;
+      }
+      const d=(m.duration_min!=null)?`${m.duration_min} 分钟`:'—';
+      const ic=m.mode==='rail'?'🚄':'✈️';
+      return `<div class="mo"><span class="mo-l">${ic} ${m.label} <b>${d}</b></span>`+
+        `<span class="mo-d">${m.distance_km!=null?'直线 '+m.distance_km+' km':'—'}</span></div>`;
+    }).join('');
     return `<div class="item"><div><div class="nm">${esc(p.name)}</div>`+
       `<div class="dist">距起点直线约 ${p.distance_km} km</div></div>`+
-      `<div class="route">${rt}</div></div>`;
+      `<div class="route">${modes}</div></div>`;
   }).join("");
 }
 function esc(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}

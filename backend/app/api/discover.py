@@ -1,8 +1,8 @@
-"""试用 API:发现周边目的地(环形距离分段,复用免费源)。"""
+"""试用 API:发现周边目的地(环形距离分段 + 多交通方式估算)。"""
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import time
-from typing import Any, Optional
+from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from data_sources import (
@@ -22,30 +22,53 @@ CATEGORIES: dict[str, dict[str, Any]] = {
               "label": "景点 / 观景点"},
 }
 
-# 环形分段(km):[low, high) —— 互斥,不含更低段。low 起自 50 以排除当前城市内。
-# "upper" 是 Overpass 检索半径上限(需覆盖整个分段)。
 DISTANCE_BANDS: list[dict[str, Any]] = [
     {"key": "50_100",  "label": "50-100 km",  "low": 50,  "high": 100},
     {"key": "100_200", "label": "100-200 km", "low": 100, "high": 200},
     {"key": "200_300", "label": "200-300 km", "low": 200, "high": 300},
     {"key": "300_500", "label": "300-500 km", "low": 300, "high": 500},
 ]
-FETCH_LIMIT = 400   # Overpass 多取,留出过滤余量
+FETCH_LIMIT = 400
 SHOW_TOP = 8
 
-# 简单进程内缓存:key = (城市, band_key, 类别) -> 过滤后的 POI 列表(带 distance_km)
+# 交通方式估算阈值(km,按 POI 直线距离)与经验系数 —— 无真实班次源,纯估算
+RAIL_MIN_KM = 100.0   # >= 触发铁路估算
+FLIGHT_MIN_KM = 300.0  # >= 触发飞机估算
+RAIL_DETOUR = 1.20     # 铁路路径绕行系数(相对直线)
+RAIL_SPEED_KMH = 220.0  # 城际均速(含中间停靠)
+RAIL_GROUND_MIN = 110.0  # 候车 + 起/终点站与景点接驳
+FLIGHT_DETOUR = 1.10
+FLIGHT_SPEED_KMH = 780.0
+FLIGHT_GROUND_MIN = 210.0  # 值机安检 + 两端机场接驳
+
 _cache: dict[tuple, list[dict[str, Any]]] = {}
 CACHE_TTL_S = 600
 
 
 class DiscoverReq(BaseModel):
     city: str = Field(default="上海", min_length=1)
-    band: str = Field(default="50_100")          # DISTANCE_BANDS 的 key
+    band: str = Field(default="50_100")
     category: str = Field(default="自然风光")
 
 
 def _clean(text: str) -> str:
     return (text or "").strip()
+
+
+def _est_mode(mode: str, straight_km: float) -> dict[str, Any]:
+    """铁路/飞机耗时估算(分钟)。纯几何 + 经验系数,无真实班次。"""
+    if mode == "rail":
+        km = straight_km * RAIL_DETOUR
+        dur = km / RAIL_SPEED_KMH * 60.0 + RAIL_GROUND_MIN
+        return {"mode": "rail", "label": "铁路(估算)",
+                "duration_min": round(dur), "distance_km": round(straight_km),
+                "note": f"按直线{round(straight_km)}km、均速{RAIL_SPEED_KMH:g}km/h + 接驳估算,无实时班次"}
+    # flight
+    km = straight_km * FLIGHT_DETOUR
+    dur = km / FLIGHT_SPEED_KMH * 60.0 + FLIGHT_GROUND_MIN
+    return {"mode": "flight", "label": "飞机(估算)",
+            "duration_min": round(dur), "distance_km": round(straight_km),
+            "note": f"按直线{round(straight_km)}km、巡航{FLIGHT_SPEED_KMH:g}km/h + 值机/接驳估算,无实时班次"}
 
 
 @router.get("/categories")
@@ -55,53 +78,63 @@ def categories():
 
 
 def _find_places(origin: dict, band: dict, cat: dict) -> list[dict[str, Any]]:
-    """按分段检索并过滤:Overpass 用上限半径,本地按 haversine 过滤出 [low, high)。"""
-    # 缓存检查
-    ck = (_clean(origin.get("city", "")), band["key"], cat["label"])
+    ck = (origin.get("city", ""), band["key"], cat["label"])
     cached = _cache.get(ck)
     now = time.time()
     if cached and (now - cached[1]) < CACHE_TTL_S:
         return cached[0]
-
     upper_m = band["high"] * 1000.0
-    raw = ds_nearby(
-        origin["lat"], origin["lng"], upper_m,
-        cat["tags"], limit=FETCH_LIMIT, require_name=True,
-        element_types=cat["element_types"],
-    )
+    raw = ds_nearby(origin["lat"], origin["lng"], upper_m,
+                    cat["tags"], limit=FETCH_LIMIT, require_name=True,
+                    element_types=cat["element_types"])
     low, high = band["low"], band["high"]
     filtered = []
     for p in raw:
         d = haversine_km(origin["lat"], origin["lng"], p["lat"], p["lng"])
         if low <= d < high:
-            item = {"name": p["name"], "lat": p["lat"], "lng": p["lng"],
-                    "distance_km": round(d, 1)}
-            filtered.append(item)
-    # 近→远
+            filtered.append({"name": p["name"], "lat": p["lat"], "lng": p["lng"],
+                             "distance_km": round(d, 1)})
     filtered.sort(key=lambda it: it["distance_km"])
     _cache[ck] = (filtered, now)
     return filtered
 
 
-def _add_routes(origin: dict, places: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """并行给前 SHOW_TOP 个目的地请求驾车路线。"""
+def _driving_route(origin: dict, p: dict) -> dict[str, Any]:
+    try:
+        leg = ds_route((origin["lng"], origin["lat"]), (p["lng"], p["lat"]))
+        return {"mode": "driving", "label": "驾车",
+                "duration_min": round(leg["duration_min"]), "distance_km": round(leg["distance_km"]),
+                "note": "OSRM 免费估算(非实时路况)"}
+    except (DataSourceError, ValueError):
+        return {"mode": "driving", "label": "驾车", "duration_min": None,
+                "distance_km": None, "note": "驾车路线获取失败"}
+
+
+def _enrich_modes(origin: dict, places: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """给每个目的地生成交通方式列表:驾车(始终,并行 OSRM) + 铁路/飞机(估算,按阈值)。"""
     shown = places[:SHOW_TOP]
     result: list[dict[str, Any]] = []
 
     def one(p: dict) -> dict[str, Any]:
-        out = dict(p)
-        out["route"] = None
-        try:
-            leg = ds_route((origin["lng"], origin["lat"]), (p["lng"], p["lat"]))
-            out["route"] = {"distance_km": round(leg["distance_km"], 1),
-                            "duration_min": round(leg["duration_min"], 1)}
-        except (DataSourceError, ValueError):
-            pass
+        out = {"name": p["name"], "lat": p["lat"], "lng": p["lng"],
+               "distance_km": p["distance_km"], "modes": []}
+        # 驾车走并行池外,先占位
+        out["modes"].append("__DRIVING__")
+        d = p["distance_km"]
+        if d >= RAIL_MIN_KM:
+            out["modes"].append(_est_mode("rail", d))
+        if d >= FLIGHT_MIN_KM:
+            out["modes"].append(_est_mode("flight", d))
         return out
 
-    with ThreadPoolExecutor(max_workers=SHOW_TOP) as ex:
-        result = list(ex.map(one, shown))
-    return result
+    base = [one(p) for p in shown]
+    # 并行补驾车
+    driving = []
+    with ThreadPoolExecutor(max_workers=max(1, SHOW_TOP)) as ex:
+        driving = list(ex.map(lambda p: _driving_route(origin, p), shown))
+    for item, drv in zip(base, driving):
+        item["modes"][0] = drv
+    return base
 
 
 @router.post("/discover")
@@ -112,7 +145,6 @@ def discover(req: DiscoverReq):
     band = next((b for b in DISTANCE_BANDS if b["key"] == _clean(req.band)), None)
     if not band:
         raise HTTPException(400, f"未知距离分段:{req.band}")
-
     started = time.monotonic()
     try:
         geo = ds_geocode(_clean(req.city))
@@ -120,21 +152,16 @@ def discover(req: DiscoverReq):
         raise HTTPException(502, f"无法解析城市 '{req.city}': {exc}") from exc
     origin = {"city": _clean(req.city), "name": geo["display_name"],
               "lat": geo["lat"], "lng": geo["lng"]}
-
     try:
         places = _find_places(origin, band, cat)
     except (DataSourceError, ValueError) as exc:
         raise HTTPException(502, f"目的地检索失败(公共数据源繁忙,请稍后重试): {exc}") from exc
-
-    enriched = _add_routes(origin, places) if places else []
-
+    enriched = _enrich_modes(origin, places) if places else []
     return {
-        "origin": origin,
-        "category": req.category,
-        "band_label": band["label"],
-        "band_km": {"low": band["low"], "high": band["high"]},
-        "results": enriched,
-        "total_found": len(places),
+        "origin": origin, "category": req.category,
+        "band_label": band["label"], "band_km": {"low": band["low"], "high": band["high"]},
+        "results": enriched, "total_found": len(places),
         "elapsed_s": round(time.monotonic() - started, 1),
-        "note": "驾车时间为 OSRM 免费估算(非实时路况);目的地来自 OpenStreetMap;距离为环形分段,不含城市内部。",
+        "mode_rules": {"rail_min_km": RAIL_MIN_KM, "flight_min_km": FLIGHT_MIN_KM},
+        "note": "驾车为 OSRM 估算;铁路/飞机为经验估算(无实时班次);距离为环形分段,不含城市内部。",
     }

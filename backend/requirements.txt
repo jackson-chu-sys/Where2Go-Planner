@@ -1,0 +1,6 @@
+# Where2Go backend 依赖 —— 阶段0 POC:免费数据源验证层(OSRM / Nominatim / Overpass)
+# 安装:pip install -r backend/requirements.txt
+requests>=2.31,<3
+
+# 测试依赖(纯 mock 单测,不触网):python -m pytest backend/
+pytest>=7.4

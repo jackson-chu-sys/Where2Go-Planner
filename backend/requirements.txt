@@ -2,5 +2,10 @@
 # 安装:pip install -r backend/requirements.txt
 requests>=2.31,<3
 
+# 试用 Web(backend/app, FastAPI):uvicorn app.main:app --app-dir backend
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.0
+
 # 测试依赖(纯 mock 单测,不触网):python -m pytest backend/
 pytest>=7.4

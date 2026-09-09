@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where2Go 试用 · 周边目的地探索</title>
+<style>
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f5f7fa;color:#1f2937}
+  header{background:#0f766e;color:#fff;padding:18px 22px}
+  header h1{margin:0;font-size:20px}
+  header p{margin:6px 0 0;font-size:13px;opacity:.9}
+  main{max-width:880px;margin:22px auto;padding:0 16px}
+  .card{background:#fff;border-radius:12px;padding:18px 20px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:16px}
+  label{font-weight:600;font-size:14px;display:block;margin-bottom:6px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+  .field{flex:1;min-width:140px}
+  input,select{width:100%;padding:9px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;box-sizing:border-box}
+  button{background:#0f766e;color:#fff;border:none;padding:11px 22px;border-radius:8px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  .err{color:#b91c1c;background:#fee2e2;padding:10px 14px;border-radius:8px;margin-top:12px;font-size:14px}
+  .meta{color:#6b7280;font-size:13px;margin-top:10px}
+  .item{display:flex;justify-content:space-between;align-items:center;padding:12px 4px;border-bottom:1px solid #f3f4f6;gap:12px}
+  .item:last-child{border-bottom:none}
+  .item .nm{font-weight:600;font-size:15px}
+  .item .dist{color:#6b7280;font-size:13px;margin-top:2px}
+  .item .route{text-align:right;min-width:150px}
+  .item .route{text-align:right;min-width:200px}
+  .mo{color:#6b7280;font-size:13px;padding:1px 0}
+  .mo b{color:#0f766e}
+  .mo-l{font-weight:600;color:#1f2937}
+  .mo-d{color:#6b7280;margin-left:6px}
+  .empty{color:#6b7280;text-align:center;padding:20px 0}
+  .tag{display:inline-block;background:#ccfbf1;color:#0f766e;font-size:12px;padding:2px 8px;border-radius:10px;margin-left:6px;font-weight:500}
+  .spinner{display:none;text-align:center;color:#6b7280;padding:24px 0;font-size:14px}
+  .spin{display:inline-block;width:16px;height:16px;border:3px solid #ddd;border-top-color:#0f766e;border-radius:50%;animation:a .8s linear infinite;vertical-align:-3px;margin-right:8px}
+  @keyframes a{to{transform:rotate(360deg)}}
+  footer{color:#9ca3af;font-size:12px;text-align:center;padding:18px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🧭 Where2Go · 周边目的地探索 <span style="font-weight:400;font-size:13px">(POC 列表模式)</span></h1>
+  <p>免费数据源 POC 界面 · 找附近「自然风光 / 旅游景点」并估算驾车耗时 · <a href="/" style="color:#ccfbf1">← 返回地图模式</a></p>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div class="field"><label>起点城市</label><input id="city" value="上海" placeholder="如:北京、上海、苏州"></div>
+      <div class="field"><label>距离分段 (距起点,互斥)</label><select id="radius">
+        <option value="50_100" selected>50-100 km</option>
+        <option value="100_200">100-200 km</option>
+        <option value="200_300">200-300 km</option>
+        <option value="300_500">300-500 km</option></select></div>
+      <div class="field"><label>目的地类型</label><select id="category">
+        <option value="自然风光" selected>自然风光(山峰/瀑布)</option>
+        <option value="旅游景点">旅游景点 / 观景点</option></select></div>
+      <div><button id="go">开始探索</button></div>
+    </div>
+    <div class="err" id="err" style="display:none"></div>
+  </div>
+  <div class="card" id="resultCard" style="display:none">
+    <div class="meta" id="meta"></div>
+    <div id="list"></div>
+  </div>
+  <div class="spinner" id="spin"><span class="spin"></span>正在从免费数据源查询,公共源较慢,请稍候…(目的地检索可能需 10-30s; 较远分段可能更久)</div>
+</main>
+<footer>Where2Go 阶段0 POC · 数据:OpenStreetMap / OSRM(免费) · 驾车为 OSRM 估算;铁路(≥100km)/飞机(≥300km)为经验估算,均无实时班次,仅供参考</footer>
+<script>
+const $=id=>document.getElementById(id);
+$("go").onclick=async()=>{
+  const city=$("city").value.trim()||"上海";
+  const band=$("radius").value, cat=$("category").value;
+  $("err").style.display="none"; $("resultCard").style.display="none";
+  $("spin").style.display="block"; $("go").disabled=true;
+  try{
+    const r=await fetch("/api/discover",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({city,band,category:cat})});
+    const data=await r.json();
+    if(!r.ok) throw new Error(data.detail||"请求失败");
+    render(data);
+  }catch(e){ $("err").textContent="出错了: "+e.message; $("err").style.display="block"; }
+  finally{ $("spin").style.display="none"; $("go").disabled=false; }
+};
+function render(data){
+  $("resultCard").style.display="block";
+  $("meta").innerHTML=`起点: <b>${esc(data.origin.name)}</b> · 距离分段 ${data.band_label} · 类型: ${data.category}`+
+    ` · 共找到 ${data.total_found} 个, 已展示前 ${data.results.length} 个`+
+    ` · 耗时 ${data.elapsed_s}s<span class="tag">驾车为估算</span>`;
+  const list=$("list");
+  if(!data.results.length){ list.innerHTML='<div class="empty">该范围/类别下暂无有名目的地,试试放宽距离</div>'; return; }
+  list.innerHTML=data.results.map(p=>{
+    const modes=(p.modes||[]).map(m=>{
+      if(m.mode==='driving'){
+        const t=(m.duration_min!=null)?`驾车 <b>${m.duration_min}</b> 分钟`:'驾车 获取失败';
+        return `<div class="mo"><span class="mo-l">🚗 ${t}</span><span class="mo-d">${m.distance_km!=null?'约 '+m.distance_km+' km':'—'}</span></div>`;
+      }
+      const d=(m.duration_min!=null)?`${m.duration_min} 分钟`:'—';
+      const ic=m.mode==='rail'?'🚄':'✈️';
+      return `<div class="mo"><span class="mo-l">${ic} ${m.label} <b>${d}</b></span>`+
+        `<span class="mo-d">${m.distance_km!=null?'直线 '+m.distance_km+' km':'—'}</span></div>`;
+    }).join('');
+    return `<div class="item"><div><div class="nm">${esc(p.name)}</div>`+
+      `<div class="dist">距起点直线约 ${p.distance_km} km</div></div>`+
+      `<div class="route">${modes}</div></div>`;
+  }).join("");
+}
+function esc(s){return (s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+</script>
+</body>
+</html>

@@ -1,11 +1,18 @@
-# Where2Go backend 依赖 —— 阶段0 POC:免费数据源验证层(OSRM / Nominatim / Overpass)
+# Where2Go backend 依赖
 # 安装:pip install -r backend/requirements.txt
+
+# 阶段0 POC:免费数据源验证层(OSRM / Nominatim / Overpass)
 requests>=2.31,<3
 
 # 试用 Web(backend/app, FastAPI):uvicorn app.main:app --app-dir backend
 fastapi>=0.110
 uvicorn>=0.29
 pydantic>=2.0
+
+# 阶段1:目的地入库(SQLite + SQLAlchemy 2.0,见 backend/db)
+sqlalchemy>=2.0,<3
+
+# 前端地图走 CDN(Leaflet + OSM 瓦片),不打包、不进依赖
 
 # 测试依赖(纯 mock 单测,不触网):python -m pytest backend/
 pytest>=7.4

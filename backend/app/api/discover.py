@@ -12,6 +12,7 @@ from data_sources import (
     nearby_places as ds_nearby,
     route as ds_route,
 )
+from services.bands import DISTANCE_BANDS as BANDS
 
 router = APIRouter()
 
@@ -22,12 +23,8 @@ CATEGORIES: dict[str, dict[str, Any]] = {
               "label": "景点 / 观景点"},
 }
 
-DISTANCE_BANDS: list[dict[str, Any]] = [
-    {"key": "50_100",  "label": "50-100 km",  "low": 50,  "high": 100},
-    {"key": "100_200", "label": "100-200 km", "low": 100, "high": 200},
-    {"key": "200_300", "label": "200-300 km", "low": 200, "high": 300},
-    {"key": "300_500", "label": "300-500 km", "low": 300, "high": 500},
-]
+# 分段定义只出一份(services.bands),POC 路由与入库/地图 API 共用同一口径。
+DISTANCE_BANDS: list[dict[str, Any]] = BANDS
 FETCH_LIMIT = 400
 SHOW_TOP = 8
 

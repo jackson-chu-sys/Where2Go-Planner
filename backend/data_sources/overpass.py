@@ -17,6 +17,9 @@
 * 部分 POI(如无名山峰)没有 ``name`` tag,因此名字按 ``name`` → ``name:zh`` →
   ``name:en`` 依次兜底,并可用 ``require_name`` 过滤;
 * ``around`` 的结果**不是**按距离排序(实测按 quadtile/id),所以客户端按大圆距离重排;
+* 阶段1a 起 ``parse_*``/``nearby_places`` 支持 ``with_id=True``,额外返回
+  ``osm_type``/``osm_id``(入库按 OSM 身份 ``(type, id)`` 防重需要);
+  默认关闭,保持阶段0 POC 的返回形状 ``{"lat", "lng", "name", "tags"}`` 不变;
 * 公共实例经常返回 ``504 + HTML``("The server is probably too busy"),实测
   ``overpass-api.de`` 繁忙时 ``z.overpass-api.de`` / ``maps.mail.ru`` 仍可用,
   因此这里做**端点链 + 重试**降级;``overpass.osm.ch`` 实测无数据、
@@ -70,6 +73,16 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     d_lambda = math.radians(lng2 - lng1)
     h = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+
+
+def _as_int(value: Any) -> Optional[int]:
+    """Overpass 的 ``id`` 归一成 int;缺失或非法返回 None(由上层决定兜底身份)。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _escape(value: Any) -> str:
@@ -160,8 +173,11 @@ def build_query(
     )
 
 
-def parse_element(element: Any) -> Optional[dict[str, Any]]:
-    """把单个 Overpass element 解析成 ``{"lat", "lng", "name", "tags"}``;无坐标则返回 None。"""
+def parse_element(element: Any, *, with_id: bool = False) -> Optional[dict[str, Any]]:
+    """把单个 Overpass element 解析成 ``{"lat", "lng", "name", "tags"}``;无坐标则返回 None。
+
+    ``with_id=True`` 时额外带 ``osm_type``/``osm_id``(入库防重要用 OSM 身份)。
+    """
     if not isinstance(element, dict):
         return None
     lat, lng = element.get("lat"), element.get("lon")
@@ -181,12 +197,16 @@ def parse_element(element: Any) -> Optional[dict[str, Any]]:
     if not isinstance(tags, dict):
         tags = {}
     name = tags.get("name") or tags.get("name:zh") or tags.get("name:en") or ""
-    return {
+    place: dict[str, Any] = {
         "lat": round(latitude, COORD_PRECISION),
         "lng": round(longitude, COORD_PRECISION),
         "name": str(name),
         "tags": tags,
     }
+    if with_id:
+        place["osm_type"] = str(element.get("type") or "")
+        place["osm_id"] = _as_int(element.get("id"))
+    return place
 
 
 def parse_places(
@@ -196,8 +216,12 @@ def parse_places(
     *,
     limit: Optional[int] = DEFAULT_LIMIT,
     require_name: bool = False,
+    with_id: bool = False,
 ) -> list[dict[str, Any]]:
-    """解析 Overpass 响应,按离 ``origin`` 由近及远排序后截断到 ``limit`` 条。"""
+    """解析 Overpass 响应,按离 ``origin`` 由近及远排序后截断到 ``limit`` 条。
+
+    ``with_id=True`` 时每条额外带 ``osm_type``/``osm_id``。
+    """
     elements = payload.get("elements") if isinstance(payload, dict) else None
     if not isinstance(elements, list):
         raise DataSourceError(
@@ -206,7 +230,7 @@ def parse_places(
 
     places: list[dict[str, Any]] = []
     for element in elements:
-        place = parse_element(element)
+        place = parse_element(element, with_id=with_id)
         if place is None:
             continue
         if require_name and not place["name"]:
@@ -264,10 +288,12 @@ class OverpassClient:
         require_name: bool = False,
         element_types: Union[str, Iterable[str]] = "nwr",
         query_timeout: float = DEFAULT_QUERY_TIMEOUT,
+        with_id: bool = False,
     ) -> list[dict[str, Any]]:
         """检索 ``(lat, lng)`` 半径 ``radius_m`` 内匹配 ``tags`` 的 POI 列表。
 
-        返回 ``[{"lat", "lng", "name", "tags"}]``,按离中心点由近及远排序。
+        返回 ``[{"lat", "lng", "name", "tags"}]``,按离中心点由近及远排序;
+        ``with_id=True`` 时每条额外带 ``osm_type``/``osm_id``。
         """
         latitude = float(lat)
         longitude = float(lng)
@@ -282,7 +308,12 @@ class OverpassClient:
         )
         payload = self.execute(query)
         return parse_places(
-            payload, latitude, longitude, limit=limit, require_name=require_name
+            payload,
+            latitude,
+            longitude,
+            limit=limit,
+            require_name=require_name,
+            with_id=with_id,
         )
 
     def execute(self, query: str) -> Any:
@@ -349,6 +380,7 @@ def nearby_places(
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
     retries: int = 2,
+    with_id: bool = False,
 ) -> list[dict[str, Any]]:
     """模块级便捷函数:周边 POI 检索。"""
     if endpoint is None and timeout is None and session is None and retries == 2:
@@ -363,4 +395,5 @@ def nearby_places(
         limit=limit,
         require_name=require_name,
         element_types=element_types,
+        with_id=with_id,
     )

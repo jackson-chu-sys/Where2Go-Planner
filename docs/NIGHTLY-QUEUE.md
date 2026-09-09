@@ -115,7 +115,7 @@
 
 ## [TASK-1c] 打磨:起点定位/换城 + 种子数据 + 自动 QA
 
-- 状态: pending
+- 状态: running
 - 目标: 产品打磨到可 DEMO。起点支持浏览器"我的位置"定位(Nominatim reverse)与城市搜索切换;OSM 国内缺失的滑雪/运动类补少量**种子数据**(人工坐标+简介);用 Hermes browser_exec 对本页面做一次自动 QA(能开、能查、无 JS 报错)。规格见 docs/STAGE1-PLAN.md。
 - 依赖: TASK-1a + TASK-1b。
 - 涉及: 前端(定位/搜索)、backend(种子数据源/脚本)、QA

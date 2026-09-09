@@ -115,7 +115,7 @@
 
 ## [TASK-1c] 打磨:起点定位/换城 + 种子数据 + 自动 QA
 
-- 状态: running
+- 状态: done
 - 目标: 产品打磨到可 DEMO。起点支持浏览器"我的位置"定位(Nominatim reverse)与城市搜索切换;OSM 国内缺失的滑雪/运动类补少量**种子数据**(人工坐标+简介);用 Hermes browser_exec 对本页面做一次自动 QA(能开、能查、无 JS 报错)。规格见 docs/STAGE1-PLAN.md。
 - 依赖: TASK-1a + TASK-1b。
 - 涉及: 前端(定位/搜索)、backend(种子数据源/脚本)、QA
@@ -124,7 +124,7 @@
   2. 滑雪/运动类至少各有若干条可展示目的地(种子补齐),标注来源=种子
   3. browser_exec 自动走一遍:开页→选分段→出 pin→点 pin 见 popup→无 console 错误
   4. 三个里程碑验收全过 → 把 docs/STAGE1-PLAN.md 阶段1 标为完成
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-10 夜班)。Codex commit `13ea2b6`:种子数据 49 条(滑雪 28/运动 21,backend/services/seed_data.py,source=种子标注);"我的位置"按钮+不可用降级提示;城市搜索空结果提示不报错;GET /api/geocode/reverse。pytest **143 passed**(87+56 新增,全 mock 不触网)。browser_exec 自动 QA 通过:开页→Leaflet 地图+瓦片加载→切 band→上海 50-100 出 226 pin→点 pin 弹窗(名称/分类/距起点/LLM 简介/来源徽标)→全程 window error 0 条。种子实测:上海 50-100 seeded=3(counts_by_source {OSM:226,种子:3});北京 200-300 冷抓 OSM 返回 0 条(公共 Overpass 繁忙,疑似降级),种子北戴河正常入库展示——白天可 refresh 重抓复核。
 
 ---
 

@@ -1,5 +1,7 @@
 # 阶段 1 开发推荐 · Where2Go 目的地探索(地图模式)
 
+> **✅ 阶段 1 已完成(2026-09-10 夜班验收)**:1a 地图骨架(`3302ace`,pytest 46)+ 1b 四分类归类去重/LLM 简介/popup(`84acfa5`,pytest 87)+ 1c 种子数据/定位/QA(`13ea2b6`,pytest 143;browser_exec 自动 QA 通过:开页→切 band→出 pin→弹窗→0 console 错误)。详见 docs/NIGHTLY-QUEUE.md 各条「结果」。
+
 > **神朱决策(2026-09-08,已拍板):**
 > 1. OSM 小众分类(滑雪/运动)覆盖不足 → **接受现状,种子数据垫底,功能稳定后再切高德/百度 key**。
 > 2. LLM 简介 → **复用既有 DeepSeek/Qwen key**(ADR-002),按 POI 缓存控制成本。

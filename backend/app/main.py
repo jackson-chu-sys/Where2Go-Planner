@@ -3,6 +3,8 @@
 路由:
 * POC(阶段0,保留不动):``POST /api/discover``、``GET /api/categories``
 * 阶段1a(地图骨架):``GET /api/places``、``GET /api/places/meta``、``GET /api/geocode``
+* 阶段1c(打磨):``GET /api/geocode/reverse``(浏览器"我的位置" → 逆地理编码起点)、
+  ``GET /api/places/intros``(LLM 补简介);滑雪/运动缺口由 ``services.seed_data`` 人工种子垫底
 """
 from __future__ import annotations
 from fastapi import FastAPI

@@ -1,6 +1,6 @@
 """地图模式 API:目的地检索(`/api/places`)+ 元信息 + 起点地理编码(`/api/geocode`)。
 
-与 POC 的 `/api/discover`、`/api/categories` 并存,四条路由:
+与 POC 的 `/api/discover`、`/api/categories` 并存,五条路由:
 
 * ``GET /api/places?origin=&band=&category=`` —— 返回该 (城市, band) 内**已入库**的目的地
   (``category`` 为四分类优先级归类的结果,一地只属一类);未入库时按需抓一次 Overpass
@@ -13,6 +13,12 @@
   (DB 即缓存,已有简介的不再调用;失败降级为空简介)。
 * ``GET /api/geocode?city=`` —— 起点城市搜索,复用 POC 的 Nominatim 接口,
   并回报该城市哪些分段已入库(前端可提示"即时读库"还是"首次抓取")。
+* ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
+  Nominatim **逆**地理编码反查城市起点。反查失败**不报错**,降级成坐标起点
+  (``resolved=false``),前端照样能画环、能查库。
+
+``/api/places`` 的返回里带 ``seeded`` 与 ``counts_by_source``:OSM 国内滑雪/运动覆盖差,
+缺口由 :mod:`services.seed_data` 的人工种子数据垫底,来源标注在每条 Place 的 ``source`` 字段。
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from db import repository as repo
 from db.base import get_session
 from services import intro as intro_service
 from services import place_loader
+from services import seed_data
 from services.bands import DISTANCE_BANDS, band_keys, find_band
 from services.classify import (
     CATEGORIES,
@@ -53,6 +60,12 @@ META_NOTE = (
 INTROS_NOTE = (
     "只给 intro 为空的 POI 调 LLM(DB 即缓存);网络/额度失败降级为空简介,下次可重试。"
 )
+REVERSE_NOTE = (
+    "浏览器定位(GPS 坐标)→ Nominatim 逆地理编码反查城市起点;"
+    "范围圈始终以传入的 GPS 坐标为圆心,不用行政区中心。"
+    "反查失败/限流时 resolved=false,起点名降级为『我的位置(纬度,经度)』——"
+    "仍是 HTTP 200,前端照常画环查库,不报错。"
+)
 
 
 def _clean(text: Optional[str]) -> Optional[str]:
@@ -69,7 +82,7 @@ def resolve_intro_limit(limit: Optional[int]) -> Optional[int]:
 
 @router.get("/places/meta")
 def places_meta() -> dict[str, Any]:
-    """分段 + 四分类 + 归类优先级 + 检索分组 + LLM 配置(前端图例/状态栏的唯一出处)。"""
+    """分段 + 四分类 + 归类优先级 + 检索分组 + LLM 配置 + 种子概览(前端图例/状态栏的唯一出处)。"""
     return {
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "categories": [dict(item) for item in CATEGORIES],
@@ -83,6 +96,7 @@ def places_meta() -> dict[str, Any]:
         "search_budget": search_budget(),
         "fetch_limit": place_loader.FETCH_LIMIT,
         "llm": intro_service.describe_llm(),
+        "seeds": seed_data.seed_stats(),
         "note": META_NOTE,
     }
 
@@ -181,6 +195,8 @@ def list_places(
         "network_used": outcome.network_used,
         "fetched_at": outcome.fetched_at,
         "written": outcome.written,
+        "seeded": outcome.seeded,
+        "counts_by_source": outcome.counts_by_source,
         "intro_stats": outcome.intro_stats,
         "intro_pending": repo.count_places(
             session, origin_city=city, band=band_def["key"], missing_intro=True
@@ -209,4 +225,29 @@ def geocode_city(
         "origin": origin,
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=cleaned),
+    }
+
+
+@router.get("/geocode/reverse")
+def reverse_geocode(
+    lat: float = Query(..., ge=-90, le=90, description="纬度(浏览器 GPS)"),
+    lng: float = Query(..., ge=-180, le=180, description="经度(浏览器 GPS)"),
+    zoom: Optional[int] = Query(None, ge=1, le=18, description="Nominatim zoom,留空 = 区县级"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """浏览器"我的位置" → 起点城市(Nominatim 逆地理编码),**失败也返回 200**。
+
+    与 ``/api/geocode`` 的区别:坐标已知,只需反查名字;``origin`` 里的 ``lat``/``lng``
+    一律沿用传入的 GPS 坐标,范围圈要以用户真实位置为圆心。``resolved=false`` 时
+    起点名降级为 ``我的位置(31.23,121.47)``,前端给个提示即可,不必当错误处理。
+    """
+    origin = place_loader.resolve_reverse_origin(
+        lat, lng, zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom))
+    )
+    return {
+        "origin": origin,
+        "resolved": bool(origin.get("resolved")),
+        "bands": [dict(band) for band in DISTANCE_BANDS],
+        "segments": repo.segment_overview(session, origin_city=origin["city"]),
+        "note": REVERSE_NOTE,
     }

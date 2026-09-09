@@ -11,10 +11,15 @@
 去重口径(docs/STAGE1-PLAN.md 第 3 节):同一 OSM 实体在同一个城市库里只存一行,
 唯一键 ``(osm_type, osm_id, origin_city)``。环形分段互斥,所以 band 不进唯一键;
 重新抓取时按该键做 upsert(见 db.repository.upsert_places)。
+
+来源标注(TASK-1c 种子数据):**不新增列**,复用 ``Place.tags`` 里的 ``source`` 键
+(种子数据写 ``种子``,OSM 抓取不写这个键),存量库无需迁移;:func:`place_source`
+再派生出统一的来源字符串给 API/前端用(见 db.repository.place_to_dict)。
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -27,6 +32,11 @@ UNCATEGORIZED = "其他"
 NAME_LEN = 255
 CITY_LEN = 120
 COORD_PRECISION = 7
+
+# 来源标注(TASK-1c):OSM 国内滑雪/运动覆盖差,缺口由人工种子数据垫底(STAGE1-PLAN 第 3 节)
+SOURCE_TAG = "source"
+SEED_SOURCE = "种子"
+OSM_SOURCE = "OSM"
 
 
 class Base(DeclarativeBase):
@@ -47,8 +57,23 @@ def iso_utc(value: Optional[datetime]) -> Optional[str]:
     return value.isoformat(timespec="seconds")
 
 
+def place_source(tags: Optional[Mapping[str, Any]]) -> str:
+    """从 ``tags`` 派生来源标注:``种子`` 或 ``OSM``。
+
+    OSM 抓取来的行没有 ``source`` 键,或写的是 ``survey`` 之类的原始 tag 值,
+    一律按 :data:`OSM_SOURCE` 处理 —— 存量库不改一行数据也能正确标注。
+    """
+    value = str(dict(tags or {}).get(SOURCE_TAG) or "").strip()
+    return SEED_SOURCE if value == SEED_SOURCE else OSM_SOURCE
+
+
+def is_seed(tags: Optional[Mapping[str, Any]]) -> bool:
+    """该行是否是人工种子数据(``tags["source"] == "种子"``)。"""
+    return place_source(tags) == SEED_SOURCE
+
+
 class Place(Base):
-    """一个目的地(当前来源为 OSM/Overpass,TASK-1c 会补种子数据)。"""
+    """一个目的地:OSM/Overpass 抓取,或人工种子数据(``tags["source"]="种子"``)。"""
 
     __tablename__ = "places"
     __table_args__ = (

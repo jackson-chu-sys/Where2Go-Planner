@@ -1,19 +1,22 @@
-# backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b)
+# backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b/1c)
 
 对应任务:`tasks/TASK-001-data-source-poc.md`(阶段0,ADR-006:免费、无需 key 的数据源)、
 `docs/NIGHTLY-QUEUE.md` TASK-1a(阶段1a:Place 入库 + 检索 API + Leaflet 地图,
 规格见 `docs/STAGE1-PLAN.md` 第 2/4 节)、TASK-1b(阶段1b:四分类优先级归类去重 +
-LLM 一句话简介 + popup 卡片,规格见 `docs/STAGE1-PLAN.md` 第 3 节)。
+LLM 一句话简介 + popup 卡片,规格见 `docs/STAGE1-PLAN.md` 第 3 节)、
+TASK-1c(阶段1c:浏览器"我的位置"定位/换城 + 滑雪/运动**人工种子数据**垫底,
+规格见 `docs/STAGE1-PLAN.md` 第 3 节"数据支撑现实")。
 
 ## 目录
 
 ```
 backend/
 ├─ requirements.txt              依赖(requests、fastapi/uvicorn、sqlalchemy;测试用 pytest)
-├─ conftest.py                   pytest 路径引导
+├─ conftest.py                   pytest 路径引导 + 整套单测默认关闭种子数据(WHERE2GO_SEEDS=off)
 ├─ test_data_sources.py          阶段0:三个源的纯 mock 单测(不触网,26 个用例)
 ├─ test_places.py                阶段1a:入库/读库/API 的纯 mock 单测(不触网,20 个用例)
 ├─ test_classify.py              阶段1b:归类优先级/跨 tag 去重/检索并集/LLM 简介的纯 mock 单测(41 个用例)
+├─ test_seed_data.py             阶段1c:种子数据校验/合并去重/来源标注/起点逆地理编码的纯 mock 单测(56 个用例)
 ├─ data_sources/                 数据获取层(阶段0,免费无 key)
 │  ├─ __init__.py                统一导出 route / geocode / reverse / nearby_places
 │  ├─ _common.py                 User-Agent、timeout(≤20s)、JSON 请求与中文错误
@@ -23,21 +26,25 @@ backend/
 │  │                             nearby_places_grouped = 多组 tag 并集、每组独立配额,一次请求查完四分类)
 │  └─ verify_poc.py              真实网络端到端验证脚本(联网)
 ├─ db/                           存储层(阶段1a,SQLite + SQLAlchemy 2.0)
-│  ├─ models.py                  Place / SegmentFetch 表定义
+│  ├─ models.py                  Place / SegmentFetch 表定义 + 来源标注派生(place_source/is_seed)
 │  ├─ base.py                    引擎与会话(懒加载;WHERE2GO_DB_URL 可覆盖库地址)
-│  └─ repository.py              upsert / 按段检索 / 分类计数 / 抓取水位 / 缺简介行查询
+│  └─ repository.py              upsert / 按段检索 / 分类计数 / **来源计数** / 抓取水位 / 缺简介行查询
 ├─ services/                     业务层(阶段1a/1b)
 │  ├─ bands.py                   环形距离分段定义(POC 与入库共用同一口径)
 │  ├─ classify.py                四分类归类引擎:OSM tag 线索 + 归类优先级 + 跨 tag 去重 + 检索并集分组
 │  ├─ categories.py              classify 的兼容导入面(阶段1a 旧名字;新代码直接 import classify)
 │  ├─ intro.py                   LLM 一句话简介:Provider 注册表 + 按 POI 缓存 + 失败降级 + CLI
 │  ├─ reclassify.py              存量库重归类(category 旧值/空值按四分类规则重算,离线)+ CLI
-│  └─ place_loader.py            (城市, band) 抓取入库编排(去重归类 → 入库 → 补简介)+ CLI
+│  ├─ seed_data.py               **人工种子数据**(滑雪场/运动,49 条)+ 与 OSM 合并去重 + 校验 CLI
+│  └─ place_loader.py            (城市, band) 抓取入库编排(去重归类 → 入库 → 合并种子 → 补简介)
+│                                + 浏览器 GPS 起点逆地理编码(resolve_reverse_origin)+ CLI
 └─ app/                          HTTP 服务(FastAPI)
    ├─ main.py                    路由装配 + 静态页面挂载
    ├─ api/discover.py            POC 路由(阶段0,保留不动)
-   ├─ api/places.py              GET /api/places、/api/places/meta、/api/places/intros、/api/geocode
-   └─ static/index.html          Leaflet 地图页(阶段1b:分类着色 pin + 简介 popup);list.html 为 POC 列表页
+   ├─ api/places.py              GET /api/places、/api/places/meta、/api/places/intros、/api/geocode、
+   │                             /api/geocode/reverse(浏览器"我的位置")
+   └─ static/index.html          Leaflet 地图页(阶段1c:分类着色 pin + 简介 popup + 📍 我的位置);
+                                 list.html 为 POC 列表页
 ```
 
 ## 安装与运行
@@ -46,7 +53,7 @@ backend/
 python3 -m venv .venv && . .venv/bin/activate      # 或用 uv venv .venv
 pip install -r backend/requirements.txt
 
-python -m pytest backend/ -q                       # 单测(mock,不触网;87 个用例)
+python -m pytest backend/ -q                       # 单测(mock,不触网;143 个用例)
 python backend/test_data_sources.py                # 不装 pytest 也能跑阶段0 同一套断言
 
 python -m uvicorn app.main:app --app-dir backend --port 8000   # Web(地图页 http://127.0.0.1:8000/)
@@ -151,6 +158,79 @@ python -m services.place_loader 上海 50_100 --refresh --intro-limit 24
 分类含义、LLM 一句话简介(缺简介给空态提示)与 OSM 身份脚注;图例带各分类计数、归类优先级
 与当前 LLM Provider;新增"补简介"按钮(每次最多 40 条,已有简介的跳过)。
 
+## 阶段1c:起点定位/换城 + 滑雪/运动种子数据
+
+**起点定位(需求 M1.01)**:前端「📍 我的位置」走 `navigator.geolocation` 拿 GPS 坐标 →
+`GET /api/geocode/reverse?lat=&lng=` → Nominatim **逆**地理编码反查城市 → 地图重定位、
+范围圈以**用户真实坐标**为圆心(不用行政区中心)。失败路径全部只给**可见提示、不抛 JS 错误**:
+
+| 情况 | 前端表现 | 后端表现 |
+|---|---|---|
+| 浏览器不支持 / 非 https 或 localhost | 黄色提示,建议改用城市搜索 | 不发请求 |
+| 用户拒绝授权 / 定位不可用 / 超时 | 黄色提示 + 保留当前起点 | 不发请求 |
+| Nominatim 挂了或反查不出城市名 | 黄色提示"已用坐标作为起点",地图照常可查 | **仍是 HTTP 200**,`resolved=false`,起点名降级为 `我的位置(31.23,121.47)` |
+
+坐标起点名只保留 2 位小数(约 1 km),避免 GPS 抖动每次都造出一个新 `origin_city` 把库切碎。
+城市搜索(阶段1a 已有)同步做了健壮化:空输入给提示不发请求;**"没搜到"不再当错误**,
+提示里带上当前起点并保持地图/已渲染 pin 不变,数据源真挂了才走红色错误框。
+
+**种子数据**(`services/seed_data.py`):OSM 国内 `piste:*` / `sport=*` 稀疏(上海两段实测
+滑雪场 1 条 / 运动 6 条),按神朱决策**种子垫底**。共 **49 条**人工补录目的地
+(**滑雪场 28** + **运动 21**),滑雪场含崇礼的万龙/云顶/太舞/富龙/长城岭、北京周边的
+南山/军都山/怀北/盘山、东北的北大湖/松花湖/亚布力/长白山/帽儿山、西北的将军山/可可托海/
+丝绸之路,以及神农架/西岭雪山/大明山与首钢滑雪大跳台、广州融创/上海耀雪/太仓阿尔卑斯/
+绍兴乔波等室内雪场;运动覆盖北京奥运场馆、上海国际赛车场、青岛帆船与金沙滩、观澜湖高尔夫、
+蜈支洲岛潜水、阳朔攀岩、古龙峡漂流、妙峰山与草原天路骑行等。
+坐标逐条用 Nominatim 正向编码取回、再用逆编码
+核对所在区县(2026-09-10);简介是**静态文案**,所以种子**永远不会触发 LLM 调用**
+(`fill_missing_intros` 只补 `intro` 为空的行),没有额度成本。
+
+关键机制:
+
+* **不新增列**:来源标注落在 `Place.tags["source"]="种子"`,`db.models.place_source()`
+  再派生出统一的 `source` 字段(`种子` / `OSM`)给 API 与前端;存量库无需迁移,
+  没有该键或写的是 `survey` 之类 OSM 原始值的一律算 `OSM`。
+* **合并去重**:去重键 = **名字 + 坐标** —— 名字相等或互相包含(短名 ≥3 字)且大圆距离
+  ≤ `DEDUPE_RADIUS_KM=2.0` 即视为同一地,**OSM 优先**、种子只垫缺口;种子列表内部同样去重。
+* **两条路径都合并**:抓取路径与**读库路径**(`ensure_seeded`,幂等且纯本地)都会补种,
+  所以 TASK-1b 抓好的存量库**不必重抓 Overpass** 也能拿到种子;补种不动 `fetched_at`。
+* **分类自洽**:种子没有 OSM id,分类完全由 tags 决定,`validate()` 逐条核对
+  `categorize(tags) == 声明的 category`(运动类 tag 刻意避开 ski/piste 等滑雪线索词,
+  否则会被优先级抢去"滑雪场")。
+* **开关**:环境变量 `WHERE2GO_SEEDS`,线上**默认开**;`0/false/no/off/关/关闭` 关闭。
+  `backend/conftest.py` 里整套单测默认关掉,既有 87 个用例的条数断言因此零改动。
+
+```bash
+python -m services.seed_data --validate            # 自检:分类/坐标/简介/重名(cd backend 后运行)
+python -m services.seed_data --list                # 按分类打印全部 49 条
+python -m services.seed_data --city 上海           # 给该城市已入库分段补种(只读本地库,不触网)
+python -m services.seed_data --city 北京 --band 50_100 --show 5
+WHERE2GO_SEEDS=0 python -m services.place_loader 上海 50_100   # 关掉种子跑一遍
+```
+
+```python
+from services import seed_data
+from services.seed_data import attach_seeds, load_seeds, seeds_in_band
+
+seeds = load_seeds(categories=["滑雪场"])          # 关掉开关时返回 []
+in_band = seeds_in_band(seeds, 39.9042, 116.4074, require_band("50_100"))
+fresh = attach_seeds(osm_rows, in_band)            # 只返回 OSM 没覆盖的那些
+```
+
+新增/变化的 API:
+
+| 路由 | 说明 |
+|---|---|
+| `GET /api/geocode/reverse?lat=&lng=&zoom=` | 浏览器 GPS → 起点城市;**失败也返回 200**(`resolved=false` + 坐标起点) |
+| `GET /api/places?...` | 响应多 `seeded`(本次补种条数)与 `counts_by_source`(`{"OSM": n, "种子": m}`);每条 Place 多 `source` 字段 |
+| `GET /api/places/meta` | 多 `seeds`(`enabled` / `total` / `by_category` / `env`,前端图例用) |
+
+前端:起点行新增「📍 我的位置」按钮与常见城市候选(`datalist`);新增黄色**轻提示**框
+(与红色错误框分开)承载"定位被拒""城市没搜到""已用坐标作为起点"等可恢复情况;
+popup 脚注按来源分流 —— 种子数据显示"来源:**人工种子数据**(OSM 国内覆盖不足,坐标人工核对)",
+OSM 数据仍显示 `osm_type/osm_id`;状态栏报 `人工种子 N 条(本次补种 M 条)/ OSM K 条`,
+图例报种子总量与分类分布;Leaflet 未加载时定位/搜索也只给提示、不产生 console 报错。
+
 ## 用法示例(阶段0 数据源)
 
 ```python
@@ -196,11 +276,17 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
 * **LLM 简介实测(2026-09-09)**:上海两段共 463 条 Place 全部生成简介,0 条降级
   (378 条 + 重抓后新增 85 条,6 并发各约 90s / 20s);简介 15-47 字,平均 28 字。
 * **OSM 国内小众分类覆盖不足**:滑雪/运动类 tag 在国内数据稀疏(实测上海两段内
-  滑雪场为 0 条),种子数据垫底是 TASK-1c 的活,见 `docs/STAGE1-PLAN.md` 第 3 节。
+  滑雪场 1 条 / 运动 6 条),已由阶段1c 的 49 条人工种子数据垫底(`services/seed_data.py`),
+  见 `docs/STAGE1-PLAN.md` 第 3 节。
+* **Nominatim 逆地理编码(阶段1c 实测)**:`zoom=10`(区县级)时中文 `display_name` 形如
+  `浦东新区, 上海市, 200120, 中国`,由细到粗逗号分隔;`city_from_display_name` 去掉国家名与
+  纯数字邮编后取第一个以 市/州/地区/盟 结尾的片段,挑不出城市就降级成坐标起点(不报错)。
+  逆编码同样受 1 req/s 节流与公共实例限流影响,所以前端把它当**可失败**路径处理。
 
 ## 范围
 
 阶段0 = 数据获取层;阶段1a 增加存储(SQLite)、入库编排、检索 API 与地图前端;
-阶段1b 增加四分类优先级归类去重、LLM 一句话简介(按 POI 缓存)与 popup 卡片。
-**尚不含**:种子数据与浏览器定位(TASK-1c)、收藏 `Collection` 表、用户系统与
-正式路线/住宿模块(阶段 2+)。
+阶段1b 增加四分类优先级归类去重、LLM 一句话简介(按 POI 缓存)与 popup 卡片;
+阶段1c 增加浏览器"我的位置"定位/换城健壮化与滑雪/运动人工种子数据(49 条,来源标注)。
+**尚不含**:TASK-1c 的 browser_exec 自动 QA(由夜班执行器跑)、收藏 `Collection` 表、
+用户系统与正式路线/住宿模块(阶段 2+)。

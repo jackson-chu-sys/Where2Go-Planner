@@ -4,7 +4,8 @@
 
 * :mod:`db.models` —— ``Place`` / ``SegmentFetch`` 表定义;
 * :mod:`db.base` —— 引擎、会话工厂、建表与 FastAPI 依赖;
-* :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询)。
+* :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询,
+  并按分类/来源(OSM / 种子)计数)。
 
 用法::
 
@@ -30,15 +31,21 @@ from .base import (
     set_engine,
 )
 from .models import (
+    OSM_SOURCE,
+    SEED_SOURCE,
+    SOURCE_TAG,
     UNCATEGORIZED,
     Base,
     Place,
     SegmentFetch,
+    is_seed,
     iso_utc,
+    place_source,
     utcnow,
 )
 from .repository import (
     count_by_category,
+    count_by_source,
     count_places,
     get_segment,
     latest_city_origin,
@@ -55,6 +62,11 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "ENV_DB_URL",
     "UNCATEGORIZED",
+    "SOURCE_TAG",
+    "SEED_SOURCE",
+    "OSM_SOURCE",
+    "is_seed",
+    "place_source",
     "Base",
     "Place",
     "SegmentFetch",
@@ -69,6 +81,7 @@ __all__ = [
     "utcnow",
     "iso_utc",
     "count_by_category",
+    "count_by_source",
     "count_places",
     "get_segment",
     "latest_city_origin",

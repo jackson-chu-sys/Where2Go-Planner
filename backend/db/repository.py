@@ -22,7 +22,17 @@ from sqlalchemy.orm import Session
 
 from data_sources import haversine_km
 
-from .models import COORD_PRECISION, UNCATEGORIZED, Place, SegmentFetch, iso_utc, utcnow
+from .models import (
+    COORD_PRECISION,
+    OSM_SOURCE,
+    SEED_SOURCE,
+    UNCATEGORIZED,
+    Place,
+    SegmentFetch,
+    iso_utc,
+    place_source,
+    utcnow,
+)
 
 DISTANCE_PRECISION = 1
 REQUIRED_ITEM_KEYS = ("osm_type", "osm_id", "lat", "lng")
@@ -41,7 +51,11 @@ def place_to_dict(
     origin_lat: Optional[float] = None,
     origin_lng: Optional[float] = None,
 ) -> dict[str, Any]:
-    """ORM 行 → API/前端用的 dict;给了起点坐标就顺带算 ``distance_km``。"""
+    """ORM 行 → API/前端用的 dict;给了起点坐标就顺带算 ``distance_km``。
+
+    ``source`` 是派生的来源标注(``种子`` / ``OSM``,见 :func:`db.models.place_source`),
+    前端 popup 用它给人工补录的种子数据打上"来源=种子"的徽章。
+    """
     distance_km: Optional[float] = None
     if origin_lat is not None and origin_lng is not None:
         distance_km = round(
@@ -58,6 +72,7 @@ def place_to_dict(
         "category": place.category,
         "intro": place.intro,
         "tags": dict(place.tags or {}),
+        "source": place_source(place.tags),
         "origin_city": place.origin_city,
         "band": place.band,
         "distance_km": distance_km,
@@ -214,6 +229,32 @@ def count_by_category(
     if band:
         stmt = stmt.where(Place.band == str(band))
     return {str(category): int(total) for category, total in session.execute(stmt)}
+
+
+def count_by_source(
+    session: Session,
+    *,
+    origin_city: Optional[str] = None,
+    band: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict[str, int]:
+    """按来源(``OSM`` / ``种子``)计数,给前端状态栏与图例用。
+
+    ``tags`` 是 JSON 列,这里不做方言相关的 JSON 索引查询,直接取回 ``tags``
+    在 Python 里判定(单个 (城市, band) 的行数量级只有几百条);两个键恒在,
+    没有种子数据时就是 ``0``,前端不必判空。
+    """
+    stmt = select(Place.tags)
+    if origin_city:
+        stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
+    if band:
+        stmt = stmt.where(Place.band == str(band))
+    if category:
+        stmt = stmt.where(Place.category == str(category))
+    counts = {OSM_SOURCE: 0, SEED_SOURCE: 0}
+    for (tags,) in session.execute(stmt):
+        counts[place_source(tags)] += 1
+    return counts
 
 
 def get_segment(session: Session, *, origin_city: str, band: str) -> Optional[SegmentFetch]:

@@ -18,7 +18,7 @@
 
 ## [TASK-1a] 地图骨架:Place 入库 + 检索 API + Leaflet 地图
 
-- 状态: pending
+- 状态: running
 - 目标: 把 POC 文字列表升级为地图模式。后端把 Overpass 抓到的目的地落入 SQLite(Place 表),提供检索 API;前端用 Leaflet 地图按当前环形距离段渲染 pin。规格见 docs/STAGE1-PLAN.md(第2/4节)。
 - 依赖: POC 已有 backend/data_sources/(OSRM/Nominatim/Overpass 可用)+ backend/app(FastAPI 试用 web)。
 - 涉及: backend/(新建 models/db、改造 api、static 前端)

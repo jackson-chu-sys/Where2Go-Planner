@@ -18,7 +18,7 @@
 
 ## [TASK-1a] 地图骨架:Place 入库 + 检索 API + Leaflet 地图
 
-- 状态: running
+- 状态: done
 - 目标: 把 POC 文字列表升级为地图模式。后端把 Overpass 抓到的目的地落入 SQLite(Place 表),提供检索 API;前端用 Leaflet 地图按当前环形距离段渲染 pin。规格见 docs/STAGE1-PLAN.md(第2/4节)。
 - 依赖: POC 已有 backend/data_sources/(OSRM/Nominatim/Overpass 可用)+ backend/app(FastAPI 试用 web)。
 - 涉及: backend/(新建 models/db、改造 api、static 前端)
@@ -29,7 +29,31 @@
   4. 前端 Leaflet 地图:起点为中心画距离环;band 内 Place 以 pin 渲染;点 pin 出弹窗(名称/分类/距起点)
   5. 依赖写 backend/requirements.txt(leaflet 走 CDN,不打包)
   6. pytest backend/ 通过
-- 结果: (待夜班回填)
+- 结果: **完成**(commit `3302ace`,2026-09-09)。
+  - 存储:新增 `backend/db/`(models/base/repository)。`Place` 表含
+    osm_type/osm_id/name/lat/lng/category/intro/tags/origin_city/band,
+    唯一键 `(osm_type, osm_id, origin_city)` 防重;`SegmentFetch` 记 (城市, band) 抓取水位。
+    SQLite 落 `backend/data/where2go.db`(已 gitignore),`WHERE2GO_DB_URL` 可覆盖。
+  - 抓取入库:新增 `backend/services/`(bands/categories/place_loader)。按分段**上限半径**
+    查 Overpass + haversine 收敛到环内(复用现有 overpass.py,解析层加 opt-in `with_id=True`);
+    **已入库 (城市, band) 二次查询直接读库、零网络请求**;`refresh=true` 强制重抓不产生重复行。
+    分类为阶段1a 简化归类(滑雪/运动/人文美食/自然/其他),四分类优先级去重与 LLM 简介留给 TASK-1b,
+    `category`/`intro` 字段已预留(重抓不覆盖已生成的 intro)。
+  - API:`GET /api/places?origin=&band=&category=`(+可选 lat/lng/refresh)、
+    `GET /api/places/meta`、`GET /api/geocode?city=`(复用 Nominatim)。
+    POC 的 `/api/discover`、`/api/categories` 行为不变;分段定义收敛到 services.bands 只出一份。
+  - 前端:`backend/app/static/index.html` 改为 Leaflet 1.9.4(CDN,带 SRI)+ OSM 瓦片的地图页,
+    原生 JS 无 React。起点为中心画 band 环形圈(外圆=上限、虚线内圆=下限),pin 按分类着色,
+    弹窗显示名称/分类/距起点/OSM id;可切 band、切分类、城市搜索、重新抓取;CDN 挂了有降级提示。
+    原 POC 列表页保留为 `list.html` 并互链。
+  - 依赖:`backend/requirements.txt` 加 `sqlalchemy>=2.0,<3`(Leaflet 走 CDN 不打包)。
+  - 测试:新增 `backend/test_places.py` 20 个用例(网络全 mock),覆盖落库、二次查询不触网、
+    换 band 分别入库、refresh 不重复、表结构/唯一键、API 过滤与校验、POC 路由未破坏。
+    `pytest backend/` = **46 passed**(原 26 + 新 20),原有用例零改动。
+  - 真实链路实测(上海):`50_100` 段首抓 141 条 / 9.1s → 二次读库 141 条 / 0.01s(`source=db`,
+    `network_used=false`);`100_200` 段首抓 237 条 / 41.6s(复用库内起点,未再调 Nominatim)
+    → 二次 0.01s;分类过滤与非法 band/category 的 400 校验均通过。
+  - 备注:OSM 国内滑雪/运动 tag 稀疏(上海两段内滑雪场 0 条),种子数据垫底属 TASK-1c。
 
 ---
 

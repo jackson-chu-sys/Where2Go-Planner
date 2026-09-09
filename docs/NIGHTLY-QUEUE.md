@@ -59,7 +59,7 @@
 
 ## [TASK-1b] 四分类归类 + LLM 简介 + popup 卡片
 
-- 状态: pending
+- 状态: running
 - 目标: 需求四分类(自然风光/小城人文美食/滑雪场/运动)检索与**优先级归类去重**(滑雪>运动>人文美食>自然,osm id+type 去重,一地只入一类);对入库 Place 生成**一句话简介**(LLM 缓存);地图 pin 分类图标 + popup 展示分类字段。规格见 docs/STAGE1-PLAN.md 第3/4节。
 - 依赖: TASK-1a(Place 表已建、地图已渲染)。
 - 涉及: backend/data_sources/(归类)、backend/models、LLM 简介(复用既有 DeepSeek/Qwen key,按 POI 缓存)、前端 popup

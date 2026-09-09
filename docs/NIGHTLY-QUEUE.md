@@ -17,7 +17,7 @@
 
 ## [TASK-1b] 四分类检索 + 归类去重模块(backend 数据层增强)
 
-- 状态: pending
+- 状态: running
 - 目标: 实现需求四分类(自然风光 / 小城人文美食 / 滑雪场 / 运动)的 OSM 检索与归类,一个地物按优先级只归一类,消除 POC 中"自然/景点重复"。属 backend 数据源层,不依赖地图 UI/DB(可独立实现+单测)。
 - 涉及: backend/data_sources/(overpass 归类)、backend/test_*.py
 - 验收:
@@ -32,7 +32,7 @@
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题
-- 状态: pending
+- 状态: running
 - 目标:
 - 涉及:
 - 验收:

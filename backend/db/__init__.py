@@ -39,6 +39,7 @@ from .models import (
 )
 from .repository import (
     count_by_category,
+    count_places,
     get_segment,
     latest_city_origin,
     list_places,
@@ -46,6 +47,7 @@ from .repository import (
     record_segment,
     segment_overview,
     segment_to_dict,
+    select_places,
     upsert_places,
 )
 
@@ -67,6 +69,7 @@ __all__ = [
     "utcnow",
     "iso_utc",
     "count_by_category",
+    "count_places",
     "get_segment",
     "latest_city_origin",
     "list_places",
@@ -74,5 +77,6 @@ __all__ = [
     "record_segment",
     "segment_overview",
     "segment_to_dict",
+    "select_places",
     "upsert_places",
 ]

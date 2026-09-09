@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Where2Go · 目的地地图(阶段1a)</title>
+<title>Where2Go · 目的地地图(阶段1b)</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
@@ -37,13 +37,16 @@
   .pop .cat{display:inline-block;color:#fff;font-size:12px;padding:1px 8px;border-radius:10px}
   .pop .kv{color:#374151;font-size:13px;margin-top:6px}
   .pop .kv b{color:#0f766e}
-  .pop .intro{color:#6b7280;font-size:13px;margin-top:7px;border-top:1px dashed #e5e7eb;padding-top:6px}
+  .pop .intro{color:#1f2937;font-size:13px;line-height:1.55;margin-top:8px;border-top:1px dashed #e5e7eb;padding-top:7px}
+  .pop .intro.empty{color:#9ca3af;font-style:italic}
+  .pop .osm{color:#9ca3af;font-size:11px;margin-top:7px}
+  .pop .blurb{color:#6b7280;font-size:12px;margin-top:5px}
   footer{color:#9ca3af;font-size:12px;text-align:center;padding:14px}
 </style>
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段1a 骨架)</span></h1>
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段1b · 四分类 + AI 简介)</span></h1>
   <p>起点城市 + 环形距离分段 → 地图渲染已入库目的地 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
@@ -59,7 +62,10 @@
       <div class="field"><label for="band">距离分段(环形,互斥)</label><select id="band"></select></div>
       <div class="field"><label for="category">分类</label><select id="category"></select></div>
       <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
-        <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass">重新抓取</button></div>
+        <div class="inline">
+          <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass 四分类并集">重新抓取</button>
+          <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
+        </div></div>
     </div>
     <div class="status" id="status">初始化…</div>
     <div class="legend" id="legend"></div>
@@ -68,8 +74,9 @@
   <div id="map"></div>
 </main>
 <footer>
-  Where2Go 阶段1a · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 抓取后入 SQLite,
-  同一「城市 + 分段」二次查询只读库不触网 · 分类为简化归类,四分类优先级去重与简介见 TASK-1b
+  Where2Go 阶段1b · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 四分类 tag 并集抓取后入 SQLite,
+  同一「城市 + 分段」二次查询只读库不触网 · 归类优先级 滑雪 &gt; 运动 &gt; 人文美食 &gt; 自然,
+  按 OSM (type, id) 去重、一地只属一类 · 一句话简介由 LLM 生成并按 POI 缓存
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -78,6 +85,7 @@ const $=id=>document.getElementById(id);
 const DEFAULT_CITY="上海";
 const FALLBACK_CENTER=[31.2304,121.4737];
 const RING_COLOR="#0f766e";
+const INTRO_LIMIT=40;
 const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{}};
 let map=null,rings=null,pins=null,outerRing=null;
 
@@ -87,7 +95,7 @@ function esc(value){
 }
 function setStatus(html){$("status").innerHTML=html;}
 function showErr(message){$("err").textContent=message||"";$("err").style.display=message?"block":"none";}
-function setBusy(busy){["goCity","reload","band","category"].forEach(id=>{$(id).disabled=busy;});}
+function setBusy(busy){["goCity","reload","intro","band","category"].forEach(id=>{$(id).disabled=busy;});}
 
 async function getJSON(url){
   const response=await fetch(url);
@@ -135,8 +143,13 @@ function renderCategoryOptions(){
 function renderLegend(counts){
   $("legend").innerHTML=state.meta.categories.map(item=>{
     const total=(counts||{})[item.key]||0;
-    return '<span><i style="background:'+item.color+'"></i>'+esc(item.label)+" <b>"+total+"</b></span>";
+    const hint=item.blurb?(" title="+esc('"'+item.blurb+'"')):"";
+    return '<span'+hint+'><i style="background:'+item.color+'"></i>'+esc(item.label)+" <b>"+total+"</b></span>";
   }).join("");
+  const priority=(state.meta.category_priority||[]).join(" > ");
+  const llm=state.meta.llm||{};
+  $("legend").innerHTML+='<span><b>归类优先级</b> '+esc(priority)+"</span>"+
+    '<span><b>简介</b> '+(llm.enabled?esc(llm.label||llm.provider||"LLM"):"未配置 LLM key,简介留空")+"</span>";
 }
 
 // 当前 band 的环形范围圈:外圆(上限半径)+ 内圆虚线(下限半径)= 环带示意
@@ -157,17 +170,20 @@ function drawRings(){
 
 function fitRings(){if(map&&outerRing) map.fitBounds(outerRing.getBounds(),{padding:[24,24]});}
 
+// popup 卡片:名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介 + OSM 身份脚注
 function popupHtml(place){
   const meta=categoryMeta(place.category);
   const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
   const distance=(place.distance_km===null||place.distance_km===undefined)?"—":(place.distance_km+" km");
-  const intro=place.intro?esc(place.intro):"简介待生成(TASK-1b:LLM 一句话简介)";
+  const hasIntro=!!(place.intro&&String(place.intro).trim());
+  const intro=hasIntro?esc(place.intro):"暂无简介(LLM 未生成或调用降级,可点「补简介」重试)";
   return '<div class="pop"><div class="nm">'+(esc(place.name)||"(无名)")+"</div>"+
     '<span class="cat" style="background:'+meta.color+'">'+meta.emoji+" "+esc(meta.label)+"</span>"+
     '<div class="kv">距起点直线 <b>'+distance+"</b> · 分段 "+esc(bandLabel)+"</div>"+
-    '<div class="kv">OSM:'+esc(place.osm_type)+"/"+esc(place.osm_id)+
-      " · "+Number(place.lat).toFixed(4)+", "+Number(place.lng).toFixed(4)+"</div>"+
-    '<div class="intro">'+intro+"</div></div>";
+    (meta.blurb?'<div class="blurb">'+esc(meta.blurb)+"</div>":"")+
+    '<div class="intro'+(hasIntro?"":" empty")+'">'+intro+"</div>"+
+    '<div class="osm">OSM:'+esc(place.osm_type)+"/"+esc(place.osm_id)+
+      " · "+Number(place.lat).toFixed(4)+", "+Number(place.lng).toFixed(4)+"</div></div>";
 }
 
 function drawPins(places){
@@ -210,8 +226,8 @@ async function loadPlaces(refresh){
   if(!state.origin) return;
   showErr("");setBusy(true);
   const known=state.cached[state.band];
-  if(refresh) setStatus("正在重新抓取 Overpass(公共源较慢,约 10-40s)…");
-  else if(known===undefined) setStatus("该分段尚未入库,正在抓取 Overpass(约 10-40s)…");
+  if(refresh) setStatus("正在重新抓取 Overpass 四分类并集(公共源较慢,约 20-120s)…");
+  else if(known===undefined) setStatus("该分段尚未入库,正在抓取 Overpass 四分类并集(约 20-120s)…");
   else setStatus("正在读取本地库(已入库,不触网)…");
   const params=new URLSearchParams({origin:state.origin.city,band:state.band,
     lat:String(state.origin.lat),lng:String(state.origin.lng)});
@@ -228,10 +244,39 @@ async function loadPlaces(refresh){
     const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
     setStatus('起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
       " · 分类 <b>"+esc(state.category||"全部")+"</b> · 显示 <b>"+data.count+"</b> / 库内 "+total+
-      " 条 · 来源:"+from+fetched+" · 耗时 "+data.elapsed_s+"s");
+      " 条 · 来源:"+from+fetched+" · 耗时 "+data.elapsed_s+"s"+introNote(data));
     if(!data.count) showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
   }catch(error){
     showErr("查询失败:"+error.message);setStatus("查询失败");
+  }finally{setBusy(false);}
+}
+
+// 简介进度:抓取路径会带回本次 LLM 生成统计;读库路径只报还缺多少条
+function introNote(data){
+  const stats=data.intro_stats;
+  if(stats) return " · 简介:新增 <b>"+stats.filled+"</b> 条 / 降级 "+stats.failed+" 条 · 仍缺 "+data.intro_pending+" 条";
+  return (data.intro_pending>0)?(" · 待补简介 <b>"+data.intro_pending+"</b> 条(点「补简介」)"):"";
+}
+
+// 补简介:给该分段还没有 intro 的 POI 调 LLM(DB 即缓存,已有的不重复调用)
+async function fillIntros(){
+  if(!state.origin) return;
+  showErr("");setBusy(true);
+  setStatus("正在调 LLM 补缺失简介(最多 "+INTRO_LIMIT+" 条,已有简介的跳过)…");
+  const params=new URLSearchParams({origin:state.origin.city,band:state.band,limit:String(INTRO_LIMIT)});
+  if(state.category) params.set("category",state.category);
+  try{
+    const data=await getJSON("/api/places/intros?"+params.toString());
+    const summary="简介:生成 <b>"+data.filled+"</b> 条 · 降级 "+data.failed+
+      " 条 · 仍缺 "+data.pending+" 条 · "+esc(data.provider||"LLM")+" · 耗时 "+data.elapsed_s+"s";
+    if(data.filled>0){await loadPlaces(false);setStatus($("status").innerHTML+" · "+summary);}
+    else{
+      setStatus(summary);
+      showErr(data.scanned===0?"该分段没有缺简介的 POI(或 LLM 未配置 key)。"
+        :"本次没有拿到新简介(LLM 调用降级),可稍后再点「补简介」重试。");
+    }
+  }catch(error){
+    showErr("补简介失败:"+error.message);setStatus("补简介失败");
   }finally{setBusy(false);}
 }
 
@@ -240,6 +285,7 @@ $("city").addEventListener("keydown",event=>{if(event.key==="Enter") searchCity(
 $("band").addEventListener("change",event=>{state.band=event.target.value;drawRings();fitRings();loadPlaces(false);});
 $("category").addEventListener("change",event=>{state.category=event.target.value;loadPlaces(false);});
 $("reload").addEventListener("click",()=>loadPlaces(true));
+$("intro").addEventListener("click",fillIntros);
 
 (async function boot(){
   if(!window.L){

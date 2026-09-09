@@ -1,12 +1,17 @@
 """(城市, band) 目的地抓取入库编排:**命中库只读库,未命中才触网**。
 
-流程(docs/STAGE1-PLAN.md 第 4 节"目的地库 cold-start"):
+流程(docs/STAGE1-PLAN.md 第 3/4 节"四分类检索 + 目的地库 cold-start"):
 
 1. 查 ``SegmentFetch`` 水位 —— 有记录说明该 (城市, band) 已入库 →
-   直接 :func:`db.repository.list_places` 读库返回,**不发任何网络请求**;
-2. 没记录 → 解析起点(Nominatim)→ 按分段**上限半径**查 Overpass(多 tag 并集,
-   一次查完)→ haversine 收敛到环内 → 简化归类 → upsert 入库 → 记水位;
-3. ``refresh=True`` 可强制重抓(仍按唯一键 upsert,不会产生重复行)。
+   直接 :func:`db.repository.list_places` 读库返回,**不发任何网络请求**
+   (读库路径也不会调 LLM,保证"二次查询秒出");
+2. 没记录 → 解析起点(Nominatim)→ 按分段**上限半径**一次查**四分类 tag 并集**
+   (:data:`SEARCH_GROUPS`,每组独立配额,见 :mod:`services.classify`)→
+   haversine 收敛到环内 → 按 OSM ``(type, id)`` **去重** + 优先级**归类**
+   (滑雪 > 运动 > 人文美食 > 自然,一地只入一类)→ upsert 入库 → 记水位;
+3. 入库**之后**再补 LLM 一句话简介(:func:`services.intro.fill_missing_intros`):
+   DB 即缓存,已有 ``intro`` 的 POI 不再调用;失败降级成空简介,**不阻塞入库**;
+4. ``refresh=True`` 可强制重抓(仍按唯一键 upsert,不会产生重复行,也不覆盖已有简介)。
 
 分类过滤只作用在**读取**阶段:一次抓取入库的数据覆盖全部分类,所以换分类查询
 同样命中库、不触网。网络调用全部可注入(``fetcher`` / ``geocoder``),单测用替身即可。
@@ -28,18 +33,22 @@ from data_sources import overpass
 from db import init_db, make_engine, open_session
 from db import repository as repo
 from db.models import FALLBACK_OSM_TYPE, OSM_ELEMENT_TYPES, SegmentFetch
+from services import classify
+from services import intro as intro_service
 from services.bands import band_keys, band_radius_m, filter_to_band, require_band
-from services.categories import categorize
+from services.classify import classify_places
 
-# 阶段1a 沿用 POC 的检索线索;TASK-1b 会扩成四分类线索并集(滑雪/运动/人文/自然)。
-SEARCH_TAGS: list[dict[str, str]] = [
-    {"natural": "peak"},
-    {"natural": "waterfall"},
-    {"tourism": "attraction"},
-    {"tourism": "viewpoint"},
-]
-ELEMENT_TYPES = "nwr"
-FETCH_LIMIT = 400
+# 四分类检索线索(docs/STAGE1-PLAN.md 第 3 节):按 band 上限半径**一次**查完并集。
+# 分组各带配额,避免 ``sport=*``/餐厅这类高频 tag 把总量刷爆、山峰古镇一条不剩;
+# 同一实体被多组命中时由 classify_places 按 OSM (type, id) 去重后只归一类。
+SEARCH_GROUPS: list[dict[str, Any]] = classify.search_groups()
+SEARCH_TAGS: list[classify.TagSelector] = classify.search_tags()
+ELEMENT_TYPES = classify.DEFAULT_ELEMENT_TYPES
+FETCH_LIMIT = overpass.MAX_FETCH
+GROUP_QUERY_TIMEOUT = overpass.DEFAULT_GROUP_QUERY_TIMEOUT
+GROUP_REQUEST_TIMEOUT = overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
+# 交互式抓取时一次最多补多少条简介(全量回填走 ``python -m services.intro``)
+INTRO_BATCH_LIMIT = 40
 SOURCE_OVERPASS = "overpass"
 SOURCE_DB = "db"
 FINGERPRINT_HEX_LEN = 12
@@ -61,6 +70,7 @@ class SegmentOutcome:
     written: int = 0
     counts_by_category: dict[str, int] = field(default_factory=dict)
     segment: Optional[dict[str, Any]] = None
+    intro_stats: Optional[dict[str, Any]] = None
 
 
 def default_geocoder(city: str) -> dict[str, Any]:
@@ -100,20 +110,24 @@ def default_fetcher(
     band: Mapping[str, Any],
     *,
     client: Optional[overpass.OverpassClient] = None,
-    tags: Optional[Iterable[Mapping[str, str]]] = None,
-    limit: int = FETCH_LIMIT,
-    element_types: str = ELEMENT_TYPES,
+    groups: Optional[Iterable[Mapping[str, Any]]] = None,
+    query_timeout: float = GROUP_QUERY_TIMEOUT,
+    request_timeout: float = GROUP_REQUEST_TIMEOUT,
 ) -> list[dict[str, Any]]:
-    """真实抓取:按分段上限半径查 Overpass(多 tag 并集 + ``with_id`` 便于防重)。"""
+    """真实抓取:按分段**上限半径**一次查四分类 tag 并集(分组配额 + ``with_id`` 防重)。
+
+    复用现有 overpass 环形分段机制:服务端只按上限半径 ``around`` 取数,环内收敛
+    仍由 :func:`services.bands.filter_to_band` 用 haversine 在本地做。
+    """
     overpass_client = client or overpass.default_client()
-    return overpass_client.nearby_places(
+    return overpass_client.nearby_places_grouped(
         lat,
         lng,
         band_radius_m(band),
-        list(tags) if tags is not None else SEARCH_TAGS,
-        limit=limit,
+        list(groups) if groups is not None else SEARCH_GROUPS,
         require_name=True,
-        element_types=element_types,
+        query_timeout=query_timeout,
+        request_timeout=request_timeout,
         with_id=True,
     )
 
@@ -134,19 +148,24 @@ def place_identity(place: Mapping[str, Any]) -> tuple[str, int]:
 
 
 def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """环内候选 → 入库条目(补 OSM 身份与简化分类;``intro`` 留给 TASK-1b)。"""
+    """环内候选 → 入库条目:先按 OSM ``(type, id)`` **去重**,再按优先级**归类**。
+
+    去重与归类都由 :func:`services.classify.classify_places` 完成(一地只入一类,
+    合并后的 tags 让优先级判定看到全部线索);这里只补入库身份与字段形状。
+    ``intro`` 不在此生成 —— 入库后由 :mod:`services.intro` 按 POI 缓存补。
+    """
     items: list[dict[str, Any]] = []
-    for candidate in candidates or []:
-        osm_type, osm_id = place_identity(candidate)
+    for row in classify_places(candidates):
+        osm_type, osm_id = place_identity(row)
         items.append(
             {
                 "osm_type": osm_type,
                 "osm_id": osm_id,
-                "name": candidate.get("name") or "",
-                "lat": candidate["lat"],
-                "lng": candidate["lng"],
-                "category": categorize(candidate.get("tags")),
-                "tags": dict(candidate.get("tags") or {}),
+                "name": row.get("name") or "",
+                "lat": row["lat"],
+                "lng": row["lng"],
+                "category": row["category"],
+                "tags": dict(row.get("tags") or {}),
             }
         )
     return items
@@ -163,8 +182,15 @@ def load_segment(
     fetcher: Optional[FetchFn] = None,
     geocoder: Optional[GeocodeFn] = None,
     refresh: bool = False,
+    intros: bool = True,
+    intro_limit: Optional[int] = INTRO_BATCH_LIMIT,
+    intro_workers: int = intro_service.DEFAULT_WORKERS,
 ) -> SegmentOutcome:
     """读取某 (城市, band) 的目的地;未入库才抓取并落库。
+
+    ``intros=True`` 时,**抓取入库之后**再给缺简介的 POI 补 LLM 一句话简介
+    (只作用于本次抓取路径:命中库直接读库时不调 LLM,保持零网络秒回)。
+    简介失败一律降级为空,不影响已入库的数据。
 
     失败语义:分段/城市非法抛 :class:`ValueError`;数据源不可用抛
     :class:`data_sources.DataSourceError`(由 API 层翻成中文 HTTP 错误)。
@@ -209,6 +235,16 @@ def load_segment(
         source=SOURCE_OVERPASS,
     )
     session.commit()
+    # 先落库再补简介:LLM 挂了/没 key 也只是简介为空,入库结果不受影响。
+    intro_stats = None
+    if intros:
+        intro_stats = intro_service.fill_missing_intros(
+            session,
+            origin_city=city_clean,
+            band=band_def["key"],
+            limit=intro_limit,
+            workers=intro_workers,
+        )
     return _read_from_db(
         session,
         origin=origin,
@@ -218,6 +254,7 @@ def load_segment(
         network_used=True,
         segment=repo.segment_to_dict(record),
         written=written,
+        intro_stats=intro_stats,
     )
 
 
@@ -259,6 +296,7 @@ def _read_from_db(
     network_used: bool,
     segment: Optional[dict[str, Any]],
     written: int = 0,
+    intro_stats: Optional[dict[str, Any]] = None,
 ) -> SegmentOutcome:
     """统一从库里取数,保证"读库"与"刚抓完"两条路径返回同一种形状。"""
     places = repo.list_places(
@@ -280,6 +318,7 @@ def _read_from_db(
         written=written,
         counts_by_category=counts,
         segment=segment,
+        intro_stats=intro_stats,
     )
 
 
@@ -291,15 +330,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("city", nargs="?", default="上海", help="起点城市名(默认:上海)")
     parser.add_argument("band", nargs="?", default="50_100", choices=band_keys(), help="距离分段 key")
     parser.add_argument("--refresh", action="store_true", help="强制重抓(仍按唯一键 upsert)")
+    parser.add_argument("--no-intros", action="store_true", help="抓取后不调 LLM 补简介")
+    parser.add_argument("--intro-limit", type=int, default=None,
+                        help=f"本次最多补多少条简介(默认 {INTRO_BATCH_LIMIT};0 = 不限)")
     parser.add_argument("--db", default=None, help="数据库 URL(默认 WHERE2GO_DB_URL 或 backend/data/where2go.db)")
     parser.add_argument("--show", type=int, default=10, help="打印前 N 条(默认 10)")
     args = parser.parse_args(argv)
 
+    intro_limit = INTRO_BATCH_LIMIT if args.intro_limit is None else (None if args.intro_limit <= 0 else args.intro_limit)
     engine = make_engine(args.db)
     init_db(engine)
     with open_session(engine) as session:
         try:
-            outcome = load_segment(session, city=args.city, band=args.band, refresh=args.refresh)
+            outcome = load_segment(
+                session,
+                city=args.city,
+                band=args.band,
+                refresh=args.refresh,
+                intros=not args.no_intros,
+                intro_limit=intro_limit,
+            )
         except (DataSourceError, ValueError) as exc:
             print(f"[失败] {exc}")
             return 1
@@ -309,8 +359,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"{len(outcome.places)} 条 · 来源={'数据库' if outcome.source == SOURCE_DB else 'Overpass 实时抓取'} · "
         f"本次写入 {outcome.written} 条"
     )
+    print(f"[分类] {' · '.join(f'{name} {total}' for name, total in sorted(outcome.counts_by_category.items()))}")
+    if outcome.intro_stats:
+        stats = outcome.intro_stats
+        print(f"[简介] 生成 {stats['filled']} 条 · 降级 {stats['failed']} 条 · 仍缺 {stats['pending']} 条 · {stats['provider']}")
     for row in outcome.places[: max(0, args.show)]:
-        print(f"  - {row['name']}({row['category']}) 距起点 {row['distance_km']} km")
+        intro = f" — {row['intro']}" if row.get("intro") else ""
+        print(f"  - {row['name']}({row['category']}) 距起点 {row['distance_km']} km{intro}")
     return 0
 
 

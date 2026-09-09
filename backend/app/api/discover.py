@@ -1,4 +1,10 @@
-"""试用 API:发现周边目的地(环形距离分段 + 多交通方式估算)。"""
+"""试用 API:发现周边目的地(环形距离分段 + 多交通方式估算)。
+
+阶段0 POC 路由,阶段1 保留不动;TASK-1b 只修一处**已知缺陷**:原先按 OSM 原始 tag
+把结果二分成"自然风光/旅游景点",同一地物两个 tag 并存时在两类里重复出现。现在结果
+先过 :func:`services.classify.categorize`(四分类优先级,一地只归一类),只在其真正
+所属的分类下返回,响应形状与字段不变。地图模式的四分类走 ``/api/places``。
+"""
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import time
@@ -13,14 +19,15 @@ from data_sources import (
     route as ds_route,
 )
 from services.bands import DISTANCE_BANDS as BANDS
+from services.classify import CATEGORY_CULTURE, CATEGORY_NATURE, categorize
 
 router = APIRouter()
 
 CATEGORIES: dict[str, dict[str, Any]] = {
     "自然风光": {"tags": [{"natural": "peak"}, {"natural": "waterfall"}], "element_types": "node",
-              "label": "山峰 / 瀑布"},
+              "label": "山峰 / 瀑布", "canonical": CATEGORY_NATURE},
     "旅游景点": {"tags": [{"tourism": "attraction"}, {"tourism": "viewpoint"}], "element_types": "nwr",
-              "label": "景点 / 观景点"},
+              "label": "景点 / 观景点", "canonical": CATEGORY_CULTURE},
 }
 
 # 分段定义只出一份(services.bands),POC 路由与入库/地图 API 共用同一口径。
@@ -87,6 +94,11 @@ def _find_places(origin: dict, band: dict, cat: dict) -> list[dict[str, Any]]:
     low, high = band["low"], band["high"]
     filtered = []
     for p in raw:
+        # 修复 POC 的"自然风光/旅游景点"重复:POC 直接拿 OSM tag 当分类,同一地物
+        # 同时带 natural=peak 与 tourism=attraction 就会在两类各出现一次。这里用
+        # 四分类引擎(优先级 + 一地只归一类)判定它**真正**属于哪类,只在该类下返回。
+        if categorize(p.get("tags")) != cat.get("canonical"):
+            continue
         d = haversine_km(origin["lat"], origin["lng"], p["lat"], p["lng"])
         if low <= d < high:
             filtered.append({"name": p["name"], "lat": p["lat"], "lng": p["lng"],

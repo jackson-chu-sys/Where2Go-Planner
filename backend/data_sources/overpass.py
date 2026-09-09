@@ -20,6 +20,15 @@
 * 阶段1a 起 ``parse_*``/``nearby_places`` 支持 ``with_id=True``,额外返回
   ``osm_type``/``osm_id``(入库按 OSM 身份 ``(type, id)`` 防重需要);
   默认关闭,保持阶段0 POC 的返回形状 ``{"lat", "lng", "name", "tags"}`` 不变;
+* 阶段1b 起支持**分组查询** :func:`build_grouped_query` /
+  :meth:`OverpassClient.nearby_places_grouped`:一次 HTTP 请求里放多段
+  ``( 选择器并集 ); out center N;``,每组一个独立配额。四分类并集检索必须这样做,
+  否则 ``sport=*`` / 餐厅这类高频 tag 会把总量配额刷爆,山峰/古镇一条都取不到;
+  同一实体被多组命中时由 :func:`services.classify.dedupe_places` 按 ``(type, id)`` 去重;
+* 分组并集是**冷启动批量抓取**(一个 (城市, band) 只跑一次,之后读 SQLite),实测
+  20-110s,远超交互请求的 20s 上限,因此 :meth:`OverpassClient.execute` 支持按次
+  覆盖 timeout,分组路径用 :data:`DEFAULT_GROUP_REQUEST_TIMEOUT_S`;
+  ``nearby_places``(交互/POC 路径)仍走 ``normalize_timeout`` 的 20s 上限,行为不变;
 * 公共实例经常返回 ``504 + HTML``("The server is probably too busy"),实测
   ``overpass-api.de`` 繁忙时 ``z.overpass-api.de`` / ``maps.mail.ru`` 仍可用,
   因此这里做**端点链 + 重试**降级;``overpass.osm.ch`` 实测无数据、
@@ -54,6 +63,13 @@ ENV_ENDPOINT = "WHERE2GO_OVERPASS_ENDPOINT"
 ELEMENT_TYPES = ("node", "way", "relation")
 ELEMENT_TYPES_ALIASES = {"nwr": ELEMENT_TYPES, "nw": ("node", "way")}
 DEFAULT_QUERY_TIMEOUT = 18
+# 分组并集查询的**服务端** Overpass QL 超时:比客户端 HTTP 超时略小,
+# 服务端先到点就带着已完成分组的部分结果返回(remark 记超时),而不是让整个请求失败。
+DEFAULT_GROUP_QUERY_TIMEOUT = 120
+# 分组并集查询的**客户端** HTTP 超时:冷启动批量抓取专用,不受交互 20s 上限约束
+# (实测上海 100km 六组并集 20-110s);服务端 Overpass QL 超时仍由 query_timeout 控制。
+DEFAULT_GROUP_REQUEST_TIMEOUT_S = 150.0
+MAX_GROUP_REQUEST_TIMEOUT_S = 300.0
 DEFAULT_LIMIT = 20
 FETCH_FACTOR = 12
 MIN_FETCH = 60
@@ -171,6 +187,63 @@ def build_query(
         f"(\n{statements}\n);\n"
         f"out center {resolve_fetch_limit(limit)};\n"
     )
+
+
+def resolve_group_limit(limit: Optional[int]) -> int:
+    """分组查询里每组的服务端取数条数(配额):收敛到 [1, 400]。
+
+    与 :func:`resolve_fetch_limit` 的区别:分组配额是**最终要多少条**,不再乘
+    ``FETCH_FACTOR``(本地不做二次截断,``parse_places(limit=None)`` 全收)。
+    """
+    if limit is None:
+        return MAX_FETCH
+    return max(1, min(MAX_FETCH, int(limit)))
+
+
+def build_grouped_query(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    require_name: bool = True,
+    query_timeout: float = DEFAULT_GROUP_QUERY_TIMEOUT,
+) -> str:
+    """构造**多组并集**的 Overpass QL:一次请求查完多类 tag,每组独立 ``out`` 配额。
+
+    ``groups`` 形如 ``[{"tags": [...], "element_types": "nwr", "budget": 120}, ...]``
+    (``limit`` 是 ``budget`` 的别名)。``require_name=True`` 时给每个选择器再挂
+    ``["name"]``,让服务端就滤掉无名地物(比取回 400 条再本地过滤有效得多)。
+
+    生成的语句形如::
+
+        [out:json][timeout:20];
+        (
+          nwr["piste:type"]["name"](around:100000,31.230400,121.473700);
+        );
+        out center 80;
+        (
+          nwr["sport"]["name"](around:100000,31.230400,121.473700);
+        );
+        out center 100;
+    """
+    radius = int(radius_m)
+    if radius <= 0:
+        raise ValueError(f"radius_m 必须为正数(米),收到:{radius_m!r}")
+    if not groups:
+        raise ValueError("groups 不能为空")
+    around = f"around:{radius},{float(lat):.6f},{float(lng):.6f}"
+
+    blocks: list[str] = []
+    for group in groups:
+        selectors = tags_to_selectors(group.get("tags"))
+        if require_name:
+            selectors = [f'{selector}["name"]' for selector in selectors]
+        types = normalize_element_types(group.get("element_types") or "nwr")
+        budget = resolve_group_limit(group.get("budget", group.get("limit")))
+        statements = "\n".join(f"  {etype}{selector}({around});" for selector in selectors for etype in types)
+        blocks.append(f"(\n{statements}\n);\nout center {budget};")
+    return f"[out:json][timeout:{int(query_timeout)}];\n" + "\n".join(blocks) + "\n"
 
 
 def parse_element(element: Any, *, with_id: bool = False) -> Optional[dict[str, Any]]:
@@ -316,8 +389,54 @@ class OverpassClient:
             with_id=with_id,
         )
 
-    def execute(self, query: str) -> Any:
-        """执行一段 Overpass QL:依次尝试各端点,临时失败(504/超时)自动重试与降级。"""
+    def nearby_places_grouped(
+        self,
+        lat: float,
+        lng: float,
+        radius_m: float,
+        groups: Sequence[Mapping[str, Any]],
+        *,
+        require_name: bool = True,
+        query_timeout: float = DEFAULT_GROUP_QUERY_TIMEOUT,
+        request_timeout: float = DEFAULT_GROUP_REQUEST_TIMEOUT_S,
+        with_id: bool = True,
+    ) -> list[dict[str, Any]]:
+        """分组并集检索:一次 HTTP 请求查多类 tag,每组独立配额(见 :func:`build_grouped_query`)。
+
+        返回按离中心点由近及远排序的 ``[{"lat", "lng", "name", "tags"(, osm_type/osm_id)}]``;
+        各组之间可能有重复实体(同一地物命中多组 tag),**不在这里去重**,
+        由 :func:`services.classify.dedupe_places` 按 ``(type, id)`` 合并。
+
+        ``request_timeout`` 是客户端 HTTP 超时(冷启动批量抓取,可远超交互 20s 上限);
+        公共实例繁忙时服务端可能在 ``query_timeout`` 处中止并只回**部分分组**的结果,
+        这时不报错、按拿到的入库(下次 ``refresh=true`` 可补齐)。
+        """
+        latitude = float(lat)
+        longitude = float(lng)
+        query = build_grouped_query(
+            latitude,
+            longitude,
+            radius_m,
+            groups,
+            require_name=require_name,
+            query_timeout=query_timeout,
+        )
+        payload = self.execute(query, timeout=request_timeout)
+        return parse_places(
+            payload,
+            latitude,
+            longitude,
+            limit=None,
+            require_name=require_name,
+            with_id=with_id,
+        )
+
+    def execute(self, query: str, *, timeout: Optional[float] = None) -> Any:
+        """执行一段 Overpass QL:依次尝试各端点,临时失败(504/超时)自动重试与降级。
+
+        ``timeout`` 只对本次调用生效(批量冷启动用),缺省沿用实例的 20s 上限值。
+        """
+        request_timeout = self.timeout if timeout is None else max(1.0, float(timeout))
         attempts_log: list[str] = []
         for index, endpoint in enumerate(self.endpoints):
             for attempt in range(1, self.retries + 1):
@@ -328,7 +447,7 @@ class OverpassClient:
                         source=SOURCE_NAME,
                         method="POST",
                         data={"data": query},
-                        timeout=self.timeout,
+                        timeout=request_timeout,
                         headers={"User-Agent": self.user_agent},
                     )
                 except TransientDataSourceError as exc:

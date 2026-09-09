@@ -6,6 +6,9 @@
   同批内重复也只落一行;已有 ``intro`` 不被覆盖(TASK-1b 的 LLM 简介是缓存,重抓不重算);
 * :func:`list_places` —— 按 (城市, band, 分类) 查询,并按大圆距离升序返回
   (距离复用 :func:`data_sources.haversine_km`,与抓取时的环形过滤同一口径);
+* :func:`select_places` / :func:`count_places` —— 返回 ORM 行的查询,给
+  TASK-1b 的重归类与 LLM 简介回填用(``missing_intro=True`` 只取还没简介的 POI,
+  **DB 就是简介缓存**:已有 ``intro`` 的行不会被再送去调 LLM);
 * :func:`get_segment` / :func:`record_segment` —— (城市, band) 抓取水位的读与记。
 """
 
@@ -14,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from data_sources import haversine_km
@@ -139,6 +142,63 @@ def list_places(
     ]
     rows.sort(key=lambda row: (row["distance_km"] is None, row["distance_km"] or 0.0, row["name"]))
     return rows[:limit] if limit else rows
+
+
+def _missing_intro_clause():
+    """``intro`` 为空的判定:NULL 或只有空白字符(空串不算已缓存)。"""
+    return or_(Place.intro.is_(None), func.trim(Place.intro) == "")
+
+
+def select_places(
+    session: Session,
+    *,
+    origin_city: Optional[str] = None,
+    band: Optional[str] = None,
+    category: Optional[str] = None,
+    missing_intro: bool = False,
+    limit: Optional[int] = None,
+) -> list[Place]:
+    """按条件取 ``Place`` **ORM 行**(需要就地改字段时用这个,不是 :func:`list_places`)。
+
+    ``missing_intro=True`` 只返回还没简介的行(LLM 简介按 POI 缓存的读侧)。
+    排序按 (城市, band, id),保证批量回填的顺序稳定、可重复。
+    """
+    stmt = select(Place)
+    if origin_city:
+        stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
+    if band:
+        stmt = stmt.where(Place.band == str(band))
+    if category:
+        stmt = stmt.where(Place.category == str(category))
+    if missing_intro:
+        stmt = stmt.where(_missing_intro_clause())
+    stmt = stmt.order_by(Place.origin_city, Place.band, Place.id)
+    if limit:
+        stmt = stmt.limit(max(1, int(limit)))
+    return list(session.scalars(stmt))
+
+
+def count_places(
+    session: Session,
+    *,
+    origin_city: Optional[str] = None,
+    band: Optional[str] = None,
+    category: Optional[str] = None,
+    missing_intro: Optional[bool] = None,
+) -> int:
+    """计数版 :func:`select_places`(前端"还有 N 条待生成简介"用)。"""
+    stmt = select(func.count(Place.id))
+    if origin_city:
+        stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
+    if band:
+        stmt = stmt.where(Place.band == str(band))
+    if category:
+        stmt = stmt.where(Place.category == str(category))
+    if missing_intro is True:
+        stmt = stmt.where(_missing_intro_clause())
+    elif missing_intro is False:
+        stmt = stmt.where(~_missing_intro_clause())
+    return int(session.scalar(stmt) or 0)
 
 
 def count_by_category(

@@ -91,21 +91,23 @@ class LLMProvider:
     env_api_keys: tuple[str, ...]
 
 
-# ADR-002:现状用既有 DeepSeek / Qwen key;产品化后可在此追加(或走环境变量覆盖)。
+# ADR-002:现状用既有 Qwen(百炼 token-plan)/ DeepSeek key;产品化后可在此追加(或走环境变量覆盖)。
+# 默认 = qwen(百炼个人 TOKEN 的 token-plan 入口,22:00-08:00 半价,神朱 2026-09-10 拍板):
+# 注意必须用 token-plan 入口的 compatible-mode,而非 dashscope 官方入口(后者对该 key 返回 401)。
 PROVIDERS: tuple[LLMProvider, ...] = (
+    LLMProvider(
+        name="qwen",
+        label="阿里 Qwen(百炼 token-plan 兼容模式)",
+        base_url="https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        model="qwen3.8-max",
+        env_api_keys=("ALIBABA_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY", "QWEN_API_KEY"),
+    ),
     LLMProvider(
         name="deepseek",
         label="DeepSeek",
         base_url="https://api.deepseek.com",
         model="deepseek-chat",
         env_api_keys=("DEEPSEEK_API_KEY",),
-    ),
-    LLMProvider(
-        name="qwen",
-        label="阿里 Qwen(DashScope 兼容模式)",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        model="qwen-plus",
-        env_api_keys=("DASHSCOPE_API_KEY", "QWEN_API_KEY", "ALIBABA_TOKEN_PLAN_API_KEY"),
     ),
 )
 

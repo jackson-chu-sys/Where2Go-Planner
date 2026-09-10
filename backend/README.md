@@ -262,10 +262,14 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
   阶段1b 的分组并集查询(`nearby_places_grouped`)一次请求里放多段 `(...); out center N;`,
   公共实例繁忙时单次可达 100s+,故客户端超时按次放宽到 150s(仅批量冷启动路径,
   交互路径 `nearby_places` 仍是 ≤20s)。
-* **LLM(DeepSeek)**:`POST https://api.deepseek.com/chat/completions`、模型 `deepseek-chat`,
-  key 取环境变量 `DEEPSEEK_API_KEY`;实测单条约 1.2s,6 并发回填 378 条约 90s、0 条降级。
-  环境里的 DashScope key(`ALIBABA_TOKEN_PLAN_API_KEY`)实测 `401 invalid_api_key`,故默认
-  Provider 走 DeepSeek;换供应商只需设 `WHERE2GO_LLM_PROVIDER` / `WHERE2GO_LLM_BASE_URL` /
+* **LLM(默认 Qwen / 百炼 token-plan)**:默认 Provider = `qwen`,走百炼个人 TOKEN 的
+  **token-plan 入口** `https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`
+  (OpenAI 兼容 `POST /chat/completions`),模型 `qwen3.8-max`,key 取环境变量
+  `ALIBABA_TOKEN_PLAN_API_KEY`(该入口 **22:00-08:00 半价**,神朱 2026-09-10 拍板;夜班执行器
+  的重活都安排在该窗)。⚠️ 必须用 token-plan 入口的 compatible-mode,**dashscope 官方入口**
+  (`https://dashscope.aliyuncs.com/compatible-mode/v1`)对该 key 实测 `401 invalid_api_key`。
+  `DEEPSEEK_API_KEY` 仍在注册表里作备选(实测单条约 1.2s,6 并发回填 378 条约 90s、0 条降级)。
+  换供应商只需设 `WHERE2GO_LLM_PROVIDER` / `WHERE2GO_LLM_BASE_URL` /
   `WHERE2GO_LLM_MODEL` / `WHERE2GO_LLM_API_KEY`,调用方代码不动。
 * **实测数据量(2026-09-09,上海)**:阶段1a 的 4-tag 抓取为 `50_100` 141 条 /
   `100_200` 237 条,首抓约 9-42s;阶段1b 六组并集重抓 `50_100` → 环内 **226 条**

@@ -130,7 +130,7 @@
 
 ## [TASK-1d] 修复远距离分段(200-300/300-500)目的地稀少
 
-- 状态: running
+- 状态: done
 - 目标: 修复真实 bug——远环数据被近处 POI 挤占。现状:Overpass 检索用 band 的**上限半径** (around:high) 查回一批按非距离序的 POI,总量受各组配额限制,远端 POI 几乎全被 0~low 范围内的近处 POI 占满;本地 haversine 过滤到 [low,high) 后所剩无几。实测水位:`北京 200_300` 入库仅 1 条、`上海 200_300` 仅 5 条,而 50_100=135、100_200=237(见 segment_fetch 表)。
 - 修复思路(首选):Overpass QL 支持**集合差**,把"上限圆"减去"下限圆"只取环内再 out:
   `( nwr[tag](around:HIGH,lat,lng); - nwr[tag](around:LOW,lat,lng); ); out center N;`
@@ -141,7 +141,12 @@
   2. `50_100`/`100_200` 既有行为不回退(条数、分类口径不变)
   3. 环形差集在公共实例上可用(端点链/超时/降级照旧),真实联网跑通一次
   4. pytest backend/ 全绿
-- 结果: (待夜班回填)
+- 结果: **完成**(commit `9058e31`,2026-09-10 夜班,Codex 执行)。
+  - overpass.py 新增 `build_grouped_ring_query`(每组「上限圆 - 下限圆」差集,inner<=0 退化为单圆)+ `OverpassClient.nearby_places_ring`:每组一次请求(六组合并撞公共实例 2048MB 单查询内存上限);单组仍 OOM 时按选择器拆开重发,合并后按 (osm_type,osm_id) 去重、由近及远截到该组配额;拆无可拆抛 DataSourceError,不写残缺水位。`execute` 增 `reject_runtime_errors`:OOM 致命 remark 不再换端点直接拆;超时 remark 仍收下部分分组。环形差集超时放宽一档(240s/270s)。place_loader 按 band low>0 走环形查询;分组并集、去重键、归类优先级口径不变;交互路径 nearby_places 不变。
+  - pytest backend/ = **161 passed**(143 原有 + 18 新增,全 mock)。
+  - 真实重抓对比(refresh,直连绕代理):上海 200_300 **5 → 463 条**(人文218/自然140/运动100/滑雪5,200.3-299.9km 全落环);北京 200_300 **1 → 468 条**(人文207/自然153/运动100/滑雪8,200.3-299.2km 全落环,抓取 839s,OOM 组自动拆分跑通);回退验证:上海 50_100 refresh 229→495 条(差集口径同样受益,无回退)、上海 100_200 读库 237 条不变。地理常识抽查:北京环内滑雪场=美林谷251/万龙白登山258/西部长青277km 等,全部真实落环。
+  - API 复核:GET /api/places 北京/上海 200_300 均 source=db、network_used=false 秒回(uvicorn 已重启)。
+  - 备注:重抓按许可跳过 LLM 简介,1196 条待补;夜班已起 qwen(token-plan)回填批处理,实测 5/5 生成成功。
 
 ---
 

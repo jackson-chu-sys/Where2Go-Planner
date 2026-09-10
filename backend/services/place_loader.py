@@ -5,9 +5,10 @@
 1. 查 ``SegmentFetch`` 水位 —— 有记录说明该 (城市, band) 已入库 →
    直接 :func:`db.repository.list_places` 读库返回,**不发任何网络请求**
    (读库路径也不会调 LLM,保证"二次查询秒出");
-2. 没记录 → 解析起点(Nominatim)→ 按分段**上限半径**一次查**四分类 tag 并集**
-   (:data:`SEARCH_GROUPS`,每组独立配额,见 :mod:`services.classify`)→
-   haversine 收敛到环内 → 按 OSM ``(type, id)`` **去重** + 优先级**归类**
+2. 没记录 → 解析起点(Nominatim)→ 按分段一次查**四分类 tag 并集**
+   (:data:`SEARCH_GROUPS`,每组独立配额,见 :mod:`services.classify`),分段下限 > 0 时
+   用 Overpass **环形差集**(上限圆 - 下限圆)让配额只花在环内 → haversine 复核收敛到环内
+   → 按 OSM ``(type, id)`` **去重** + 优先级**归类**
    (滑雪 > 运动 > 人文美食 > 自然,一地只入一类)→ upsert 入库 → 记水位;
 3. 入库**之后**再补 LLM 一句话简介(:func:`services.intro.fill_missing_intros`):
    DB 即缓存,已有 ``intro`` 的 POI 不再调用;失败降级成空简介,**不阻塞入库**;
@@ -46,10 +47,16 @@ from db.models import FALLBACK_OSM_TYPE, OSM_ELEMENT_TYPES, UNCATEGORIZED, Segme
 from services import classify
 from services import intro as intro_service
 from services import seed_data
-from services.bands import band_keys, band_radius_m, filter_to_band, require_band
+from services.bands import (
+    band_inner_radius_m,
+    band_keys,
+    band_radius_m,
+    filter_to_band,
+    require_band,
+)
 from services.classify import classify_places
 
-# 四分类检索线索(docs/STAGE1-PLAN.md 第 3 节):按 band 上限半径**一次**查完并集。
+# 四分类检索线索(docs/STAGE1-PLAN.md 第 3 节):按 band 环形差集**一次**查完并集。
 # 分组各带配额,避免 ``sport=*``/餐厅这类高频 tag 把总量刷爆、山峰古镇一条不剩;
 # 同一实体被多组命中时由 classify_places 按 OSM (type, id) 去重后只归一类。
 SEARCH_GROUPS: list[dict[str, Any]] = classify.search_groups()
@@ -58,6 +65,10 @@ ELEMENT_TYPES = classify.DEFAULT_ELEMENT_TYPES
 FETCH_LIMIT = overpass.MAX_FETCH
 GROUP_QUERY_TIMEOUT = overpass.DEFAULT_GROUP_QUERY_TIMEOUT
 GROUP_REQUEST_TIMEOUT = overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
+# 环形差集要在服务端扫两个圆,比单圆慢一档,超时也放宽一档(仍是批量抓取路径,
+# 交互路径 nearby_places 不受影响)。
+RING_QUERY_TIMEOUT = overpass.DEFAULT_RING_QUERY_TIMEOUT
+RING_REQUEST_TIMEOUT = overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
 # 交互式抓取时一次最多补多少条简介(全量回填走 ``python -m services.intro``)
 INTRO_BATCH_LIMIT = 40
 SOURCE_OVERPASS = "overpass"
@@ -211,19 +222,33 @@ def default_fetcher(
     *,
     client: Optional[overpass.OverpassClient] = None,
     groups: Optional[Iterable[Mapping[str, Any]]] = None,
-    query_timeout: float = GROUP_QUERY_TIMEOUT,
-    request_timeout: float = GROUP_REQUEST_TIMEOUT,
+    query_timeout: Optional[float] = None,
+    request_timeout: Optional[float] = None,
 ) -> list[dict[str, Any]]:
-    """真实抓取:按分段**上限半径**一次查四分类 tag 并集(分组配额 + ``with_id`` 防重)。
+    """真实抓取:一次查四分类 tag 并集(分组配额 + ``with_id`` 防重),远环用**环形差集**。
 
-    复用现有 overpass 环形分段机制:服务端只按上限半径 ``around`` 取数,环内收敛
-    仍由 :func:`services.bands.filter_to_band` 用 haversine 在本地做。
+    ``low > 0`` 的分段走**环形差集**(上限圆 - 下限圆,TASK-1d):在此之前只按上限半径
+    ``around`` 取数,每组配额都被 0~low 的近处 POI 占满,本地收敛到环内后只剩个位数
+    (实测北京 200-300 只有 1 条、上海 5 条);差集把配额全部花在环内。
+    ``low == 0`` 时 :func:`services.bands.band_inner_radius_m` 给 0,overpass 自动退化成
+    单圆并集查询(一次请求),行为与 TASK-1b 一致。
+
+    环内复核仍由 :func:`services.bands.filter_to_band` 用 haversine 在本地做一次:
+    way/relation 的 ``around`` 命中看的是**几何范围**(有一个节点在圈内就算),
+    按圆心距离复核才与地图上画的环一致。超时缺省按形态解析(环形更宽)。
     """
     overpass_client = client or overpass.default_client()
-    return overpass_client.nearby_places_grouped(
+    inner_radius_m = band_inner_radius_m(band)
+    ring = inner_radius_m > 0
+    if query_timeout is None:
+        query_timeout = RING_QUERY_TIMEOUT if ring else GROUP_QUERY_TIMEOUT
+    if request_timeout is None:
+        request_timeout = RING_REQUEST_TIMEOUT if ring else GROUP_REQUEST_TIMEOUT
+    return overpass_client.nearby_places_ring(
         lat,
         lng,
         band_radius_m(band),
+        inner_radius_m,
         list(groups) if groups is not None else SEARCH_GROUPS,
         require_name=True,
         query_timeout=query_timeout,

@@ -25,6 +25,28 @@
   ``( 选择器并集 ); out center N;``,每组一个独立配额。四分类并集检索必须这样做,
   否则 ``sport=*`` / 餐厅这类高频 tag 会把总量配额刷爆,山峰/古镇一条都取不到;
   同一实体被多组命中时由 :func:`services.classify.dedupe_places` 按 ``(type, id)`` 去重;
+* TASK-1d 起分组查询支持**环形差集**(:func:`build_grouped_ring_query` /
+  :meth:`OverpassClient.nearby_places_ring` 的 ``inner_radius_m``):每组语句变成
+  ``( 上限圆并集; - 下限圆并集; ); out center N;``,**配额只花在环内地物上**。
+  在此之前远距离分段(200-300 / 300-500 km)只按 band **上限半径** ``around`` 取数,
+  每组配额被 0~下限 的近处 POI 占满,本地 haversine 收敛到环内后只剩个位数
+  (实测北京 200-300 入库 1 条、上海 5 条,而 50-100 有 135 条);
+  差集要在公共实例上同时扫两个圆,实测比单圆慢一倍以上(上海 200-300 单组
+  小城古镇 24-33s、运动 57s、人文 86s、美食 71s),因此服务端/客户端超时另给一档
+  (:data:`DEFAULT_RING_QUERY_TIMEOUT` / :data:`DEFAULT_RING_REQUEST_TIMEOUT_S`);
+  ``inner_radius_m`` 缺省或为 0 时退化成普通 ``around`` 查询,输出与阶段1b 逐字一致;
+* 环形差集**不能**像单圆那样六组塞进一次请求:差集要在服务端同时物化上限圆与下限圆
+  两个集合,六组合并实测直接撞公共实例的单查询内存上限(maps.mail.ru 回
+  ``runtime error: Query run out of memory using about 2048 MB of RAM`` 且 elements 为空,
+  overpass-api.de 则 504 拒收),所以 :meth:`OverpassClient.nearby_places_ring`
+  改成**每组一次请求**(各自走端点链 + 重试);
+* 单组仍可能太重(实测**滑雪场**组四个选择器里有两个是正则,300 km 外圈在
+  overpass-api.de 与 maps.mail.ru 都撞 2048 MB 上限,各花 88-145s 才回 OOM),
+  这时把该组**按选择器拆开**逐个重发同样的差集(每条实测 27-58s 跑通),
+  拆分后仍受该组配额约束(合并 → ``(type, id)`` 去重 → 由近及远取前 ``budget`` 条);
+  OOM 之类的**致命** remark 直接抛 :class:`OverpassRuntimeError` 而不换端点
+  (三个公共实例的单查询内存上限都是 2048 MB,换端点只会再等一遍),
+  超时 remark 仍按"只回部分分组"收下,口径不变;
 * 分组并集是**冷启动批量抓取**(一个 (城市, band) 只跑一次,之后读 SQLite),实测
   20-110s,远超交互请求的 20s 上限,因此 :meth:`OverpassClient.execute` 支持按次
   覆盖 timeout,分组路径用 :data:`DEFAULT_GROUP_REQUEST_TIMEOUT_S`;
@@ -69,6 +91,10 @@ DEFAULT_GROUP_QUERY_TIMEOUT = 120
 # 分组并集查询的**客户端** HTTP 超时:冷启动批量抓取专用,不受交互 20s 上限约束
 # (实测上海 100km 六组并集 20-110s);服务端 Overpass QL 超时仍由 query_timeout 控制。
 DEFAULT_GROUP_REQUEST_TIMEOUT_S = 150.0
+# 环形差集(上限圆 - 下限圆)要在服务端扫两个圆,实测比单圆并集慢一倍以上,
+# 因此超时各放宽一档;仍不超过 MAX_GROUP_REQUEST_TIMEOUT_S。
+DEFAULT_RING_QUERY_TIMEOUT = 240
+DEFAULT_RING_REQUEST_TIMEOUT_S = 270.0
 MAX_GROUP_REQUEST_TIMEOUT_S = 300.0
 DEFAULT_LIMIT = 20
 FETCH_FACTOR = 12
@@ -77,9 +103,24 @@ MAX_FETCH = 400
 EARTH_RADIUS_KM = 6371.0088
 DETAIL_LEN = 200
 DETAIL_KEEP = 3
+# Overpass 用响应里的 ``remark`` 汇报服务端运行期错误。超时(只回部分分组)按现有口径
+# 收下;其余(OOM 等)意味着**一条都没取到**,必须把查询拆小重发,而不是当成"环内真的
+# 没有 POI"(见 :class:`OverpassRuntimeError`)。
+RUNTIME_ERROR_REMARK = "runtime error"
+TIMEOUT_REMARK = "query timed out"
 COORD_PRECISION = 7
 
 Tags = Union[Mapping[str, Any], str, Sequence[Union[Mapping[str, Any], str]]]
+
+
+class OverpassRuntimeError(DataSourceError):
+    """服务端回了**致命** ``remark``(OOM 之类):同一条查询换端点也会再撞一遍。
+
+    实测 overpass-api.de 与 maps.mail.ru 的单查询内存上限都是 2048 MB,同一句
+    ``runtime error: Query run out of memory using about 2048 MB of RAM``;换端点只是
+    白等一两分钟。:meth:`OverpassClient.nearby_places_ring` 收到它就把该组
+    **按选择器拆开**重发(每条查询小得多),拆无可拆才向调用方抛错。
+    """
 
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -215,6 +256,9 @@ def build_grouped_query(
     (``limit`` 是 ``budget`` 的别名)。``require_name=True`` 时给每个选择器再挂
     ``["name"]``,让服务端就滤掉无名地物(比取回 400 条再本地过滤有效得多)。
 
+    这是**单圆**查询(0 ~ ``radius_m``),只适合下限为 0 的分段;远距离分段(下限 > 0)
+    请用 :func:`build_grouped_ring_query`,否则每组配额都会被 0~下限 的近处 POI 吃光。
+
     生成的语句形如::
 
         [out:json][timeout:20];
@@ -227,12 +271,109 @@ def build_grouped_query(
         );
         out center 100;
     """
-    radius = int(radius_m)
-    if radius <= 0:
+    return _join_grouped_blocks(
+        _group_blocks(lat, lng, radius_m, groups, require_name=require_name), query_timeout
+    )
+
+
+def build_grouped_ring_query(
+    lat: float,
+    lng: float,
+    outer_radius_m: float,
+    inner_radius_m: float,
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    require_name: bool = True,
+    query_timeout: float = DEFAULT_RING_QUERY_TIMEOUT,
+) -> str:
+    """**环形差集**版分组并集:每组只取 ``[inner, outer]`` 环内的地物(TASK-1d)。
+
+    远距离分段(200-300 / 300-500 km)必须走这条:单圆 ``around:上限`` 的每组配额会被
+    0~下限 的近处 POI 占满,本地再按环过滤就只剩个位数。差集把近处那一圈在**服务端**
+    减掉,配额全部落在环内;分组并集、去重键 ``(type, id)``、归类优先级口径都不变。
+
+    ``inner_radius_m`` 为 0 / None 时退化成普通 ``around`` 查询,输出与
+    :func:`build_grouped_query` 逐字一致;``query_timeout`` 默认放宽一档
+    (:data:`DEFAULT_RING_QUERY_TIMEOUT`),因为服务端要同时扫两个圆。
+    """
+    return _join_grouped_blocks(
+        _group_blocks(
+            lat,
+            lng,
+            outer_radius_m,
+            groups,
+            inner_radius_m=inner_radius_m,
+            require_name=require_name,
+        ),
+        query_timeout,
+    )
+
+
+def _join_grouped_blocks(blocks: Sequence[str], query_timeout: float) -> str:
+    """把各组语句拼成**一次**请求(整条查询只有一个 ``[out:json]`` 头)。"""
+    return f"[out:json][timeout:{int(query_timeout)}];\n" + "\n".join(blocks) + "\n"
+
+
+def _around(radius_m: int, lat: float, lng: float) -> str:
+    """``around`` 的半径 + 圆心片段(坐标固定 6 位小数,便于构造出可复现的语句)。"""
+    return f"around:{radius_m},{float(lat):.6f},{float(lng):.6f}"
+
+
+def _group_statements(
+    selectors: Sequence[str], types: Sequence[str], around: str, *, indent: str = "  "
+) -> str:
+    """选择器 × 元素类型 展开成多行 ``nwr[tag](around:...);`` 语句。"""
+    return "\n".join(f"{indent}{etype}{selector}({around});" for selector in selectors for etype in types)
+
+
+def _group_blocks(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    inner_radius_m: Optional[float] = None,
+    require_name: bool = True,
+) -> list[str]:
+    """每个分组一段 Overpass QL;``inner_radius_m > 0`` 时该段是**环形差集**。
+
+    单圆(TASK-1b 口径)::
+
+        (
+          nwr["piste:type"]["name"](around:100000,31.230400,121.473700);
+        );
+        out center 80;
+
+    环形差集(TASK-1d,配额只花在环内)::
+
+        (
+          (
+            nwr["piste:type"]["name"](around:300000,31.230400,121.473700);
+          );
+          -
+          (
+            nwr["piste:type"]["name"](around:200000,31.230400,121.473700);
+          );
+        );
+        out center 80;
+
+    ``inner_radius_m`` 缺省 / 为 0 → 单圆;负数或 ``>= radius_m`` → :class:`ValueError`。
+    """
+    outer = int(radius_m)
+    if outer <= 0:
         raise ValueError(f"radius_m 必须为正数(米),收到:{radius_m!r}")
     if not groups:
         raise ValueError("groups 不能为空")
-    around = f"around:{radius},{float(lat):.6f},{float(lng):.6f}"
+    inner = int(inner_radius_m or 0)
+    if inner < 0:
+        raise ValueError(f"inner_radius_m 不能为负数(米),收到:{inner_radius_m!r}")
+    if inner >= outer:
+        raise ValueError(
+            f"inner_radius_m 必须小于 radius_m(否则环形差集为空集),"
+            f"收到:inner={inner_radius_m!r} / radius={radius_m!r}"
+        )
+    outer_around = _around(outer, lat, lng)
+    inner_around = _around(inner, lat, lng) if inner > 0 else None
 
     blocks: list[str] = []
     for group in groups:
@@ -241,9 +382,68 @@ def build_grouped_query(
             selectors = [f'{selector}["name"]' for selector in selectors]
         types = normalize_element_types(group.get("element_types") or "nwr")
         budget = resolve_group_limit(group.get("budget", group.get("limit")))
-        statements = "\n".join(f"  {etype}{selector}({around});" for selector in selectors for etype in types)
-        blocks.append(f"(\n{statements}\n);\nout center {budget};")
-    return f"[out:json][timeout:{int(query_timeout)}];\n" + "\n".join(blocks) + "\n"
+        if inner_around is None:
+            statements = _group_statements(selectors, types, outer_around)
+            blocks.append(f"(\n{statements}\n);\nout center {budget};")
+            continue
+        blocks.append(
+            f"(\n"
+            f"  (\n{_group_statements(selectors, types, outer_around, indent='    ')}\n  );\n"
+            f"  -\n"
+            f"  (\n{_group_statements(selectors, types, inner_around, indent='    ')}\n  );\n"
+            f");\nout center {budget};"
+        )
+    return blocks
+
+
+def runtime_error_remark(payload: Any) -> str:
+    """取出响应里的**致命** ``remark``(OOM 之类);超时与正常响应返回空串。
+
+    实测样本(maps.mail.ru,六组环形差集一次请求)::
+
+        {"remark": "runtime error: Query run out of memory using about 2048 MB of RAM.",
+         "elements": []}
+
+    这类响应是 HTTP 200 + 合法 JSON,光看状态码会误判成"环内没有 POI";
+    而 ``runtime error: Query timed out ...`` 是服务端到点中止、**仍带已完成分组的结果**,
+    按既有口径收下即可,不算致命。
+    """
+    if not isinstance(payload, dict):
+        return ""
+    remark = str(payload.get("remark") or "").strip()
+    lowered = remark.lower()
+    if RUNTIME_ERROR_REMARK not in lowered or TIMEOUT_REMARK in lowered:
+        return ""
+    return remark
+
+
+def _merge_split_rows(
+    rows: Iterable[dict[str, Any]], budget: int, lat: float, lng: float
+) -> list[dict[str, Any]]:
+    """把**按选择器拆开**取回的一组结果合并回去重 + 配额限制后的样子。
+
+    整组一条查询时由服务端的 ``out center budget`` 限制该组条数;拆成一个选择器一条查询
+    后每条都各自带 ``budget``,直接合并会超配额,所以在本地补上同一道限制:先按
+    ``(osm_type, osm_id)`` 去重(同一地物常被组内多个选择器命中,键与
+    :func:`services.classify.dedupe_places` 一致;没有 OSM 身份时退化成坐标 + 名称),
+    再由近及远取前 ``budget`` 条。归类优先级与跨组去重仍由 services 层负责,口径不变。
+    """
+    unique: list[dict[str, Any]] = []
+    seen: set[Any] = set()
+    for row in rows:
+        identity: Any = (row.get("osm_type"), row.get("osm_id"))
+        if identity[1] is None:
+            identity = (
+                round(float(row["lat"]), COORD_PRECISION),
+                round(float(row["lng"]), COORD_PRECISION),
+                row.get("name"),
+            )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(row)
+    unique.sort(key=lambda item: haversine_km(lat, lng, item["lat"], item["lng"]))
+    return unique[: max(1, int(budget))]
 
 
 def parse_element(element: Any, *, with_id: bool = False) -> Optional[dict[str, Any]]:
@@ -407,6 +607,9 @@ class OverpassClient:
         各组之间可能有重复实体(同一地物命中多组 tag),**不在这里去重**,
         由 :func:`services.classify.dedupe_places` 按 ``(type, id)`` 合并。
 
+        这是**单圆**路径(0 ~ ``radius_m``);下限 > 0 的分段请用 :meth:`nearby_places_ring`,
+        否则每组配额都会被近处 POI 吃光。
+
         ``request_timeout`` 是客户端 HTTP 超时(冷启动批量抓取,可远超交互 20s 上限);
         公共实例繁忙时服务端可能在 ``query_timeout`` 处中止并只回**部分分组**的结果,
         这时不报错、按拿到的入库(下次 ``refresh=true`` 可补齐)。
@@ -431,10 +634,192 @@ class OverpassClient:
             with_id=with_id,
         )
 
-    def execute(self, query: str, *, timeout: Optional[float] = None) -> Any:
+    def nearby_places_ring(
+        self,
+        lat: float,
+        lng: float,
+        outer_radius_m: float,
+        inner_radius_m: Optional[float],
+        groups: Sequence[Mapping[str, Any]],
+        *,
+        require_name: bool = True,
+        query_timeout: Optional[float] = None,
+        request_timeout: Optional[float] = None,
+        with_id: bool = True,
+    ) -> list[dict[str, Any]]:
+        """环形差集检索:只取 ``[inner_radius_m, outer_radius_m]`` 环内的地物(TASK-1d)。
+
+        与 :meth:`nearby_places_grouped` 的差别有两点:
+
+        1. **每组一次请求**。差集要在服务端同时物化上限圆与下限圆两个集合,六组塞进一次
+           请求实测直接撞公共实例的单查询内存上限(maps.mail.ru 回 OOM remark、
+           overpass-api.de 504 拒收);拆开后单组实测 24-130s 可跑通。每组各自走
+           :meth:`execute` 的端点链 + 重试退避。
+        2. **单组仍太重时按选择器再拆**(见 :meth:`_ring_group_rows`):实测滑雪场组
+           在 overpass-api.de / maps.mail.ru 都 OOM,拆成一个选择器一条差集后
+           每条 27-58s 跑通;拆分后仍受该组配额约束。
+        3. **失败要响**。某组拆到选择器粒度仍拿不到,就抛 :class:`DataSourceError`(带组名),
+           不把残缺结果当成功返回 —— 否则调用方会把这个 (城市, band) 记成"已抓取",
+           远环又只剩几条,正好回到本任务要修的老问题。
+
+        ``inner_radius_m`` 为 0 / None 时没有内圈可减,直接委托
+        :meth:`nearby_places_grouped`(单圆、一次请求、单圆超时),行为与 TASK-1b 一致。
+        分组并集、每组配额、去重键 ``(type, id)`` 与归类优先级口径都不变。
+        """
+        latitude = float(lat)
+        longitude = float(lng)
+        inner = float(inner_radius_m or 0.0)
+        ring = inner > 0
+        if query_timeout is None:
+            query_timeout = DEFAULT_RING_QUERY_TIMEOUT if ring else DEFAULT_GROUP_QUERY_TIMEOUT
+        if request_timeout is None:
+            request_timeout = DEFAULT_RING_REQUEST_TIMEOUT_S if ring else DEFAULT_GROUP_REQUEST_TIMEOUT_S
+        if not ring:
+            return self.nearby_places_grouped(
+                latitude,
+                longitude,
+                outer_radius_m,
+                groups,
+                require_name=require_name,
+                query_timeout=query_timeout,
+                request_timeout=request_timeout,
+                with_id=with_id,
+            )
+        if not groups:
+            raise ValueError("groups 不能为空")
+
+        rows: list[dict[str, Any]] = []
+        for group in groups:
+            rows.extend(
+                self._ring_group_rows(
+                    group,
+                    latitude,
+                    longitude,
+                    outer_radius_m,
+                    inner,
+                    require_name=require_name,
+                    query_timeout=query_timeout,
+                    request_timeout=request_timeout,
+                    with_id=with_id,
+                )
+            )
+        rows.sort(key=lambda item: haversine_km(latitude, longitude, item["lat"], item["lng"]))
+        return rows
+
+    def _ring_group_rows(
+        self,
+        group: Mapping[str, Any],
+        lat: float,
+        lng: float,
+        outer_radius_m: float,
+        inner_radius_m: float,
+        *,
+        require_name: bool,
+        query_timeout: float,
+        request_timeout: float,
+        with_id: bool,
+    ) -> list[dict[str, Any]]:
+        """一个分组的环内结果:先**整组一次请求**,失败再**按选择器拆开**逐个请求。
+
+        整组差集要把"该组所有选择器 × 上下限圆"一次物化,重的组会直接 OOM/504
+        (实测滑雪场组:4 个选择器里 ``sport~`` / ``ski~`` 两个是正则,300 km 外圈在
+        overpass-api.de 花 145s、maps.mail.ru 花 88s 后都回 2048 MB OOM)。拆成
+        "一个选择器一条差集查询"后每条都小得多(同组四个选择器实测 27/29/44/58s 全部跑通),
+        是公共实例上的常规降级手段。
+
+        拆分后仍受**该组配额**约束:合并 → ``(type, id)`` 去重 → 由近及远取前 ``budget`` 条
+        (:func:`_merge_split_rows`),与整组查询 ``out center budget`` 的口径一致。
+        拆到选择器粒度仍全部失败才抛错(带组名),免得把残缺结果记成"已抓取"的水位。
+        """
+        label = str(group.get("group") or group.get("category") or "未命名分组")
+        budget = resolve_group_limit(group.get("budget", group.get("limit")))
+
+        def fetch(targets: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+            return self._ring_request(
+                targets,
+                lat,
+                lng,
+                outer_radius_m,
+                inner_radius_m,
+                require_name=require_name,
+                query_timeout=query_timeout,
+                request_timeout=request_timeout,
+                with_id=with_id,
+            )
+
+        try:
+            return fetch([group])
+        except DataSourceError as exc:
+            whole = exc
+
+        selectors = tags_to_selectors(group.get("tags"))
+        if len(selectors) < 2:
+            raise self._ring_failure(label, whole) from whole
+
+        rows: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for selector in selectors:
+            split = dict(group)
+            split["tags"] = [selector]
+            try:
+                rows.extend(fetch([split]))
+            except DataSourceError as exc:
+                failures.append(f"{selector}:{exc.message[:DETAIL_LEN]}")
+        if failures:
+            raise self._ring_failure(label, whole, failures) from whole
+        return _merge_split_rows(rows, budget, lat, lng)
+
+    def _ring_request(
+        self,
+        groups: Sequence[Mapping[str, Any]],
+        lat: float,
+        lng: float,
+        outer_radius_m: float,
+        inner_radius_m: float,
+        *,
+        require_name: bool,
+        query_timeout: float,
+        request_timeout: float,
+        with_id: bool,
+    ) -> list[dict[str, Any]]:
+        """发一条环形差集查询并解析(端点链 + 重试由 :meth:`execute` 负责)。"""
+        query = build_grouped_ring_query(
+            lat,
+            lng,
+            outer_radius_m,
+            inner_radius_m,
+            groups,
+            require_name=require_name,
+            query_timeout=query_timeout,
+        )
+        payload = self.execute(query, timeout=request_timeout, reject_runtime_errors=True)
+        return parse_places(
+            payload, lat, lng, limit=None, require_name=require_name, with_id=with_id
+        )
+
+    @staticmethod
+    def _ring_failure(
+        label: str, cause: DataSourceError, failures: Optional[Sequence[str]] = None
+    ) -> DataSourceError:
+        """「某组取不到数」的统一错误:带组名与失败明细,便于定位是哪类 tag 太重。"""
+        detail = ";".join(failures[-DETAIL_KEEP:]) if failures else cause.message
+        return DataSourceError(
+            SOURCE_NAME,
+            f"环形差集分组「{label}」取数失败,本次抓取按失败处理"
+            f"(不写残缺水位,可稍后 refresh 重试):{detail}",
+        )
+
+    def execute(
+        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
+    ) -> Any:
         """执行一段 Overpass QL:依次尝试各端点,临时失败(504/超时)自动重试与降级。
 
         ``timeout`` 只对本次调用生效(批量冷启动用),缺省沿用实例的 20s 上限值。
+        ``reject_runtime_errors=True`` 时,HTTP 200 但带**致命** ``remark``(OOM 之类,
+        见 :func:`runtime_error_remark`)的响应直接抛 :class:`OverpassRuntimeError`:
+        这类错误源于查询本身太重,而三个公共实例的单查询内存上限实测都是 2048 MB,
+        换端点只会再等一遍;该由调用方把查询拆小(见 :meth:`_ring_group_rows`)。
+        超时 remark 不在此列,照旧收下部分结果。
         """
         request_timeout = self.timeout if timeout is None else max(1.0, float(timeout))
         attempts_log: list[str] = []
@@ -454,11 +839,16 @@ class OverpassClient:
                     attempts_log.append(f"{endpoint} 第{attempt}次:{exc.message[:DETAIL_LEN]}")
                     self._backoff(index, attempt)
                     continue
-                self.used_endpoint = endpoint
                 if not isinstance(payload, dict):
                     raise DataSourceError(
                         SOURCE_NAME, f"响应格式异常(应为 JSON 对象):{type(payload).__name__}"
                     )
+                remark = runtime_error_remark(payload) if reject_runtime_errors else ""
+                if remark:
+                    raise OverpassRuntimeError(
+                        SOURCE_NAME, f"{endpoint} 服务端致命错误:{remark[:DETAIL_LEN]}"
+                    )
+                self.used_endpoint = endpoint
                 return payload
 
         tried = "、".join(self.endpoints)

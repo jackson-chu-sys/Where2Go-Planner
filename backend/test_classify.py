@@ -35,7 +35,7 @@ from db import init_db, make_engine, session_factory  # noqa: E402
 from db import repository as repo  # noqa: E402
 from db.models import UNCATEGORIZED, Place  # noqa: E402
 from services import classify, intro as intro_service, place_loader, reclassify  # noqa: E402
-from services.bands import DISTANCE_BANDS, band_radius_m  # noqa: E402
+from services.bands import DISTANCE_BANDS, band_inner_radius_m, band_radius_m  # noqa: E402
 from services.classify import (  # noqa: E402
     CATEGORY_CULTURE,
     CATEGORY_NATURE,
@@ -103,15 +103,22 @@ class RecordingGeocoder:
 
 
 class FakeOverpassClient:
-    """Overpass 客户端替身:记录分组并集调用的半径与分组(验证真实抓取路径)。"""
+    """Overpass 客户端替身:记录批量抓取调用的半径/内圈/分组(验证真实抓取路径)。"""
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     def nearby_places_grouped(self, lat: float, lng: float, radius_m: float,
                               groups: Any, **kwargs: Any) -> list[dict[str, Any]]:
-        self.calls.append({"lat": lat, "lng": lng, "radius_m": radius_m,
+        self.calls.append({"lat": lat, "lng": lng, "radius_m": radius_m, "inner_radius_m": 0.0,
                            "groups": list(groups), **kwargs})
+        return []
+
+    def nearby_places_ring(self, lat: float, lng: float, outer_radius_m: float,
+                           inner_radius_m: Any, groups: Any,
+                           **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append({"lat": lat, "lng": lng, "radius_m": outer_radius_m,
+                           "inner_radius_m": inner_radius_m, "groups": list(groups), **kwargs})
         return []
 
 
@@ -165,6 +172,19 @@ class FakeSession:
                            "query": data.get("data") if isinstance(data, Mapping) else None,
                            "timeout": timeout, "headers": dict(headers or {})})
         return FakeResponse(self.payload)
+
+
+class QueuedSession(FakeSession):
+    """按调用顺序返回预设 payload(用于"整组差集 OOM → 按选择器拆开后成功"这类降级)。"""
+
+    def __init__(self, *payloads: Any) -> None:
+        super().__init__(payloads[-1] if payloads else {})
+        self.payloads = list(payloads) or [{}]
+
+    def request(self, method: str, url: str, params: Any = None, data: Any = None,
+                timeout: Any = None, headers: Any = None) -> FakeResponse:
+        self.payload = self.payloads[min(len(self.calls), len(self.payloads) - 1)]
+        return super().request(method, url, params, data, timeout, headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +444,96 @@ def test_nearby_places_grouped_sends_a_single_post_and_keeps_osm_ids() -> None:
     assert [(row["name"], row["category"]) for row in classified] == [("雪场", CATEGORY_SKI), ("古镇", CATEGORY_CULTURE)]
 
 
+def test_grouped_ring_query_keeps_every_group_budget_inside_the_ring() -> None:
+    """TASK-1d:远环改用集合差,六组的配额口径与单圆并集**完全一致**。"""
+    query = overpass.build_grouped_ring_query(
+        SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, classify.search_groups(), query_timeout=240
+    )
+    assert query.startswith("[out:json][timeout:240];")
+    assert query.count("[out:json]") == 1, "环形差集仍然是**一次**请求"
+    assert query.count("out center ") == len(classify.SEARCH_GROUPS), "每组一个独立配额"
+    for group in classify.SEARCH_GROUPS:
+        assert f"out center {group['budget']};" in query, f"{group['group']} 配额不变"
+    # 每组都要同时扫上限圆与下限圆,并用一个差集运算符把内圈减掉
+    outer = query.count("around:300000,31.230400,121.473700")
+    inner = query.count("around:200000,31.230400,121.473700")
+    assert outer == inner > 0, "上下限圆的选择器数量必须对称"
+    assert query.count("\n  -\n") == len(classify.SEARCH_GROUPS), "每组一个集合差"
+    assert '["piste:type"]["name"](around:300000' in query, "require_name 口径不变"
+
+
+def test_nearby_places_ring_sends_one_difference_request_per_group() -> None:
+    """TASK-1d:环形差集**每组一次请求**,配额/去重口径与单圆并集完全一致。
+
+    六组塞进一次请求会撞公共实例的单查询内存上限(实测 OOM / 504),拆开后单组可跑通。
+    """
+    payload = {"elements": [
+        {"type": "node", "id": 1, "lat": 33.03, "lon": 121.47, "tags": {"name": "环内古镇", "historic": "town"}},
+        {"type": "way", "id": 2, "center": {"lat": 32.9, "lon": 120.1}, "tags": {"name": "环内山峰", "natural": "peak"}},
+    ]}
+    fake = FakeSession(payload)
+    client = overpass.OverpassClient(session=fake, retries=1, retry_backoff_s=0)
+    groups = classify.search_groups()
+    rows = client.nearby_places_ring(SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, groups)
+
+    assert len(fake.calls) == len(groups), "每组一次请求"
+    for call, group in zip(fake.calls, groups):
+        sent = call["query"]
+        assert sent.count("[out:json]") == 1
+        assert sent.count("out center ") == 1, "一次请求只查一组"
+        assert f"out center {group['budget']};" in sent, f"{group['group']} 配额不变"
+        assert f"[timeout:{overpass.DEFAULT_RING_QUERY_TIMEOUT}]" in sent, "环形查询放宽服务端超时"
+        assert call["timeout"] == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S, "客户端超时同步放宽"
+        assert "around:300000" in sent and "around:200000" in sent and "\n  -\n" in sent
+    # 抓取层仍不去重(同一实体被多组命中),但跨组合并后按由近及远排序(古镇 200 km < 山峰 226 km)
+    assert len(rows) == 2 * len(groups)
+    assert [row["name"] for row in rows] == ["环内古镇"] * len(groups) + ["环内山峰"] * len(groups)
+    assert {(row["osm_type"], row["osm_id"]) for row in rows} == {("node", 1), ("way", 2)}
+    classified = classify_places(rows)
+    assert [(row["name"], row["category"]) for row in classified] == [
+        ("环内古镇", CATEGORY_CULTURE), ("环内山峰", CATEGORY_NATURE)
+    ], "去重键 (type, id) 与归类优先级口径不变"
+
+
+OOM_REMARK = "runtime error: Query run out of memory using about 2048 MB of RAM."
+
+
+def test_ring_falls_back_to_per_selector_difference_for_the_heavy_ski_group() -> None:
+    """实测**滑雪场**组整条差集在公共实例上 OOM(2048 MB),必须能按选择器拆开重发。
+
+    拆分只改"发几条查询",不改口径:每条仍是环形差集、仍带**该组**配额,合并后按
+    ``(type, id)`` 去重并截到配额,归类优先级照旧由 :func:`classify_places` 决定。
+    """
+    ski = next(group for group in classify.search_groups() if group["category"] == CATEGORY_SKI)
+    selectors = overpass.tags_to_selectors(ski["tags"])
+    assert len(selectors) > 1, "滑雪场组本来就是多选择器并集,才需要拆分降级"
+    payload = {"elements": [
+        {"type": "node", "id": 1, "lat": 33.03, "lon": 121.47,
+         "tags": {"name": "环内雪场", "piste:type": "downhill", "sport": "skiing"}},
+        {"type": "way", "id": 2, "center": {"lat": 32.9, "lon": 120.1},
+         "tags": {"name": "环内雪道", "piste:type": "downhill"}},
+    ]}
+    session = QueuedSession({"remark": OOM_REMARK, "elements": []}, *([payload] * len(selectors)))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
+    rows = client.nearby_places_ring(SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, [ski])
+
+    assert len(session.calls) == 1 + len(selectors), "整组 1 次 + 每个选择器各 1 次"
+    for call, selector in zip(session.calls, [None, *selectors]):
+        sent = call["query"]
+        assert sent.count("out center ") == 1, "一次请求只查一组/一个选择器"
+        assert f"out center {ski['budget']};" in sent, f"{ski['group']} 配额不变"
+        assert "\n  -\n" in sent and "around:300000" in sent and "around:200000" in sent
+        assert call["timeout"] == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
+        if selector is not None:
+            assert f'{selector}["name"]' in sent, "每个选择器单独一条差集查询"
+    # 同两个地物被每个选择器各命中一次 → 按 (type, id) 去重后只剩 2 条(未超配额)
+    assert {(row["osm_type"], row["osm_id"]) for row in rows} == {("node", 1), ("way", 2)}
+    assert len(rows) == 2
+    assert [(row["name"], row["category"]) for row in classify_places(rows)] == [
+        ("环内雪场", CATEGORY_SKI), ("环内雪道", CATEGORY_SKI)
+    ], "归类优先级口径不变"
+
+
 # --------------------------------------------------------------------------- #
 # 5. 入库链路:去重归类写 Place.category
 # --------------------------------------------------------------------------- #
@@ -442,20 +552,51 @@ def test_to_place_items_dedupes_and_classifies_before_insert() -> None:
     assert all("intro" not in item for item in items), "简介在入库后由 services.intro 补,不在归类阶段生成"
 
 
-def test_loader_uses_four_category_union_groups_by_upper_radius() -> None:
+def test_loader_fetches_every_band_as_a_ring_difference() -> None:
     assert place_loader.SEARCH_GROUPS == classify.search_groups()
     assert {group["category"] for group in place_loader.SEARCH_GROUPS} == set(CATEGORY_PRIORITY)
     assert place_loader.SEARCH_TAGS == classify.search_tags()
     assert place_loader.GROUP_REQUEST_TIMEOUT > 20, "冷启动批量抓取不受交互 20s 上限约束"
+    assert place_loader.RING_REQUEST_TIMEOUT > place_loader.GROUP_REQUEST_TIMEOUT, "差集更慢,超时放宽一档"
 
     client = FakeOverpassClient()
     band = DISTANCE_BANDS[1]
     place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
     assert len(client.calls) == 1, "四分类并集只发一次 Overpass 请求"
     call = client.calls[0]
-    assert call["radius_m"] == band_radius_m(band), "按分段**上限半径**检索(环内收敛在本地做)"
+    assert call["radius_m"] == band_radius_m(band), "外圈仍是分段**上限半径**"
+    assert call["inner_radius_m"] == band_inner_radius_m(band) == 100_000, "内圈 = 分段下限(配额只花在环内)"
     assert call["groups"] == classify.search_groups(), "一次查完四分类 tag 并集"
     assert call["with_id"] is True, "带 OSM 身份才能按 (type, id) 去重"
+    assert call["query_timeout"] == place_loader.RING_QUERY_TIMEOUT
+    assert call["request_timeout"] == place_loader.RING_REQUEST_TIMEOUT
+
+
+def test_loader_ring_covers_every_band_with_positive_lower_bound() -> None:
+    """四个分段下限都 > 0,所以全部都走环形差集(远环稀少 bug 的根因就在这里)。"""
+    client = FakeOverpassClient()
+    for band in DISTANCE_BANDS:
+        place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
+    assert [call["inner_radius_m"] for call in client.calls] == [
+        band_inner_radius_m(band) for band in DISTANCE_BANDS
+    ]
+    assert all(call["inner_radius_m"] > 0 for call in client.calls)
+    assert [call["radius_m"] for call in client.calls] == [band_radius_m(band) for band in DISTANCE_BANDS]
+
+
+def test_loader_degrades_to_single_circle_when_band_low_is_zero() -> None:
+    """下限为 0 的分段没有内圈可减 → 退化成单圆查询与单圆超时(行为同 TASK-1b)。"""
+    client = FakeOverpassClient()
+    band = {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50}
+    assert band_inner_radius_m(band) == 0.0
+    place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
+    call = client.calls[0]
+    assert call["inner_radius_m"] == 0.0
+    assert call["radius_m"] == 50_000
+    assert call["query_timeout"] == place_loader.GROUP_QUERY_TIMEOUT
+    assert call["request_timeout"] == place_loader.GROUP_REQUEST_TIMEOUT
+
+
 
 
 def test_load_segment_stores_one_row_per_feature_with_priority_category(session) -> None:

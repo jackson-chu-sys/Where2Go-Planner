@@ -391,6 +391,73 @@ def test_overpass_rejects_bad_inputs() -> None:
     expect_error(lambda: overpass.normalize_element_types("point"), ValueError, "element_types")
 
 
+def test_overpass_build_grouped_ring_query_shape() -> None:
+    """TASK-1d:每组 ``( 上限圆; - 下限圆; ); out center N;``,配额只花在环内。"""
+    groups = [{"tags": [{"historic": None}], "element_types": "nw", "budget": 40}]
+    query = overpass.build_grouped_ring_query(
+        39.9042, 116.4074, 300_000, 200_000, groups, query_timeout=240
+    )
+    assert query == (
+        "[out:json][timeout:240];\n"
+        "(\n"
+        "  (\n"
+        '    node["historic"]["name"](around:300000,39.904200,116.407400);\n'
+        '    way["historic"]["name"](around:300000,39.904200,116.407400);\n'
+        "  );\n"
+        "  -\n"
+        "  (\n"
+        '    node["historic"]["name"](around:200000,39.904200,116.407400);\n'
+        '    way["historic"]["name"](around:200000,39.904200,116.407400);\n'
+        "  );\n"
+        ");\n"
+        "out center 40;\n"
+    )
+
+
+def test_overpass_ring_query_defaults_to_a_wider_server_timeout() -> None:
+    groups = [{"tags": [{"sport": None}], "budget": 10}]
+    ring = overpass.build_grouped_ring_query(39.9042, 116.4074, 300_000, 200_000, groups)
+    # 差集要在服务端扫两个圆,默认超时比单圆分组查询放宽一档
+    assert ring.startswith(f"[out:json][timeout:{overpass.DEFAULT_RING_QUERY_TIMEOUT}];")
+    assert overpass.DEFAULT_RING_QUERY_TIMEOUT > overpass.DEFAULT_GROUP_QUERY_TIMEOUT
+    assert overpass.DEFAULT_RING_REQUEST_TIMEOUT_S > overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
+    assert overpass.DEFAULT_RING_REQUEST_TIMEOUT_S <= overpass.MAX_GROUP_REQUEST_TIMEOUT_S
+
+
+def test_overpass_ring_query_degrades_to_single_circle_without_inner_radius() -> None:
+    """下限为 0(或缺省)时退化成普通 around 查询,与单圆分组查询逐字一致。"""
+    groups = [{"tags": [{"natural": "peak"}], "budget": 60}]
+    plain = overpass.build_grouped_query(39.9042, 116.4074, 100_000, groups, query_timeout=120)
+    for inner in (0, 0.0, None):
+        ring = overpass.build_grouped_ring_query(39.9042, 116.4074, 100_000, inner, groups, query_timeout=120)
+        assert ring == plain
+    assert "\n  -\n" not in plain, "退化路径不应出现集合差运算符"
+    assert plain.count("around:100000,39.904200,116.407400") == 3  # nwr × 1 组 tag
+
+
+def test_overpass_ring_query_rejects_bad_radii() -> None:
+    groups = [{"tags": [{"natural": "peak"}], "budget": 60}]
+    expect_error(
+        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 300_000, groups),
+        ValueError, "inner_radius_m", "radius_m",
+    )
+    expect_error(
+        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 200_000, groups),
+        ValueError, "inner_radius_m",
+    )
+    expect_error(
+        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, -1, groups),
+        ValueError, "inner_radius_m",
+    )
+    expect_error(
+        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 0, 0, groups), ValueError, "radius_m"
+    )
+    expect_error(
+        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 100_000, []),
+        ValueError, "groups",
+    )
+
+
 def test_overpass_parse_places_sorts_and_falls_back_names() -> None:
     places = overpass.parse_places(OVERPASS_PAYLOAD, 39.9042, 116.4074, limit=None)
     # 无坐标的 relation 被丢弃;剩下的按大圆距离升序
@@ -467,6 +534,151 @@ def test_overpass_rejects_payload_without_elements() -> None:
         ds.DataSourceError,
         "elements",
     )
+
+
+OOM_REMARK = "runtime error: Query run out of memory using about 2048 MB of RAM."
+TIMEOUT_REMARK = 'runtime error: Query timed out in "nwr" at line 4 after 240 seconds.'
+RING_GROUP = [{"group": "小城古镇", "tags": ['["place"~"^(town|village)$"]'],
+               "element_types": "nwr", "budget": 40}]
+# 实测**滑雪场**组的整条差集在 overpass-api.de / maps.mail.ru 都撞 2048 MB 上限,
+# 这里用两个选择器 + 配额 2 复现同一形态(便于断言去重与配额截断)。
+HEAVY_GROUP = [{"group": "滑雪场", "tags": ['["piste:type"]', '["ski"~"^(yes)$"]'],
+                "element_types": "nwr", "budget": 2}]
+
+
+def test_overpass_runtime_error_remark_tells_oom_from_timeout() -> None:
+    """OOM 是致命 remark;超时只是"服务端到点中止 + 仍回部分分组",按既有口径收下。"""
+    assert overpass.runtime_error_remark({"remark": OOM_REMARK, "elements": []}) == OOM_REMARK
+    assert overpass.runtime_error_remark({"remark": TIMEOUT_REMARK, "elements": []}) == ""
+    assert overpass.runtime_error_remark({"elements": []}) == ""
+    assert overpass.runtime_error_remark("不是 JSON 对象") == ""
+
+
+def test_overpass_execute_raises_on_out_of_memory_remark_without_failover() -> None:
+    """OOM remark 是 HTTP 200 + 合法 JSON,病根在查询太重:换端点只会再撞同一内存上限。"""
+    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
+    client = overpass.OverpassClient(session=session, retries=2, retry_backoff_s=0, sleep=lambda _: None)
+    expect_error(
+        lambda: client.execute("[out:json][timeout:240];out;", reject_runtime_errors=True),
+        overpass.OverpassRuntimeError,
+        "服务端致命错误",
+        "out of memory",
+    )
+    assert len(session.calls) == 1, "致命 remark 不原地重试、也不换端点(交给调用方拆小查询)"
+    assert client.used_endpoint is None
+
+
+def test_overpass_ring_splits_a_too_heavy_group_by_selector() -> None:
+    """整组差集 OOM → **按选择器拆开**重发同样的差集(每条小得多,实测 27-58s 跑通)。"""
+    piste = {"type": "way", "id": 9, "center": {"lat": 41.5, "lon": 117.0},
+             "tags": {"name": "环内雪道", "piste:type": "downhill"}}
+    resort = {"type": "node", "id": 8, "lat": 41.2, "lon": 116.9,
+              "tags": {"name": "环内雪场", "ski": "yes"}}
+    session = FakeSession(
+        FakeResponse({"remark": OOM_REMARK, "elements": []}),
+        FakeResponse({"elements": [piste]}),
+        FakeResponse({"elements": [resort]}),
+    )
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, HEAVY_GROUP)
+
+    assert len(session.calls) == 3, "整组 1 次 + 每个选择器各 1 次"
+    for call in session.calls:
+        sent = call.data["data"]
+        assert sent.count("[out:json]") == 1
+        assert sent.count("out center 2;") == 1, "拆分后该组配额不变"
+        assert "around:300000,39.904200,116.407400" in sent
+        assert "around:200000,39.904200,116.407400" in sent and "\n  -\n" in sent, "拆分后仍是环形差集"
+        assert call.timeout == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
+    assert '["piste:type"]["name"]' in session.calls[1].data["data"], "第一个选择器单独一条差集"
+    assert '["ski"~"^(yes)$"]["name"]' in session.calls[2].data["data"]
+    assert [(row["name"], row["osm_type"], row["osm_id"]) for row in rows] == [
+        ("环内雪场", "node", 8), ("环内雪道", "way", 9)
+    ], "跨选择器合并后仍按由近及远排序"
+
+
+def test_overpass_ring_split_rows_are_deduped_and_capped_by_group_budget() -> None:
+    """拆分后每组仍受配额约束:``(type, id)`` 去重 + 由近及远取前 ``budget`` 条。"""
+
+    def node(osm_id: int, lat: float, name: str) -> dict[str, Any]:
+        return {"type": "node", "id": osm_id, "lat": lat, "lon": 116.4074,
+                "tags": {"name": name, "piste:type": "downhill", "ski": "yes"}}
+
+    session = FakeSession(
+        FakeResponse({"remark": OOM_REMARK, "elements": []}),
+        FakeResponse({"elements": [node(3, 42.0, "最远"), node(2, 41.0, "中间"), node(1, 40.4, "最近")]}),
+        FakeResponse({"elements": [node(1, 40.4, "最近"), node(3, 42.0, "最远")]}),
+    )
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, HEAVY_GROUP)
+
+    assert [(row["name"], row["osm_id"]) for row in rows] == [("最近", 1), ("中间", 2)], (
+        "两个选择器命中同一地物只留一条,并按该组配额(2)由近及远截断"
+    )
+
+
+def test_overpass_ring_fails_loud_when_the_selector_split_also_fails() -> None:
+    """拆到选择器粒度仍全灭 → 抛错带组名,且不白跑后面的分组(不写残缺水位)。"""
+    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    groups = HEAVY_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
+    expect_error(
+        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, groups),
+        ds.DataSourceError, "滑雪场", "服务端致命错误", "out of memory",
+    )
+    assert len(session.calls) == 3, "整组 1 次 + 两个选择器各 1 次,第一组失败即中止"
+
+
+def test_overpass_ring_does_not_split_a_single_selector_group() -> None:
+    """只有一个选择器时无从再拆:直接失败,不把同一条查询原样重发一遍。"""
+    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
+    client = overpass.OverpassClient(session=session, retries=2, retry_backoff_s=0, sleep=lambda _: None)
+    expect_error(
+        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_GROUP),
+        ds.DataSourceError, "小城古镇", "服务端致命错误",
+    )
+    assert len(session.calls) == 1
+
+
+def test_overpass_ring_accepts_partial_groups_on_timeout_remark() -> None:
+    """超时 remark(带已完成的结果)不算失败:照旧入库,下次 refresh 再补齐。"""
+    session = FakeSession(FakeResponse({
+        "remark": TIMEOUT_REMARK,
+        "elements": [{"type": "node", "id": 3, "lat": 40.5, "lon": 116.9,
+                      "tags": {"name": "环内村落", "place": "village"}}],
+    }))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
+    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_GROUP)
+    assert len(session.calls) == 1, "超时不换端点、不重试"
+    assert [row["name"] for row in rows] == ["环内村落"]
+
+
+def test_overpass_ring_reports_the_group_that_exhausted_the_endpoint_chain() -> None:
+    """某组把端点链跑完仍失败 → 抛错并带组名(不返回残缺结果,免得被记成"已抓取")。"""
+    session = FakeSession(FakeResponse(None, status_code=504, text=OVERPASS_BUSY_HTML))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    groups = RING_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
+    expect_error(
+        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, groups),
+        ds.DataSourceError, "小城古镇", "所有 Overpass 端点均不可用", "too busy",
+    )
+    assert len(session.calls) == len(client.endpoints), "第一组失败即中止,不白跑后面几组"
+
+
+def test_overpass_ring_without_inner_radius_delegates_to_single_circle() -> None:
+    """下限为 0 → 退化成单圆并集:一次请求、单圆超时、无差集运算符(TASK-1b 行为不变)。"""
+    session = FakeSession(FakeResponse({"elements": []}))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
+    groups = RING_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
+    client.nearby_places_ring(39.9042, 116.4074, 100_000, 0, groups)
+
+    assert len(session.calls) == 1, "单圆仍然一次请求查完所有分组"
+    sent = session.last.data["data"]
+    assert sent.startswith(f"[out:json][timeout:{overpass.DEFAULT_GROUP_QUERY_TIMEOUT}];")
+    assert session.last.timeout == overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
+    assert sent.count("out center ") == len(groups)
+    assert "around:100000,39.904200,116.407400" in sent
+    assert "\n  -\n" not in sent, "退化路径不应出现集合差运算符"
 
 
 def test_overpass_haversine_matches_known_distance() -> None:

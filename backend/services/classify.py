@@ -6,8 +6,10 @@
    (:data:`CATEGORY_RULES` 按此顺序排列,首次命中即定类);
 2. **去重键 = OSM ``type + id``**:同一实体被多组检索 tag 命中时合并 tags 后只留一行
    (:func:`dedupe_places`),没有 OSM id 的种子数据由调用方给 ``identity`` 兜底;
-3. **检索**:按 band 上限半径一次查四分类 tag 的**并集**,每组带独立配额
-   (:data:`SEARCH_GROUPS`),避免某一类(如餐厅)把总量刷爆。
+3. **检索**:一次查四分类 tag 的**并集**,每组带独立配额(:data:`SEARCH_GROUPS`),
+   避免某一类(如餐厅)把总量刷爆;band 下限 > 0 时由
+   :func:`data_sources.overpass.build_grouped_ring_query` 取**环形差集**
+   (上限圆 - 下限圆),配额只花在环内(TASK-1d)—— 分组、配额与归类口径都不变。
 
 分类与 OSM tag 的对照(STAGE1-PLAN 第 3 节表格):
 

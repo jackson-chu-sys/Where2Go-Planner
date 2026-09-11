@@ -181,7 +181,7 @@
   3. 跳转按钮可点、URL 正确(新页打开)
   4. 页面无 JS 报错;既有功能回归正常
   5. 可用 Hermes browser_exec 做一次自动 QA(开页→点 pin→出面板→画线→无 console error)
-- 结果: **完成**(commit `<见 git log feat(frontend)>`,2026-09-11 夜班,Codex 起草+执行器收尾;Codex 单次调用超 30min 上限被熔断,产物已就绪故未重跑)。
+- 结果: **完成**(commit `388da20`,2026-09-11 夜班,Codex 起草+执行器收尾;Codex 单次调用超 30min 上限被熔断,产物已就绪故未重跑)。
   - index.html(+429 行):点 pin → popup 内「🚗 路线对比」按钮 → 路线面板(各方式卡片:图标/时长/费用/里程/note/「真实·估算」徽标/生成时间);选中卡片地图画线(驾车=OSRM geometry 青实线,铁路=蓝虚线示意、飞机=紫虚线示意),切换换线、关闭清线;每卡片 deep-link 跳转按钮(target=_blank rel=noopener,高德/Google/12306/OTA);加载/失败/空态友好提示;既有 pin 着色、popup 简介、band 切换、搜索、定位、补简介零回退。
   - 新增 backend/test_frontend_routes.py 轻量静态断言(面板 DOM/JS 函数/api 调用存在),全 mock。pytest backend/ = **212 passed**(189 既有零回退 + 23 新增)。
   - browser_exec 真实 QA(uvicorn :8000 已重启到新版):开页 495 pin→点 pin 出 popup→点路线按钮→面板出驾车卡片(OSRM real 50min/¥60 估算/62.8km,note 含估算口径)→画线 4 条 path→跳链 URL 正确(uri.amap.com/google maps,target=_blank)→关闭清线、全程 window error **0** 条。

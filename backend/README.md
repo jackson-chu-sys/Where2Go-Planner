@@ -1,4 +1,5 @@
 # backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b/1c)+ 路线服务与费用估算(阶段2a)
++ 前端路线面板(阶段2b)
 
 对应任务:`tasks/TASK-001-data-source-poc.md`(阶段0,ADR-006:免费、无需 key 的数据源)、
 `docs/NIGHTLY-QUEUE.md` TASK-1a(阶段1a:Place 入库 + 检索 API + Leaflet 地图,
@@ -7,7 +8,9 @@ LLM 一句话简介 + popup 卡片,规格见 `docs/STAGE1-PLAN.md` 第 3 节)、
 TASK-1c(阶段1c:浏览器"我的位置"定位/换城 + 滑雪/运动**人工种子数据**垫底,
 规格见 `docs/STAGE1-PLAN.md` 第 3 节"数据支撑现实")、
 TASK-2a(阶段2a:多方式**路线服务 + 费用估算** + `GET /api/routes` + deep-link 跳转链接,
-规格见 `docs/STAGE2-PLAN.md` 第 2/4 节)。
+规格见 `docs/STAGE2-PLAN.md` 第 2/4 节)、
+TASK-2b(阶段2b:**前端路线面板** —— 点 pin 出多方式卡片 + 地图画线 + deep-link 跳转,
+规格见 `docs/STAGE2-PLAN.md` 第 3 节)。
 
 ## 目录
 
@@ -20,6 +23,7 @@ backend/
 ├─ test_classify.py              阶段1b:归类优先级/跨 tag 去重/检索并集/LLM 简介的纯 mock 单测(46 个用例)
 ├─ test_seed_data.py             阶段1c:种子数据校验/合并去重/来源标注/起点逆地理编码的纯 mock 单测(56 个用例)
 ├─ test_routes.py                阶段2a:路线编排/费用系数/deep-link/参数校验/OSRM 降级的纯 mock 单测(28 个用例)
+├─ test_frontend_routes.py       阶段2b:前端路线面板静态页断言 + 前后端字段契约 + node 语法检查(23 个用例)
 ├─ data_sources/                 数据获取层(阶段0,免费无 key)
 │  ├─ __init__.py                统一导出 route / geocode / reverse / nearby_places
 │  ├─ _common.py                 User-Agent、timeout(≤20s)、JSON 请求与中文错误
@@ -50,8 +54,8 @@ backend/
    ├─ api/places.py              GET /api/places、/api/places/meta、/api/places/intros、/api/geocode、
    │                             /api/geocode/reverse(浏览器"我的位置")
    ├─ api/routes.py              GET /api/routes(阶段2a:三方式时间 + 费用对比 + 跳转链接)
-   └─ static/index.html          Leaflet 地图页(阶段1c:分类着色 pin + 简介 popup + 📍 我的位置);
-                                 list.html 为 POC 列表页
+   └─ static/index.html          Leaflet 地图页(阶段2b:分类着色 pin + 简介 popup + 📍 我的位置
+                                 + 路线面板 / 地图画线 / deep-link 跳转);list.html 为 POC 列表页
 ```
 
 ## 安装与运行
@@ -60,7 +64,7 @@ backend/
 python3 -m venv .venv && . .venv/bin/activate      # 或用 uv venv .venv
 pip install -r backend/requirements.txt
 
-python -m pytest backend/ -q                       # 单测(mock,不触网;189 个用例)
+python -m pytest backend/ -q                       # 单测(mock,不触网;212 个用例)
 python backend/test_data_sources.py                # 不装 pytest 也能跑阶段0 同一套断言
 
 python -m uvicorn app.main:app --app-dir backend --port 8000   # Web(地图页 http://127.0.0.1:8000/)
@@ -304,6 +308,70 @@ OSRM 不可用是**降级不是错误**,仍返回 200。`from_name` 是可选补
 (12306 京沪高铁二等座公布价 553 元,估算偏差约 4%)、飞机 300 min / 804 元。
 上海 → 太平洋中一点(无路网):驾车 `degraded=true`、数字为 `null`,铁路/飞机照常,HTTP 200。
 
+## 阶段2b:前端路线面板 + 地图画线(TASK-2b)
+
+**口径**:**纯前端**改造,只动 `app/static/index.html`(单文件原生 JS、Leaflet 走 CDN、无构建步骤);
+后端逻辑与 API 形状**零改动** —— 阈值、系数、note 文案、deep-link 全部仍是阶段2a
+`services/routes.py` 的唯一出处,页面只负责取数、展示、画线与降级提示
+(规格见 `docs/STAGE2-PLAN.md` 第 3 节 1/2/3/5 条;第 4 条「收藏路线」是 TASK-2c)。
+
+**打开面板**:点目的地 pin(popup 打开)→ 地图右上角浮出「🧭 路线对比」侧栏
+(`<aside id="routePanel">`,CSS 默认 `display:none`,不占地图;窄屏 ≤680px 降级成地图下方的
+普通卡片)。popup 里另留一个显式入口按钮「🚗 路线对比」,便于重开与键盘操作。面板调
+`GET /api/routes?from_lat=&from_lng=&to_lat=&to_lng=&to_name=&from_name=`
+(起点 = 当前 origin、终点 = 该 Place 坐标,`URLSearchParams` 自动百分号编码中文地名),
+后端按距离阈值给几种方式就渲染几张卡片(上海→北京三张;50km 内通常只有驾车一张)。
+
+**卡片**:emoji 图标 + 方式名 + 「真实 / 估算」徽标(按 `kind`,`real` 青、`estimate` 琥珀)+
+OSRM 降级时额外的「数据源不可用」灰徽标(`degraded`,时长/里程为 `null` 时**不瞎估**)+
+时长 / 费用 / 里程三格数字(`fmtDuration` 把分钟折成「X 小时 Y 分」、空值一律显示 `—`
+而不是 `¥0`)+ 一行 `note`(自带 `估算·非实时·以官方为准`)+ 跳转按钮区。
+面板脚注给出起终点直线距离、**生成时间**(`generated_at` 统一显示成 `YYYY-MM-DD HH:MM UTC`,
+解析不了就原样显示)、后端 `cost_model.disclaimer` 与本次规划耗时 `elapsed_s`。
+
+**画线**(独立图层 `routeLayer`,**先清后画 → 同一时刻地图上只有一条线**):
+
+| 方式 | 线型 | 几何 |
+|---|---|---|
+| 驾车 | 青实线 `#0f766e` / 5px | 后端 OSRM `geometry` 折线;前端再按 `ROUTE_MAX_POINTS=600` 等间隔抽稀(**首尾必留**,坏点丢弃),后端已按 `GEOMETRY_MAX_POINTS=1200` 抽过一道 |
+| 铁路 | 蓝虚线 `#2563eb`(`dashArray 10 8`) | 起点 → 终点示意直线 |
+| 飞机 | 紫点虚线 `#7c3aed`(`dashArray 2 8`) | 二次贝塞尔弧(`arcPoints`,28 段、垂直偏移 12%),像航段而不是铁轨 |
+
+铁路/飞机**没有真实轨迹数据**(免费源无班次/航路),所以明确画成**示意线**:图例文案
+(`routePanelLegend`)与线的 tooltip 都写明「示意线,非真实轨迹」;OSRM 降级(`geometry=null`)
+时驾车也退回示意线。点卡片换方式即换线,并 `fitBounds` 把整条路线收进视野(`maxZoom:12`);
+点 ✕ 或按 Esc 关面板清线;换 band、换分类、重抓、换起点(`applyOrigin`)一律
+`closeRoutePanel()`,免得图上留着以上一个起点为前提的旧路线。
+
+**跳转**:每卡片按后端 `links[]` 渲染 `<a class="jump" target="_blank" rel="noopener noreferrer">`
+(高德 / Google 导航、12306 车票查询、去哪儿机票),URL **一律用后端 deep-link 纯函数生成的
+`link.url`**,前端不自己拼参数;`link.url` 过 `esc()` 再进 `href` 防注入,`link.note` 当 `title`
+(如「Google 在中国大陆不可访问」「高德按 GCJ-02 解析,带地名可纠偏」)。点链接不会误触发
+选中卡片/换线(事件委托里先把 `#routePanel a` 排除)。
+
+**健壮性**:加载中 / 请求失败 / 后端返回空路线 / 起点或目的地坐标缺失,都在面板内给**中文可见
+文案**(失败额外带「重试」按钮),不 `alert`、不抛 JS 错误、不影响地图与目的地列表;
+快速连点多个 pin 用**递增 token** 丢弃过期响应,不串台;同一「起点 + 目的地」的结果按
+`ROUTE_CACHE_LIMIT=40` 条做 FIFO 缓存(点回同一个 pin 秒开、不重复打 OSRM),换起点即清空。
+卡片与链接都是运行时 `innerHTML` 生成的,统一走 `document` 事件委托(**无内联 `onclick=`**),
+并支持键盘:Tab 聚焦卡片、Enter/空格选中画线、Esc 关闭面板清线。
+
+**零回退**:阶段1a/1b/1c 的分类着色 pin、popup 简介卡片、band/分类切换、城市搜索、
+「📍 我的位置」、「补简介」按钮与 Leaflet CDN 挂掉时的降级提示全部原样保留
+(`test_frontend_routes.py` 里有一份专门的 id/函数清单断言守着)。
+
+**测试**(`test_frontend_routes.py`,23 个用例,全 mock 不触网):页面没有构建步骤、也无需浏览器,
+所以做三类**离线**断言 ——
+① **DOM / JS 面**:面板容器与控件 id、卡片渲染 / 画线 / 格式化函数名都在;跳转是
+`<a target="_blank" rel="noopener noreferrer">`;无内联 `onclick=`、无 `alert`/`document.write`;
+面板默认隐藏、只在打开时 `display:block`;`drawRouteLine` 里「先清后画」的顺序也被断言。
+② **前后端契约**:用替身 router 真跑一遍 `app.api.routes.list_routes`(上海→北京,三方式齐全 +
+3000 点长 geometry),把面板那段 JS 里引用的 `data.*` / `route.*` / `link.*` 字段名逐个对回
+真实响应的键 —— 后端改字段名而前端没跟上(或反过来)当场红;同时校验前端抽稀上限不比后端
+`GEOMETRY_MAX_POINTS` 松、`ROUTE_MODE_*` 与 `KIND_BADGE` 覆盖后端所有 `mode`/`kind` 取值。
+③ **零回退**清单(见上)。装了 `node` 时再加一条 `node --check` 对内联脚本做**语法**校验
+(没装则 skip)。
+
 ## 用法示例(阶段0 数据源)
 
 ```python
@@ -376,7 +444,10 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
 阶段1b 增加四分类优先级归类去重、LLM 一句话简介(按 POI 缓存)与 popup 卡片;
 阶段1c 增加浏览器"我的位置"定位/换城健壮化与滑雪/运动人工种子数据(49 条,来源标注);
 阶段2a 增加多方式路线服务(驾车 OSRM 真实 + 铁路/飞机估算)、费用估算系数、
-`GET /api/routes` 与 deep-link 纯函数(**仅后端**)。
-**尚不含**:前端路线面板与地图画线(TASK-2b)、路线收藏 `Collection` 表(TASK-2c)、
-用户系统、住宿 M3 与预订聚合 M4;公交/大巴等复合方式(免费源无班次数据,见
-`docs/STAGE2-PLAN.md` 第 6 节风险 2)。
+`GET /api/routes` 与 deep-link 纯函数(**仅后端**);
+阶段2b 增加**前端路线面板**(点 pin → 多方式卡片 + 时长/费用/时效标注 + 地图画线 +
+deep-link 跳转,**纯前端**,后端不动)。
+**尚不含**:路线收藏 `Collection` 表与「收藏路线」按钮(TASK-2c,`docs/STAGE2-PLAN.md`
+第 3 节第 4 条)、用户系统、住宿 M3 与预订聚合 M4;公交/大巴等复合方式(免费源无班次数据,见
+`docs/STAGE2-PLAN.md` 第 6 节风险 2);铁路/飞机的**真实轨迹**画线(免费源无航路/线路几何,
+现为起终点示意线)。

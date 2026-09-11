@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Where2Go · 目的地地图(阶段1c)</title>
+<title>Where2Go · 目的地地图(阶段2b)</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
@@ -45,13 +45,57 @@
   .pop .src{color:#0f766e;font-size:11px;margin-top:7px}
   .pop .src b{color:#0f766e}
   .pop .blurb{color:#6b7280;font-size:12px;margin-top:5px}
+  .pop .acts{margin-top:9px}
+  .pop-go{width:100%;padding:7px 10px;font-size:13px}
+  /* 路线面板(TASK-2b):浮在地图右上角的侧栏;窄屏降级成地图下方的普通卡片 */
+  #mapWrap{position:relative}
+  #routePanel{display:none;position:absolute;top:10px;right:10px;z-index:1000;
+              width:min(366px,calc(100% - 20px));max-height:calc(100% - 20px);overflow:auto;
+              background:#fff;border-radius:12px;box-shadow:0 3px 14px rgba(0,0,0,.28);
+              padding:12px 14px;box-sizing:border-box}
+  .rp-head{display:flex;align-items:flex-start;gap:8px}
+  .rp-ttl{font-weight:700;font-size:15px;flex:1}
+  .rp-x{background:#e5e7eb;color:#1f2937;padding:2px 9px;font-size:13px;border-radius:6px;line-height:1.5}
+  .rp-sub{color:#6b7280;font-size:12px;margin-top:4px}
+  .rp-msg{margin-top:9px;font-size:13px;padding:8px 10px;border-radius:8px;background:#e0f2fe;color:#075985}
+  .rp-msg.warn{background:#fef3c7;color:#92400e}
+  .rp-msg.err{background:#fee2e2;color:#b91c1c}
+  .rp-retry{margin-top:8px;padding:6px 12px;font-size:13px}
+  .rp-cards{display:flex;flex-direction:column;gap:9px;margin-top:10px}
+  .rcard{border:2px solid #e5e7eb;border-radius:11px;padding:9px 11px;background:#fff;cursor:pointer;text-align:left}
+  .rcard:hover{border-color:#5eead4;background:#f0fdfa}
+  .rcard.sel{border-color:#0f766e;background:#f0fdfa;box-shadow:0 1px 5px rgba(15,118,110,.2)}
+  .rcard:focus-visible{outline:2px solid #0f766e;outline-offset:2px}
+  .rp-top{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .rp-ico{font-size:18px;line-height:1}
+  .rp-lb{font-weight:700;font-size:14px}
+  .badge{font-size:11px;padding:1px 7px;border-radius:9px;color:#fff;background:#9ca3af}
+  .badge.real{background:#0f766e}
+  .badge.est{background:#b45309}
+  .badge.deg{background:#6b7280}
+  .rp-figs{display:flex;gap:16px;margin-top:8px;flex-wrap:wrap}
+  .rp-fig{font-size:11px;color:#6b7280}
+  .rp-fig b{display:block;font-size:15px;color:#1f2937}
+  .rp-note{color:#6b7280;font-size:12px;line-height:1.5;margin-top:7px;
+           border-top:1px dashed #e5e7eb;padding-top:6px;
+           white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .rp-links{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+  .rp-links.empty{color:#9ca3af;font-size:12px}
+  .rp-links a.jump{display:inline-block;background:#0f766e;color:#fff;text-decoration:none;
+                   font-size:12px;padding:5px 10px;border-radius:7px}
+  .rp-links a.jump:hover{background:#115e59}
+  .rp-line{margin-top:9px;font-size:11px;color:#6b7280}
+  .rp-meta{margin-top:7px;font-size:11px;color:#9ca3af;border-top:1px dashed #e5e7eb;padding-top:6px}
+  @media (max-width:680px){
+    #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  }
   footer{color:#9ca3af;font-size:12px;text-align:center;padding:14px}
 </style>
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段1c · 起点定位 + 种子数据)</span></h1>
-  <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 ·
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段2b · 路线面板 + 画线 + 跳转)</span></h1>
+  <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
 <main>
@@ -79,13 +123,31 @@
     <div class="note" id="note" style="display:none"></div>
     <div class="err" id="err" style="display:none"></div>
   </div>
-  <div id="map"></div>
+  <div id="mapWrap">
+    <div id="map"></div>
+    <!-- 路线面板(TASK-2b):点 pin 自动展开;✕ 关闭时清掉地图上的路线 -->
+    <aside id="routePanel" aria-live="polite">
+      <div class="rp-head">
+        <div class="rp-ttl" id="routePanelTitle">🧭 路线对比</div>
+        <button type="button" id="routePanelClose" class="rp-x"
+                title="关闭路线面板并清除地图上的路线">✕</button>
+      </div>
+      <div class="rp-sub" id="routePanelSub"></div>
+      <div class="rp-msg" id="routePanelMsg" style="display:none"></div>
+      <button type="button" id="routeRetry" class="rp-retry" style="display:none">重试</button>
+      <div class="rp-cards" id="routeCards"></div>
+      <div class="rp-line" id="routePanelLegend" style="display:none"></div>
+      <div class="rp-meta" id="routePanelMeta"></div>
+    </aside>
+  </div>
 </main>
 <footer>
-  Where2Go 阶段1c · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 四分类 tag 并集抓取后入 SQLite,
+  Where2Go 阶段2b · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 四分类 tag 并集抓取后入 SQLite,
   同一「城市 + 分段」二次查询只读库不触网 · 归类优先级 滑雪 &gt; 运动 &gt; 人文美食 &gt; 自然,
   按 OSM (type, id) 去重、一地只属一类 · 一句话简介由 LLM 生成并按 POI 缓存 ·
-  OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据垫底(popup 标注来源=种子)
+  OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据垫底(popup 标注来源=种子)·
+  路线:驾车时长/里程来自 OSRM 真实路网(费用为估算),铁路/飞机为经验估算,
+  一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -99,8 +161,26 @@ const GEO_TIMEOUT_MS=12000;
 const SEED_SOURCE="种子";
 const CITY_HINTS=["上海","北京","广州","深圳","杭州","苏州","南京","成都","重庆","武汉","西安",
                   "张家口","崇礼","吉林","哈尔滨"];
-const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{}};
-let map=null,rings=null,pins=null,outerRing=null;
+// 路线面板(TASK-2b,阶段2b):口径全在后端 services/routes.py,前端只管展示/画线/降级提示
+const ROUTE_MAX_POINTS=600;   // 前端再抽稀一次(后端已按 GEOMETRY_MAX_POINTS=1200 抽过)
+const ROUTE_FLIGHT_BOW=.12;   // 飞机示意线弧度(相对起终点连线的垂直偏移比例);铁路画直线
+const ROUTE_ARC_SEGMENTS=28;
+const ROUTE_CACHE_LIMIT=40;   // 同一「起点 + 目的地」的路线结果缓存上限(点回同一个 pin 秒开)
+const ROUTE_MODE_EMOJI={driving:"🚗",rail:"🚄",flight:"✈️"};
+const ROUTE_MODE_LABEL={driving:"驾车",rail:"铁路",flight:"飞机"};
+const ROUTE_LINE_STYLE={
+  driving:{color:"#0f766e",weight:5,opacity:.9},
+  rail:{color:"#2563eb",weight:4,opacity:.85,dashArray:"10 8"},
+  flight:{color:"#7c3aed",weight:4,opacity:.85,dashArray:"2 8"}
+};
+const KIND_BADGE={real:{cls:"real",text:"真实"},estimate:{cls:"est",text:"估算"}};
+const ROUTE_DISCLAIMER="估算·非实时·以官方为准";
+const ROUTE_LINE_LEGEND="画线:🚗 青实线 = OSRM 真实路网折线 · 🚄 蓝虚线 = 铁路示意 · "+
+                        "✈️ 紫虚线 = 航段示意(铁路/飞机为起终点示意线,非真实轨迹)";
+
+const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
+             places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0}};
+let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
 
 function esc(value){
   return String(value===null||value===undefined?"":value)
@@ -141,6 +221,7 @@ function initMap(){
   }).addTo(map);
   rings=L.layerGroup().addTo(map);
   pins=L.layerGroup().addTo(map);
+  routeLayer=L.layerGroup().addTo(map);   // 路线画线专用图层:同一时刻只留一条
 }
 
 function renderBandOptions(){
@@ -200,8 +281,8 @@ function drawRings(){
 
 function fitRings(){if(map&&outerRing&&outerRing.getBounds) map.fitBounds(outerRing.getBounds(),{padding:[24,24]});}
 
-// popup 卡片:名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介 + OSM 身份脚注
-function popupHtml(place){
+// popup 卡片:名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介 + OSM 身份脚注 + 路线入口
+function popupHtml(place,index){
   const meta=categoryMeta(place.category);
   const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
   const distance=(place.distance_km===null||place.distance_km===undefined)?"—":(place.distance_km+" km");
@@ -212,6 +293,8 @@ function popupHtml(place){
     '<div class="kv">距起点直线 <b>'+distance+"</b> · 分段 "+esc(bandLabel)+"</div>"+
     (meta.blurb?'<div class="blurb">'+esc(meta.blurb)+"</div>":"")+
     '<div class="intro'+(hasIntro?"":" empty")+'">'+intro+"</div>"+
+    '<div class="acts"><button type="button" class="pop-go js-routes" data-i="'+Number(index)+
+      '" title="重新拉一次 /api/routes 并跳到路线面板">🚗 路线对比(时长 / 费用 / 跳转)</button></div>'+
     identityHtml(place)+"</div>";
 }
 
@@ -224,15 +307,340 @@ function identityHtml(place){
   return '<div class="osm">来源:OSM · '+esc(place.osm_type)+"/"+esc(place.osm_id)+coord+"</div>";
 }
 
+// --------------------------------------------------------------------------- //
+// 路线面板(TASK-2b,阶段2b):点目的地 pin → GET /api/routes → 多方式卡片
+// (图标 / 时长 / 费用 / 一行 note / 「真实·估算」徽标 / 生成时间)+ 选中方式在地图画线
+// + 每卡片带 deep-link 跳转(target=_blank rel=noopener)。
+// 口径与系数全在后端 services/routes.py,前端只做展示、画线与降级提示:
+// 加载中 / 失败 / 无路线都给可见文案,不抛 JS 错误;关面板、换 band/分类/起点一律清线。
+// --------------------------------------------------------------------------- //
+function num(value){
+  return (value===null||value===undefined||value==="")?NaN:Number(value);
+}
+function coordsReady(point){
+  return !!point&&isFinite(num(point.lat))&&isFinite(num(point.lng));
+}
+function fmtDuration(min){
+  const value=num(min);
+  if(!isFinite(value)) return "—";
+  const total=Math.max(0,Math.round(value));
+  if(total<60) return total+" 分钟";
+  const hours=Math.floor(total/60),mins=total%60;
+  return mins?(hours+" 小时 "+mins+" 分"):(hours+" 小时");
+}
+function fmtCost(cny){
+  const value=num(cny);
+  return isFinite(value)?("¥"+Math.round(Math.max(0,value))):"—";
+}
+function fmtKm(km){
+  const value=num(km);
+  return isFinite(value)?(Math.max(0,value).toFixed(1)+" km"):"—";
+}
+// 后端 generated_at 是 ISO(UTC);统一显示成 "YYYY-MM-DD HH:MM UTC",解析不了就原样显示
+function fmtGeneratedAt(value){
+  if(!value) return "";
+  const stamp=new Date(String(value));
+  if(isNaN(stamp.getTime())) return String(value);
+  const pad=item=>String(item).padStart(2,"0");
+  return stamp.getUTCFullYear()+"-"+pad(stamp.getUTCMonth()+1)+"-"+pad(stamp.getUTCDate())+
+    " "+pad(stamp.getUTCHours())+":"+pad(stamp.getUTCMinutes())+" UTC";
+}
+
+// 折线抽稀:等间隔取点、**首尾必留**(后端已按 GEOMETRY_MAX_POINTS 抽过,这里再收一道,
+// 免得长路线几千个点把画线拖慢;坏点直接丢掉,不抛错)
+function thinPoints(points,max){
+  const coords=[];
+  (points||[]).forEach(pair=>{
+    const lat=num(pair&&pair[0]),lng=num(pair&&pair[1]);
+    if(isFinite(lat)&&isFinite(lng)) coords.push([lat,lng]);
+  });
+  if(coords.length<3||!max||max<2||coords.length<=max) return coords;
+  const step=(coords.length-1)/(max-1);
+  const picked=[];
+  for(let index=0;index<max-1;index++) picked.push(coords[Math.round(index*step)]);
+  picked.push(coords[coords.length-1]);
+  return picked;
+}
+
+// 飞机示意线:起终点之间拉一条二次贝塞尔弧(垂直偏移 bow),看起来像航段而不是铁轨
+function arcPoints(from,to,bow){
+  const points=[];
+  const midLat=(from[0]+to[0])/2,midLng=(from[1]+to[1])/2;
+  const dLat=to[0]-from[0],dLng=to[1]-from[1];
+  const ctrlLat=midLat-dLng*(bow||0),ctrlLng=midLng+dLat*(bow||0);
+  for(let index=0;index<=ROUTE_ARC_SEGMENTS;index++){
+    const t=index/ROUTE_ARC_SEGMENTS,inv=1-t;
+    points.push([inv*inv*from[0]+2*inv*t*ctrlLat+t*t*to[0],
+                 inv*inv*from[1]+2*inv*t*ctrlLng+t*t*to[1]]);
+  }
+  return points;
+}
+
+function setRouteMsg(message,tone){
+  const box=$("routePanelMsg");
+  if(box){
+    box.textContent=message||"";
+    box.className="rp-msg"+((tone==="warn"||tone==="err")?(" "+tone):"");
+    box.style.display=message?"block":"none";
+  }
+  const retry=$("routeRetry");
+  if(retry) retry.style.display=(message&&tone==="err")?"inline-block":"none";
+}
+function showRouteLegend(on){
+  const box=$("routePanelLegend");
+  if(!box) return;
+  box.textContent=on?ROUTE_LINE_LEGEND:"";
+  box.style.display=on?"block":"none";
+}
+function renderRouteMeta(data){
+  const box=$("routePanelMeta");
+  if(!box) return;
+  if(!data){box.textContent="";return;}
+  const parts=[];
+  const km=num(data.distance_km);
+  if(isFinite(km)) parts.push("起终点直线 "+km.toFixed(1)+" km");
+  if(data.generated_at) parts.push("生成于 "+fmtGeneratedAt(data.generated_at));
+  parts.push((data.cost_model&&data.cost_model.disclaimer)||ROUTE_DISCLAIMER);
+  if(data.elapsed_s!==null&&data.elapsed_s!==undefined) parts.push("规划耗时 "+data.elapsed_s+"s");
+  box.textContent=parts.join(" · ");
+}
+
+// 跳转按钮:URL 一律来自后端 links[].url(deep-link 纯函数生成),新页打开且不带 referrer 泄露
+function routeLinksHtml(links){
+  const items=(links||[]).filter(link=>link&&link.url);
+  if(!items.length) return '<div class="rp-links empty">该方式暂无跳转链接</div>';
+  return '<div class="rp-links">'+items.map(link=>
+    '<a class="jump" href="'+esc(link.url)+'" target="_blank" rel="noopener noreferrer"'+
+    (link.note?(' title="'+esc(link.note)+'"'):"")+">"+
+    esc(link.label||link.provider||"跳转")+" ↗</a>").join("")+"</div>";
+}
+
+function routeCardHtml(route){
+  const mode=route.mode||"";
+  const badge=KIND_BADGE[route.kind]||KIND_BADGE.estimate;
+  const selected=(state.routePanel.mode===mode);
+  const degraded=route.degraded
+    ? '<span class="badge deg" title="OSRM 本次没给出驾车时长/里程,不做瞎估;跳转导航照常可用">数据源不可用</span>'
+    : "";
+  return '<div class="rcard'+(selected?" sel":"")+'" role="button" tabindex="0" '+
+    'aria-pressed="'+(selected?"true":"false")+'" data-mode="'+esc(mode)+'" '+
+    'title="点一下在地图上画这条线">'+
+    '<div class="rp-top"><span class="rp-ico">'+esc(route.emoji||ROUTE_MODE_EMOJI[mode]||"🚗")+"</span>"+
+      '<span class="rp-lb">'+esc(route.label||ROUTE_MODE_LABEL[mode]||mode||"路线")+"</span>"+
+      '<span class="badge '+badge.cls+'" title="真实=OSRM 路网数据,估算=经验系数">'+badge.text+"</span>"+
+      degraded+"</div>"+
+    '<div class="rp-figs">'+
+      '<span class="rp-fig"><b>'+esc(fmtDuration(route.duration_min))+"</b>时长</span>"+
+      '<span class="rp-fig"><b>'+esc(fmtCost(route.cost_cny))+"</b>费用(估算)</span>"+
+      '<span class="rp-fig"><b>'+esc(fmtKm(route.distance_km))+"</b>里程</span>"+
+    "</div>"+
+    (route.note?'<div class="rp-note" title="'+esc(route.note)+'">'+esc(route.note)+"</div>":"")+
+    routeLinksHtml(route.links)+
+    "</div>";
+}
+
+function renderRouteCards(routes){
+  const box=$("routeCards");
+  if(box) box.innerHTML=(routes||[]).map(routeCardHtml).join("");
+}
+
+function routeSubText(place){
+  const origin=state.origin||{};
+  const from=origin.name||origin.city||"我的位置";
+  const km=num(place.distance_km);
+  return "起点 "+from+" → "+(place.name||"目的地")+
+    (isFinite(km)?(" · 直线 "+km.toFixed(1)+" km"):"")+" · 点卡片换线";
+}
+
+function routeCacheKey(place){
+  const origin=state.origin||{};
+  return [origin.city,origin.lat,origin.lng,place.lat,place.lng].join("|");
+}
+function cacheRoutes(place,data){
+  const keys=Object.keys(state.routeCache);
+  while(keys.length>=ROUTE_CACHE_LIMIT) delete state.routeCache[keys.shift()];
+  state.routeCache[routeCacheKey(place)]=data;
+}
+function currentRoute(){
+  const panel=state.routePanel;
+  const routes=(panel.data&&Array.isArray(panel.data.routes))?panel.data.routes:[];
+  return routes.find(route=>route&&route.mode===panel.mode)||null;
+}
+// 画线的两端:优先用后端回传的 from/to(与链接、估算同源),缺失就退回当前起点与该 pin
+function routeEnds(){
+  const panel=state.routePanel;
+  const data=panel.data||{};
+  const from=data.from||state.origin;
+  const to=data.to||panel.place;
+  if(!coordsReady(from)||!coordsReady(to)) return null;
+  return {from:[num(from.lat),num(from.lng)],to:[num(to.lat),num(to.lng)]};
+}
+
+function routeTooltip(route,schematic){
+  const label=route.label||ROUTE_MODE_LABEL[route.mode]||route.mode||"路线";
+  const badge=(KIND_BADGE[route.kind]||KIND_BADGE.estimate).text;
+  const figs=[fmtDuration(route.duration_min),fmtCost(route.cost_cny),fmtKm(route.distance_km)].join(" · ");
+  return label+" "+figs+"("+badge+")"+(schematic?" · 示意线,非真实轨迹":" · OSRM 真实折线");
+}
+
+function clearRouteLine(){
+  if(routeLayer) routeLayer.clearLayers();
+  routeLine=null;
+}
+
+// 画线:驾车有 geometry 就画真实折线(抽稀后),铁路/飞机(以及 OSRM 降级)画起终点示意线;
+// 先清后画 → 同一时刻地图上只有一条路线
+function drawRouteLine(route){
+  clearRouteLine();
+  if(!map||!routeLayer||!route) return;
+  const ends=routeEnds();
+  if(!ends) return;
+  let points=(Array.isArray(route.geometry)&&route.geometry.length>1)
+    ? thinPoints(route.geometry,ROUTE_MAX_POINTS):null;
+  const schematic=!points||points.length<2;
+  if(schematic) points=(route.mode==="flight")?arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW):[ends.from,ends.to];
+  const style=ROUTE_LINE_STYLE[route.mode]||ROUTE_LINE_STYLE.rail;
+  routeLine=L.polyline(points,{color:style.color,weight:style.weight,opacity:style.opacity,
+    dashArray:style.dashArray||null});
+  routeLine.bindTooltip(routeTooltip(route,schematic),{sticky:true});
+  routeLayer.addLayer(routeLine);
+}
+
+function selectRouteMode(mode,fit){
+  state.routePanel.mode=mode;
+  const cards=document.querySelectorAll("#routeCards .rcard");
+  Array.prototype.forEach.call(cards,card=>{
+    const on=(card.getAttribute("data-mode")===mode);
+    card.classList.toggle("sel",on);
+    card.setAttribute("aria-pressed",on?"true":"false");
+  });
+  drawRouteLine(currentRoute());
+  if(fit&&map&&routeLine&&routeLine.getBounds) map.fitBounds(routeLine.getBounds(),{padding:[40,40],maxZoom:12});
+}
+
+function applyRouteData(data){
+  state.routePanel.data=data;
+  const routes=(data&&Array.isArray(data.routes))?data.routes:[];
+  renderRouteMeta(data);
+  if(!routes.length){
+    renderRouteCards([]);
+    showRouteLegend(false);
+    clearRouteLine();
+    setRouteMsg("这条起终点暂时给不出路线(后端返回空)。换个目的地,或重设起点后再试。","warn");
+    return;
+  }
+  renderRouteCards(routes);
+  setRouteMsg("");
+  showRouteLegend(true);
+  // 默认选中能画出真实折线的那条(通常是驾车),OSRM 降级时退回第一条有数字的
+  const preferred=routes.find(route=>!route.degraded&&Array.isArray(route.geometry)&&route.geometry.length>1)||
+                  routes.find(route=>!route.degraded)||routes[0];
+  selectRouteMode(preferred?preferred.mode:null,false);
+}
+
+async function loadRoutes(place,token){
+  const params=new URLSearchParams({from_lat:String(state.origin.lat),from_lng:String(state.origin.lng),
+    to_lat:String(place.lat),to_lng:String(place.lng)});
+  if(place.name) params.set("to_name",String(place.name));
+  if(state.origin.name) params.set("from_name",String(state.origin.name));
+  try{
+    const data=await getJSON("/api/routes?"+params.toString());
+    if(token!==state.routePanel.token) return;   // 已切到别的 pin 或已关面板:丢掉过期响应
+    cacheRoutes(place,data);
+    applyRouteData(data);
+  }catch(error){
+    if(token!==state.routePanel.token) return;
+    renderRouteCards([]);
+    showRouteLegend(false);
+    clearRouteLine();
+    setRouteMsg("路线查询失败:"+((error&&error.message)||error)+
+      "(公共 OSRM 可能繁忙,可点「重试」;地图与目的地列表不受影响)","err");
+  }
+}
+
+async function openRoutePanel(place,options){
+  if(!place) return;
+  const panel=$("routePanel");
+  if(!panel) return;
+  state.routePanel.token+=1;
+  const token=state.routePanel.token;
+  state.routePanel.open=true;
+  state.routePanel.place=place;
+  state.routePanel.data=null;
+  state.routePanel.mode=null;
+  $("routePanelTitle").textContent="🧭 路线 · "+(place.name||"(无名)");
+  $("routePanelSub").textContent=routeSubText(place);
+  renderRouteCards([]);
+  renderRouteMeta(null);
+  showRouteLegend(false);
+  clearRouteLine();
+  panel.style.display="block";
+  if(options&&options.scroll&&panel.scrollIntoView) panel.scrollIntoView({behavior:"smooth",block:"nearest"});
+
+  if(!coordsReady(state.origin)||!coordsReady(place)){
+    setRouteMsg(state.origin
+      ? "该目的地坐标缺失,没法规划路线;换一个目的地再试。"
+      : "还没有起点:先搜索城市或点「📍 我的位置」,再回来看路线。","warn");
+    return;
+  }
+  const cached=state.routeCache[routeCacheKey(place)];
+  if(cached){applyRouteData(cached);return;}
+  setRouteMsg("正在规划路线(OSRM 驾车真实路网 + 铁路/飞机估算,约 2-8s)…");
+  await loadRoutes(place,token);
+}
+
+function closeRoutePanel(){
+  state.routePanel.token+=1;   // 让在飞的请求作废,免得回填到已关闭的面板
+  const token=state.routePanel.token;
+  state.routePanel={open:false,place:null,data:null,mode:null,token:token};
+  const panel=$("routePanel");
+  if(panel) panel.style.display="none";
+  renderRouteCards([]);
+  setRouteMsg("");
+  renderRouteMeta(null);
+  showRouteLegend(false);
+  clearRouteLine();
+}
+
+// 卡片选中与跳转都走事件委托(卡片/链接都是运行时 innerHTML 生成的)
+function onDocumentClick(event){
+  const target=event.target;
+  if(!target||!target.closest) return;
+  const popupButton=target.closest(".js-routes");
+  if(popupButton){
+    const place=state.places[Number(popupButton.getAttribute("data-i"))];
+    if(place) openRoutePanel(place,{scroll:true});
+    return;
+  }
+  if(target.closest("#routePanel a")) return;   // 跳转链接自己开新页,不算选卡片
+  const card=target.closest("#routeCards .rcard");
+  if(card) selectRouteMode(card.getAttribute("data-mode"),true);
+}
+
+// 键盘可达:Enter/空格选中卡片(画线),Esc 关面板清线
+function onDocumentKeydown(event){
+  if(event.key==="Escape"){closeRoutePanel();return;}
+  if(event.key!=="Enter"&&event.key!==" "&&event.key!=="Spacebar") return;
+  const target=event.target;
+  if(!target||!target.closest) return;
+  const card=target.closest("#routeCards .rcard");
+  if(!card) return;
+  event.preventDefault();
+  selectRouteMode(card.getAttribute("data-mode"),true);
+}
+
 function drawPins(places){
   if(!pins) return;
+  closeRoutePanel();   // 换 band/分类/起点或重抓:旧 pin 可能已不在图上,面板与画线一并清掉
+  state.places=places||[];
   pins.clearLayers();
-  (places||[]).forEach(place=>{
+  state.places.forEach((place,index)=>{
     const meta=categoryMeta(place.category);
     const icon=L.divIcon({className:"",iconSize:[26,26],iconAnchor:[13,26],popupAnchor:[0,-24],
       html:'<div class="pin" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
     const marker=L.marker([place.lat,place.lng],{icon:icon,title:place.name||""});
-    marker.bindPopup(popupHtml(place));
+    marker.bindPopup(popupHtml(place,index));
+    marker.on("popupopen",()=>openRoutePanel(place));   // 点 pin → 侧栏路线面板自动展开
     pins.addLayer(marker);
   });
 }
@@ -278,6 +686,8 @@ async function searchCity(city){
 function applyOrigin(data){
   state.origin=data.origin;
   state.cached={};
+  state.routeCache={};   // 起点变了 → 已缓存的路线全部作废
+  closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉
   (data.segments||[]).forEach(seg=>{state.cached[seg.band]=seg.place_count;});
   renderBandOptions();drawRings();fitRings();
 }
@@ -408,6 +818,13 @@ $("band").addEventListener("change",event=>{state.band=event.target.value;drawRi
 $("category").addEventListener("change",event=>{state.category=event.target.value;loadPlaces(false);});
 $("reload").addEventListener("click",()=>loadPlaces(true));
 $("intro").addEventListener("click",fillIntros);
+$("routePanelClose").addEventListener("click",closeRoutePanel);
+$("routeRetry").addEventListener("click",()=>{
+  const place=state.routePanel.place;
+  if(place) openRoutePanel(place);   // 失败重试:缓存里没东西,会重新打一次 /api/routes
+});
+document.addEventListener("click",onDocumentClick);
+document.addEventListener("keydown",onDocumentKeydown);
 
 (async function boot(){
   if(!window.L){

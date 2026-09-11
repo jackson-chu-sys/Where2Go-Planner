@@ -150,6 +150,53 @@
 
 ---
 
+## [TASK-2a] 路线服务 + 费用估算 + /api/routes + 跳转链接(后端)
+
+- 状态: pending
+- 目标: 依 docs/STAGE2-PLAN.md 第 2/4 节,新建 backend/services/routes.py:统一路线编排,返回驾车(OSRM 真实,含 geometry)/铁路/飞机三种方式,每条含 `{mode, label, duration_min, cost_cny, distance_km, geometry?, kind: real|estimate, note}`。费用按文档系数估算(驾车油耗+过路费;铁路 里程×0.45 起步价;飞机 里程×0.6+100),系数为集中常量便于日后替换。新增 `GET /api/routes?from_lat=&from_lng=&to_lat=&to_lng=&to_name=`。deep-link 生成(高德/Google 导航、12306、OTA 搜索)为纯函数。复用现有 data_sources(OSRM/Nominatim)与 app/api 风格。
+- 依赖: 无(阶段1 已完成)。
+- 涉及: backend/services/routes.py、backend/app/api/routes.py(或并入现有 api)、backend/test_routes.py
+- 验收:
+  1. `/api/routes` 对真实坐标返回驾车(真实时长/距离/geometry)+ 铁路/飞机(估算),字段符合上述结构
+  2. 费用为估算且带 `kind=estimate` 与 note;驾车 kind=real
+  3. deep-link 纯函数有单测(高德/Google/12306/OTA 各一条)
+  4. 时长阈值沿用(POC 口径):铁路 ≥100km、飞机 ≥300km 才出现
+  5. pytest backend/ 全绿
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-2b] 前端路线面板(地图点 pin → 多方式卡片 + 画线 + 跳转)
+
+- 状态: pending
+- 目标: 依 docs/STAGE2-PLAN.md 第 3 节,在 Leaflet 地图页实现:点目的地 pin → 出路线面板,展示三种方式卡片(图标/时长/费用/说明/来源标注),选中方式在地图画线(驾车用 OSRM geometry 折线,铁路/飞机示意直线),每卡片带跳转按钮(deep-link 新页)。保持现有分类 pin、popup、band 切换、起点定位不破坏。
+- 依赖: TASK-2a。
+- 涉及: backend/app/static/index.html(及必要的静态资源)
+- 验收:
+  1. 点 pin 能看到"驾车/铁路/飞机"卡片(按距离阈值出现),含时长与费用及"估算/真实"标注
+  2. 驾车能画真实路径折线(geometry 抽稀);铁路/飞机为示意线
+  3. 跳转按钮可点、URL 正确(新页打开)
+  4. 页面无 JS 报错;既有功能回归正常
+  5. 可用 Hermes browser_exec 做一次自动 QA(开页→点 pin→出面板→画线→无 console error)
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-2c] 路线收藏(Collection 表 + 收藏 API + UI)
+
+- 状态: pending
+- 目标: 依 docs/STAGE2-PLAN.md 第 4 节,新增 `Collection` / `CollectionCat` 表(为 M4 铺路)与收藏 API(增/删/查),前端路线面板加「收藏路线」按钮与收藏列表查看。收藏条目记录:类型(route/place)、引用、名称、快照摘要(时长/费用)、创建时间。
+- 依赖: TASK-2a/2b。
+- 涉及: backend/db/models.py、backend/db/repository.py、backend/app/api/、frontend static
+- 验收:
+  1. 收藏表 + 唯一约束;重复收藏幂等
+  2. API:新增/删除/列表(按类型过滤)
+  3. 前端能收藏路线并在收藏列表看到(含时长/费用摘要)
+  4. 单测覆盖收藏增删查与幂等;pytest backend/ 全绿
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

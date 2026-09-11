@@ -14,6 +14,12 @@
 * 失败时 ``code`` 不是 ``Ok``(例如 ``NotFound`` / ``NoRoute``),响应仍可能是 HTTP 200;
 * 备选公共实例 ``https://routing.openstreetmap.de/routed-car`` 的路径前缀里已含
   profile,因此把 endpoint 整体替换即可,URL 结构一致。
+
+阶段2 画线按需取 geometry:``route(..., with_geometry=True)`` 会把 ``overview`` 换成
+``full`` 并加 ``geometries=geojson``,响应里多出
+``routes[0].geometry = {"type": "LineString", "coordinates": [[lng, lat], ...]}``,
+本模块顺手换成 Leaflet 需要的 ``[[lat, lng], ...]``。**默认仍是 ``overview=false``,
+返回形状与阶段0 完全一致**(不带 ``geometry`` 键),POC 的 ``/api/discover`` 与既有单测不受影响。
 """
 
 from __future__ import annotations
@@ -35,6 +41,11 @@ DEFAULT_ENDPOINT = "https://router.project-osrm.org"
 ALT_ENDPOINT = "https://routing.openstreetmap.de/routed-car"
 DEFAULT_PROFILE = "driving"
 ENV_ENDPOINT = "WHERE2GO_OSRM_ENDPOINT"
+# overview=full 才返回折线;geometry 坐标保留 6 位小数(≈0.1 m,画线足够)
+OVERVIEW_FALSE = "false"
+OVERVIEW_FULL = "full"
+GEOMETRIES_GEOJSON = "geojson"
+GEOMETRY_COORD_PRECISION = 6
 
 LngLat = Union[Sequence[float], str]
 
@@ -61,8 +72,37 @@ def format_lnglat(value: LngLat) -> str:
     return f"{lng:.6f},{lat:.6f}"
 
 
-def parse_route(payload: Any) -> dict[str, float]:
-    """解析 OSRM 响应,返回 ``{"distance_km": 公里, "duration_min": 分钟}``。"""
+def parse_geometry(raw: Any) -> Optional[list[list[float]]]:
+    """OSRM 的 GeoJSON ``geometry`` → Leaflet 友好的 ``[[lat, lng], ...]``。
+
+    OSRM 给的是 ``{"type": "LineString", "coordinates": [[lng, lat], ...]}``(经度在前),
+    前端 Leaflet 要 ``[lat, lng]``,这里一次性换好序;也接受裸的坐标数组。
+    拿不到或格式不对时返回 ``None`` —— 时长/里程仍然是真的,不该因为一条折线
+    把整条驾车路线判为失败。
+    """
+    coordinates = raw.get("coordinates") if isinstance(raw, dict) else raw
+    if not isinstance(coordinates, list) or not coordinates:
+        return None
+    points: list[list[float]] = []
+    for item in coordinates:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            return None
+        try:
+            lng, lat = float(item[0]), float(item[1])
+        except (TypeError, ValueError):
+            return None
+        if not (-180.0 <= lng <= 180.0 and -90.0 <= lat <= 90.0):
+            return None
+        points.append([round(lat, GEOMETRY_COORD_PRECISION), round(lng, GEOMETRY_COORD_PRECISION)])
+    return points
+
+
+def parse_route(payload: Any, *, with_geometry: bool = False) -> dict[str, Any]:
+    """解析 OSRM 响应 → ``{"distance_km": 公里, "duration_min": 分钟}``。
+
+    ``with_geometry=True`` 时多返回一个 ``geometry`` 键(``[[lat, lng], ...]`` 或 ``None``);
+    默认不加这个键,返回形状与阶段0 保持一致。
+    """
     if not isinstance(payload, dict):
         raise DataSourceError(SOURCE_NAME, f"响应格式异常(应为 JSON 对象):{type(payload).__name__}")
 
@@ -94,10 +134,13 @@ def parse_route(payload: Any) -> dict[str, float]:
             SOURCE_NAME, f"路线距离/耗时非正数(distance={distance_m} m, duration={duration_s} s)"
         )
 
-    return {
+    result: dict[str, Any] = {
         "distance_km": round(float(distance_m) / 1000.0, 3),
         "duration_min": round(float(duration_s) / 60.0, 1),
     }
+    if with_geometry:
+        result["geometry"] = parse_geometry(first.get("geometry"))
+    return result
 
 
 class OsrmClient:
@@ -123,16 +166,23 @@ class OsrmClient:
         end_lnglat: LngLat,
         *,
         profile: str = DEFAULT_PROFILE,
-    ) -> dict[str, float]:
-        """驾车路线规划:返回 ``{"distance_km": float, "duration_min": float}``。"""
+        with_geometry: bool = False,
+    ) -> dict[str, Any]:
+        """驾车路线规划:返回 ``{"distance_km": float, "duration_min": float}``。
+
+        ``with_geometry=True`` 时改传 ``overview=full`` + ``geometries=geojson``,
+        结果多一个 ``geometry``(``[[lat, lng], ...]`` 或 ``None``)—— 阶段2 地图画线用。
+        """
         coordinates = f"{format_lnglat(start_lnglat)};{format_lnglat(end_lnglat)}"
         url = f"{self.endpoint}/route/v1/{profile}/{coordinates}"
-        params = {
-            "overview": "false",
+        params: dict[str, Any] = {
+            "overview": OVERVIEW_FULL if with_geometry else OVERVIEW_FALSE,
             "alternatives": "false",
             "steps": "false",
             "annotations": "false",
         }
+        if with_geometry:
+            params["geometries"] = GEOMETRIES_GEOJSON
         payload = http_json(
             self._session,
             url,
@@ -141,7 +191,7 @@ class OsrmClient:
             timeout=self.timeout,
             headers={"User-Agent": self.user_agent},
         )
-        return parse_route(payload)
+        return parse_route(payload, with_geometry=with_geometry)
 
 
 _default_client: Optional[OsrmClient] = None
@@ -160,13 +210,14 @@ def route(
     end_lnglat: LngLat,
     *,
     profile: str = DEFAULT_PROFILE,
+    with_geometry: bool = False,
     endpoint: Optional[str] = None,
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
-) -> dict[str, float]:
-    """模块级便捷函数:两点间驾车路线 ``{"distance_km", "duration_min"}``。"""
+) -> dict[str, Any]:
+    """模块级便捷函数:两点间驾车路线 ``{"distance_km", "duration_min"[, "geometry"]}``。"""
     if endpoint is None and timeout is None and session is None:
         client = default_client()
     else:
         client = OsrmClient(endpoint, timeout=timeout, session=session)
-    return client.route(start_lnglat, end_lnglat, profile=profile)
+    return client.route(start_lnglat, end_lnglat, profile=profile, with_geometry=with_geometry)

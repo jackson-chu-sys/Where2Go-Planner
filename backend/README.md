@@ -1,11 +1,13 @@
-# backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b/1c)
+# backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b/1c)+ 路线服务与费用估算(阶段2a)
 
 对应任务:`tasks/TASK-001-data-source-poc.md`(阶段0,ADR-006:免费、无需 key 的数据源)、
 `docs/NIGHTLY-QUEUE.md` TASK-1a(阶段1a:Place 入库 + 检索 API + Leaflet 地图,
 规格见 `docs/STAGE1-PLAN.md` 第 2/4 节)、TASK-1b(阶段1b:四分类优先级归类去重 +
 LLM 一句话简介 + popup 卡片,规格见 `docs/STAGE1-PLAN.md` 第 3 节)、
 TASK-1c(阶段1c:浏览器"我的位置"定位/换城 + 滑雪/运动**人工种子数据**垫底,
-规格见 `docs/STAGE1-PLAN.md` 第 3 节"数据支撑现实")。
+规格见 `docs/STAGE1-PLAN.md` 第 3 节"数据支撑现实")、
+TASK-2a(阶段2a:多方式**路线服务 + 费用估算** + `GET /api/routes` + deep-link 跳转链接,
+规格见 `docs/STAGE2-PLAN.md` 第 2/4 节)。
 
 ## 目录
 
@@ -13,14 +15,16 @@ TASK-1c(阶段1c:浏览器"我的位置"定位/换城 + 滑雪/运动**人工种
 backend/
 ├─ requirements.txt              依赖(requests、fastapi/uvicorn、sqlalchemy;测试用 pytest)
 ├─ conftest.py                   pytest 路径引导 + 整套单测默认关闭种子数据(WHERE2GO_SEEDS=off)
-├─ test_data_sources.py          阶段0:三个源的纯 mock 单测(不触网,26 个用例)
+├─ test_data_sources.py          阶段0:三个源的纯 mock 单测(不触网,39 个用例)
 ├─ test_places.py                阶段1a:入库/读库/API 的纯 mock 单测(不触网,20 个用例)
-├─ test_classify.py              阶段1b:归类优先级/跨 tag 去重/检索并集/LLM 简介的纯 mock 单测(41 个用例)
+├─ test_classify.py              阶段1b:归类优先级/跨 tag 去重/检索并集/LLM 简介的纯 mock 单测(46 个用例)
 ├─ test_seed_data.py             阶段1c:种子数据校验/合并去重/来源标注/起点逆地理编码的纯 mock 单测(56 个用例)
+├─ test_routes.py                阶段2a:路线编排/费用系数/deep-link/参数校验/OSRM 降级的纯 mock 单测(28 个用例)
 ├─ data_sources/                 数据获取层(阶段0,免费无 key)
 │  ├─ __init__.py                统一导出 route / geocode / reverse / nearby_places
 │  ├─ _common.py                 User-Agent、timeout(≤20s)、JSON 请求与中文错误
-│  ├─ osrm.py                    驾车路线 → {distance_km, duration_min}
+│  ├─ osrm.py                    驾车路线 → {distance_km, duration_min}(with_geometry=True 时
+│  │                             附 Leaflet 折线 [[lat, lng], ...],阶段2a 画线用;默认形状不变)
 │  ├─ nominatim.py               正向/逆向地理编码 → {lat, lng, display_name}
 │  ├─ overpass.py                周边 POI 检索 → [{lat, lng, name, tags}](with_id=True 时附 osm id/type;
 │  │                             nearby_places_grouped = 多组 tag 并集、每组独立配额,一次请求查完四分类)
@@ -29,13 +33,15 @@ backend/
 │  ├─ models.py                  Place / SegmentFetch 表定义 + 来源标注派生(place_source/is_seed)
 │  ├─ base.py                    引擎与会话(懒加载;WHERE2GO_DB_URL 可覆盖库地址)
 │  └─ repository.py              upsert / 按段检索 / 分类计数 / **来源计数** / 抓取水位 / 缺简介行查询
-├─ services/                     业务层(阶段1a/1b)
+├─ services/                     业务层(阶段1a/1b/2a)
 │  ├─ bands.py                   环形距离分段定义(POC 与入库共用同一口径)
 │  ├─ classify.py                四分类归类引擎:OSM tag 线索 + 归类优先级 + 跨 tag 去重 + 检索并集分组
 │  ├─ categories.py              classify 的兼容导入面(阶段1a 旧名字;新代码直接 import classify)
 │  ├─ intro.py                   LLM 一句话简介:Provider 注册表 + 按 POI 缓存 + 失败降级 + CLI
 │  ├─ reclassify.py              存量库重归类(category 旧值/空值按四分类规则重算,离线)+ CLI
 │  ├─ seed_data.py               **人工种子数据**(滑雪场/运动,49 条)+ 与 OSM 合并去重 + 校验 CLI
+│  ├─ routes.py                  阶段2a:多方式路线编排(驾车 OSRM 真实 + 铁路/飞机估算)
+│  │                             + 费用估算系数 + deep-link 纯函数(高德/Google/12306/OTA)
 │  └─ place_loader.py            (城市, band) 抓取入库编排(去重归类 → 入库 → 合并种子 → 补简介)
 │                                + 浏览器 GPS 起点逆地理编码(resolve_reverse_origin)+ CLI
 └─ app/                          HTTP 服务(FastAPI)
@@ -43,6 +49,7 @@ backend/
    ├─ api/discover.py            POC 路由(阶段0,保留不动)
    ├─ api/places.py              GET /api/places、/api/places/meta、/api/places/intros、/api/geocode、
    │                             /api/geocode/reverse(浏览器"我的位置")
+   ├─ api/routes.py              GET /api/routes(阶段2a:三方式时间 + 费用对比 + 跳转链接)
    └─ static/index.html          Leaflet 地图页(阶段1c:分类着色 pin + 简介 popup + 📍 我的位置);
                                  list.html 为 POC 列表页
 ```
@@ -53,7 +60,7 @@ backend/
 python3 -m venv .venv && . .venv/bin/activate      # 或用 uv venv .venv
 pip install -r backend/requirements.txt
 
-python -m pytest backend/ -q                       # 单测(mock,不触网;143 个用例)
+python -m pytest backend/ -q                       # 单测(mock,不触网;189 个用例)
 python backend/test_data_sources.py                # 不装 pytest 也能跑阶段0 同一套断言
 
 python -m uvicorn app.main:app --app-dir backend --port 8000   # Web(地图页 http://127.0.0.1:8000/)
@@ -231,6 +238,72 @@ popup 脚注按来源分流 —— 种子数据显示"来源:**人工种子数�
 OSM 数据仍显示 `osm_type/osm_id`;状态栏报 `人工种子 N 条(本次补种 M 条)/ OSM K 条`,
 图例报种子总量与分类分布;Leaflet 未加载时定位/搜索也只给提示、不产生 console 报错。
 
+## 阶段2a:路线服务 + 费用估算 + deep-link(TASK-2a)
+
+**口径**(`services/routes.py`,规格见 `docs/STAGE2-PLAN.md` 第 2/4 节):一次 `plan_routes()`
+给出三种方式的**时间 + 费用**对比,每条路线形状统一 ——
+`{mode, label, emoji, duration_min, cost_cny, distance_km, geometry, kind, degraded, source, note, links}`。
+
+| 方式 | 出现条件 | 时间 | 费用(估算) | `kind` |
+|---|---|---|---|---|
+| 驾车 | 始终出现 | OSRM **真实**路网(含 geometry 折线) | 油费 8L/100km × 7.5 元/L + 高速占比 0.7 × 里程 × 0.5 元/km | `real` |
+| 铁路 | 直线距离 ≥ **100 km** | 直线 × 1.2 / 220 km/h + 110 min 候车接驳 | 计费里程 × 0.45 元/km,20 元起步价下限(二等座) | `estimate` |
+| 飞机 | 直线距离 ≥ **300 km** | 直线 × 1.1 / 780 km/h + 210 min 值机接驳 | 计费里程 × 0.6 元/km + 100 元机建燃油(经济舱) | `estimate` |
+
+出现阈值与耗时系数**沿用 POC** `app/api/discover.py` 的 `_est_mode`(单测直接对拍同一函数,
+避免两处口径漂移)。费用系数集中在 `services/routes.py` 开头一段常量
+(`FUEL_L_PER_100KM` / `TOLL_CNY_PER_KM` / `RAIL_CNY_PER_KM` / `FLIGHT_CNY_PER_KM` …),
+日后换真实票价/实时路况只改那一段;`cost_coefficients()` 与 `mode_rules()` 把当前系数与算式
+原样吐给前端做「估算」标注,不必写死在页面里。每条 `note` 都带 `估算·非实时·以官方为准`
+—— 不抓 12306/OTA 实时价、不代订(ADR-004/ADR-007)。
+
+**OSRM 失败只降级、不 500**:公共实例繁忙、两点不在同一路网(跨海)、坐标离路网太远时,
+驾车条目变成 `degraded=true`、`kind=estimate`、时长/费用/geometry 为 `null`,`note` 说明原因,
+**导航 deep-link 照给**(跳转不依赖 OSRM);铁路/飞机不受影响。
+
+**geometry 抽稀**:`data_sources.route(..., with_geometry=True)` 改传 `overview=full` +
+`geometries=geojson`,并把 GeoJSON 的 `[lng, lat]` 换成 Leaflet 要的 `[lat, lng]`;服务端再按
+`GEOMETRY_MAX_POINTS=1200` 等间隔抽稀(**首尾点必留**),免得长路线一次吐几千个点。
+默认 `with_geometry=False`,阶段0 的返回形状与既有单测零改动。
+
+**deep-link 全是纯函数**(不触网、不查库,中文地名按 UTF-8 百分号编码,同参数必得同 URL):
+
+| 函数 | 目标 | 要点 |
+|---|---|---|
+| `amap_navigation_url()` | `uri.amap.com/navigation` | `from`/`to` = `lng,lat[,name]`(**经度在前**);缺起点就省略 `from`,高德自动用当前位置 |
+| `google_maps_directions_url()` | `google.com/maps/dir/?api=1` | `origin`/`destination` = `lat,lng`(**纬度在前**,与高德相反);中国大陆不可访问,note 里写明 |
+| `rail_12306_url()` | `kyfw.12306.cn/otn/leftTicket/init` | `fs`/`ts` 只带站名(没有站码映射,由 12306 自行匹配);`date` 默认今天(UTC+8) |
+| `flight_ota_url()` | 去哪儿单程列表页 | **不用携程**:`flights.ctrip.com/online/list/oneway-{from}-{to}` 只认三字码,传中文城市名会被重定向回首页、查询条件丢失(2026-09-11 实测);去哪儿接受中文城市名。日后接入城市码映射只需换这个函数 |
+
+没有地名时**不编站名**:12306/OTA 链接省略对应参数,留给用户在官方页面补全;
+地图展示名降级成 `我的位置(31.2304,121.4737)`。
+
+```python
+from services.routes import cost_coefficients, mode_rules, plan_routes
+
+plan = plan_routes(from_lat=31.2304, from_lng=121.4737,
+                   to_lat=39.9042, to_lng=116.4074, to_name="北京", from_name="上海")
+for r in plan.routes:                 # 驾车(real)/ 铁路 / 飞机(estimate)
+    print(r["mode"], r["duration_min"], r["cost_cny"], r["kind"], [l["provider"] for l in r["links"]])
+print(plan.distance_km, mode_rules()["rail_min_km"], cost_coefficients()["rail"]["formula"])
+```
+
+新增 API(`app/api/routes.py`):
+
+| 路由 | 说明 |
+|---|---|
+| `GET /api/routes?from_lat=&from_lng=&to_lat=&to_lng=&to_name=&from_name=` | 三方式时间 + 费用对比;响应含 `routes[]`(每条带 `links[]`)、`distance_km`、`mode_rules`、`cost_model`、`generated_at`、`note` |
+
+参数校验:缺参/空串/非数字/NaN/越界一律 **400 + 中文说明**(校验统一在服务层做,
+所以四个坐标在 API 上声明成 `str`,免得同一个"坐标不对"一会儿 422 一会儿 400);
+OSRM 不可用是**降级不是错误**,仍返回 200。`from_name` 是可选补充
+(12306/OTA 链接的出发地名),`to_name` 建议带上(deep-link 文案/URL 用)。
+
+**实测(2026-09-11,真实 OSRM)**:上海 → 北京 直线 1067.3 km;驾车 1196.4 km / 821 min /
+1137 元(费用估算)、折线抽稀到 1200 点,整条请求 `elapsed_s ≈ 2.1`;铁路 459 min / 576 元
+(12306 京沪高铁二等座公布价 553 元,估算偏差约 4%)、飞机 300 min / 804 元。
+上海 → 太平洋中一点(无路网):驾车 `degraded=true`、数字为 `null`,铁路/飞机照常,HTTP 200。
+
 ## 用法示例(阶段0 数据源)
 
 ```python
@@ -282,6 +355,16 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
 * **OSM 国内小众分类覆盖不足**:滑雪/运动类 tag 在国内数据稀疏(实测上海两段内
   滑雪场 1 条 / 运动 6 条),已由阶段1c 的 49 条人工种子数据垫底(`services/seed_data.py`),
   见 `docs/STAGE1-PLAN.md` 第 3 节。
+* **OSRM geometry(阶段2a 实测)**:画线要 `overview=full` + `geometries=geojson`,响应里
+  `routes[0].geometry` 是 GeoJSON `LineString`(**经度在前**),需换成 Leaflet 的 `[lat, lng]`;
+  长路线点数很大(上海→北京实测 6647 点),故服务端先抽到 1200 点再下发。
+  跨海/离路网太远的两点 OSRM 返回 `code != "Ok"`(HTTP 仍可能 200),按**降级**处理。
+* **deep-link 口径(2026-09-11 实测)**:高德 URI API 的 `from`/`to` 是 `lng,lat,name`
+  (经度在前)、Google `maps/dir/?api=1` 的 `origin`/`destination` 是 `lat,lng`(纬度在前),
+  两者顺序相反别搞混;12306 `leftTicket/init?linktypeid=dc&fs=&ts=&date=&flag=N,N,Y`
+  只带中文站名即可打开查询页;携程机票列表页只认三字码(中文名会被重定向回首页),
+  故 OTA 链接改用去哪儿。坐标是 WGS84,高德按 GCJ-02 解析,国内可能有百米级偏移
+  —— 带上地名时高德可按名字纠偏,note 里已如实标注。
 * **Nominatim 逆地理编码(阶段1c 实测)**:`zoom=10`(区县级)时中文 `display_name` 形如
   `浦东新区, 上海市, 200120, 中国`,由细到粗逗号分隔;`city_from_display_name` 去掉国家名与
   纯数字邮编后取第一个以 市/州/地区/盟 结尾的片段,挑不出城市就降级成坐标起点(不报错)。
@@ -291,6 +374,9 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
 
 阶段0 = 数据获取层;阶段1a 增加存储(SQLite)、入库编排、检索 API 与地图前端;
 阶段1b 增加四分类优先级归类去重、LLM 一句话简介(按 POI 缓存)与 popup 卡片;
-阶段1c 增加浏览器"我的位置"定位/换城健壮化与滑雪/运动人工种子数据(49 条,来源标注)。
-**尚不含**:TASK-1c 的 browser_exec 自动 QA(由夜班执行器跑)、收藏 `Collection` 表、
-用户系统与正式路线/住宿模块(阶段 2+)。
+阶段1c 增加浏览器"我的位置"定位/换城健壮化与滑雪/运动人工种子数据(49 条,来源标注);
+阶段2a 增加多方式路线服务(驾车 OSRM 真实 + 铁路/飞机估算)、费用估算系数、
+`GET /api/routes` 与 deep-link 纯函数(**仅后端**)。
+**尚不含**:前端路线面板与地图画线(TASK-2b)、路线收藏 `Collection` 表(TASK-2c)、
+用户系统、住宿 M3 与预订聚合 M4;公交/大巴等复合方式(免费源无班次数据,见
+`docs/STAGE2-PLAN.md` 第 6 节风险 2)。

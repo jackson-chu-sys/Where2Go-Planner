@@ -1,4 +1,4 @@
-"""Where2Go 业务编排层(阶段 1)。
+"""Where2Go 业务编排层(阶段 1 / 2a)。
 
 夹在 ``data_sources``(只管网络)与 ``app``(只管 HTTP)之间:
 
@@ -13,5 +13,9 @@
   抓取与读库两条路径都合并种子,并支持浏览器 GPS 坐标 → 逆地理编码的起点解析;
 * :mod:`services.intro` —— LLM 一句话简介(Provider 可切换,按 POI 缓存在 ``Place.intro``,
   失败降级为空简介、不阻塞入库);
-* :mod:`services.reclassify` —— 存量库重归类:把 ``category`` 的旧值/空值按四分类规则重算(离线)。
+* :mod:`services.reclassify` —— 存量库重归类:把 ``category`` 的旧值/空值按四分类规则重算(离线);
+* :mod:`services.routes` —— (阶段2a)多方式路线编排:驾车走 OSRM **真实**时长/里程/折线,
+  铁路/飞机按 POC ``_est_mode`` 口径估算;费用按集中常量估算(油费 + 过路费 / 里程 × 单价),
+  每条路线带 ``kind=real|estimate``、诚实标注的 ``note`` 与 deep-link
+  (高德/Google 导航、12306 查票、OTA 机票搜索,均为纯函数)。
 """

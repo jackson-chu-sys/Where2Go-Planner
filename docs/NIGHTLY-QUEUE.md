@@ -152,7 +152,7 @@
 
 ## [TASK-2a] 路线服务 + 费用估算 + /api/routes + 跳转链接(后端)
 
-- 状态: running
+- 状态: done
 - 目标: 依 docs/STAGE2-PLAN.md 第 2/4 节,新建 backend/services/routes.py:统一路线编排,返回驾车(OSRM 真实,含 geometry)/铁路/飞机三种方式,每条含 `{mode, label, duration_min, cost_cny, distance_km, geometry?, kind: real|estimate, note}`。费用按文档系数估算(驾车油耗+过路费;铁路 里程×0.45 起步价;飞机 里程×0.6+100),系数为集中常量便于日后替换。新增 `GET /api/routes?from_lat=&from_lng=&to_lat=&to_lng=&to_name=`。deep-link 生成(高德/Google 导航、12306、OTA 搜索)为纯函数。复用现有 data_sources(OSRM/Nominatim)与 app/api 风格。
 - 依赖: 无(阶段1 已完成)。
 - 涉及: backend/services/routes.py、backend/app/api/routes.py(或并入现有 api)、backend/test_routes.py
@@ -162,7 +162,10 @@
   3. deep-link 纯函数有单测(高德/Google/12306/OTA 各一条)
   4. 时长阈值沿用(POC 口径):铁路 ≥100km、飞机 ≥300km 才出现
   5. pytest backend/ 全绿
-- 结果: (待夜班回填)
+- 结果: **完成**(commit `50cf97f`,2026-09-11 夜班,Codex 执行)。
+  - 新增 `backend/services/routes.py`(682 行):费用/阈值系数集中常量(RAIL_MIN_KM=100、FLIGHT_MIN_KM=300、铁路 0.45 元/km 起步 20、飞机 0.6 元/km+100、驾车 8L/100km×7.5 元/L+0.7 高速占比×0.5 元/km);`plan_routes` 编排驾车(OSRM real,含 geometry,失败降级不 500)+铁路/飞机(estimate,note 标注估算非实时);deep-link 纯函数 amap/google/12306/OTA。`GET /api/routes` 校验风格与 /api/places 一致(缺参/非法 400)。osrm.py 增强 geometry 支持。
+  - pytest backend/ = **189 passed**(161 原有零改动 + 28 新增,网络全 mock)。
+  - 真实链路实测(上海人民广场→杭州西湖,直线 167.2km):driving kind=real 132min/182.5km/173 元(OSRM geometry 1172 点,费用与公式吻合 109.5+63.9≈173)、rail kind=estimate 165min/90 元(167.2×1.2×0.45≈90)、飞机未出现(<300km 阈值正确);links=amap/google/12306 齐备。
 
 ---
 

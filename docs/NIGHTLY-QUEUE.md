@@ -171,7 +171,7 @@
 
 ## [TASK-2b] 前端路线面板(地图点 pin → 多方式卡片 + 画线 + 跳转)
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE2-PLAN.md 第 3 节,在 Leaflet 地图页实现:点目的地 pin → 出路线面板,展示三种方式卡片(图标/时长/费用/说明/来源标注),选中方式在地图画线(驾车用 OSRM geometry 折线,铁路/飞机示意直线),每卡片带跳转按钮(deep-link 新页)。保持现有分类 pin、popup、band 切换、起点定位不破坏。
 - 依赖: TASK-2a。
 - 涉及: backend/app/static/index.html(及必要的静态资源)

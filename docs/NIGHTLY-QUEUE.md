@@ -190,7 +190,7 @@
 
 ## [TASK-2c] 路线收藏(Collection 表 + 收藏 API + UI)
 
-- 状态: running
+- 状态: needs_review
 - 目标: 依 docs/STAGE2-PLAN.md 第 4 节,新增 `Collection` / `CollectionCat` 表(为 M4 铺路)与收藏 API(增/删/查),前端路线面板加「收藏路线」按钮与收藏列表查看。收藏条目记录:类型(route/place)、引用、名称、快照摘要(时长/费用)、创建时间。
 - 依赖: TASK-2a/2b。
 - 涉及: backend/db/models.py、backend/db/repository.py、backend/app/api/、frontend static
@@ -199,7 +199,17 @@
   2. API:新增/删除/列表(按类型过滤)
   3. 前端能收藏路线并在收藏列表看到(含时长/费用摘要)
   4. 单测覆盖收藏增删查与幂等;pytest backend/ 全绿
-- 结果: (待夜班回填)
+- 结果: **后端完成、前端未落地 → needs_review**(2026-09-12 夜班)。
+  - 后端(commit `ff2a7fd`,Codex 第1次调用 ~52min/677K tokens):`Collection`/`CollectionCat` 两表
+    (唯一键 (kind,ref_key,mode),幂等 upsert 不报错不重复);`POST/GET/DELETE /api/collections`
+    (kind/cat 过滤、counts_by_kind 一次带齐、缺参/非法 400 中文报错,口径与 /api/places 一致);
+    `backend/test_collections.py` 55 用例全 mock。**pytest backend/ = 267 passed**(212 基线零改动+55 新增)。
+    执行器真机复验(uvicorn :8000 重启后实测):POST 两次幂等同 id、GET ?kind=route 过滤正确、
+    summary 含 mode/duration_min/cost_cny/distance_km 快照、DELETE 后 total=0、bad-id/bad-kind/empty-body 均 400。
+  - 前端(收藏按钮+收藏列表面板)**未完成**:Codex 第2次调用超 30min 熔断线被中止(R7),
+    中止时 git 工作区干净、零产物,无可收尾内容。验收第3条(前端能收藏并看列表)未达成。
+  - 待神朱定夺:下晚重派前端子任务(任务描述已备好,见本条目标)或白天处理。
+  - 备注:POST route 收藏需 mode + 目的地引用(osm_type+osm_id 或 to_lat+to_lng),前端对接时注意。
 
 ---
 

@@ -190,7 +190,7 @@
 
 ## [TASK-2c] 路线收藏(Collection 表 + 收藏 API + UI)
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE2-PLAN.md 第 4 节,新增 `Collection` / `CollectionCat` 表(为 M4 铺路)与收藏 API(增/删/查),前端路线面板加「收藏路线」按钮与收藏列表查看。收藏条目记录:类型(route/place)、引用、名称、快照摘要(时长/费用)、创建时间。
 - 依赖: TASK-2a/2b。
 - 涉及: backend/db/models.py、backend/db/repository.py、backend/app/api/、frontend static

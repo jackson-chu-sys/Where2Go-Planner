@@ -1,11 +1,11 @@
-"""Where2Go 持久层:SQLite + SQLAlchemy 2.0(TASK-1a)。
+"""Where2Go 持久层:SQLite + SQLAlchemy 2.0(TASK-1a / TASK-2c)。
 
 分三个模块:
 
-* :mod:`db.models` —— ``Place`` / ``SegmentFetch`` 表定义;
+* :mod:`db.models` —— ``Place`` / ``SegmentFetch`` / ``Collection`` / ``CollectionCat`` 表定义;
 * :mod:`db.base` —— 引擎、会话工厂、建表与 FastAPI 依赖;
 * :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询,
-  并按分类/来源(OSM / 种子)计数)。
+  并按分类/来源(OSM / 种子)计数;收藏的幂等 upsert、按类型过滤与分组维护)。
 
 用法::
 
@@ -31,30 +31,60 @@ from .base import (
     set_engine,
 )
 from .models import (
+    CAT_AUTO,
+    CAT_MANUAL,
+    COLLECTION_CAT_SOURCES,
+    COLLECTION_KINDS,
+    KIND_PLACE,
+    KIND_ROUTE,
+    NO_MODE,
     OSM_SOURCE,
     SEED_SOURCE,
     SOURCE_TAG,
     UNCATEGORIZED,
     Base,
+    Collection,
+    CollectionCat,
     Place,
     SegmentFetch,
+    clean_text,
+    collection_kind,
+    collection_ref_key,
+    default_collection_name,
     is_seed,
     iso_utc,
+    optional_coordinate,
+    osm_key,
     place_source,
+    point_key,
+    point_label,
     utcnow,
 )
 from .repository import (
+    collection_cat_to_dict,
+    collection_summary,
+    collection_to_dict,
     count_by_category,
+    count_by_kind,
     count_by_source,
+    count_collections,
     count_places,
+    delete_collection,
+    delete_collection_cat,
+    get_collection,
+    get_collection_cat,
     get_segment,
     latest_city_origin,
+    list_collection_cats,
+    list_collections,
     list_places,
     place_to_dict,
     record_segment,
     segment_overview,
     segment_to_dict,
     select_places,
+    upsert_collection,
+    upsert_collection_cat,
     upsert_places,
 )
 
@@ -65,11 +95,28 @@ __all__ = [
     "SOURCE_TAG",
     "SEED_SOURCE",
     "OSM_SOURCE",
+    "KIND_ROUTE",
+    "KIND_PLACE",
+    "COLLECTION_KINDS",
+    "NO_MODE",
+    "CAT_MANUAL",
+    "CAT_AUTO",
+    "COLLECTION_CAT_SOURCES",
     "is_seed",
     "place_source",
+    "clean_text",
+    "collection_kind",
+    "collection_ref_key",
+    "default_collection_name",
+    "optional_coordinate",
+    "osm_key",
+    "point_key",
+    "point_label",
     "Base",
     "Place",
     "SegmentFetch",
+    "Collection",
+    "CollectionCat",
     "database_url",
     "get_engine",
     "get_session",
@@ -92,4 +139,17 @@ __all__ = [
     "segment_to_dict",
     "select_places",
     "upsert_places",
+    "collection_summary",
+    "collection_to_dict",
+    "collection_cat_to_dict",
+    "upsert_collection",
+    "get_collection",
+    "list_collections",
+    "delete_collection",
+    "count_collections",
+    "count_by_kind",
+    "upsert_collection_cat",
+    "get_collection_cat",
+    "list_collection_cats",
+    "delete_collection_cat",
 ]

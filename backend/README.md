@@ -1,5 +1,5 @@
 # backend · 免费数据源验证层(阶段0)+ 目的地入库、四分类与简介(阶段1a/1b/1c)+ 路线服务与费用估算(阶段2a)
-+ 前端路线面板(阶段2b)
++ 前端路线面板(阶段2b)+ 路线/目的地收藏(阶段2c)
 
 对应任务:`tasks/TASK-001-data-source-poc.md`(阶段0,ADR-006:免费、无需 key 的数据源)、
 `docs/NIGHTLY-QUEUE.md` TASK-1a(阶段1a:Place 入库 + 检索 API + Leaflet 地图,
@@ -10,7 +10,9 @@ TASK-1c(阶段1c:浏览器"我的位置"定位/换城 + 滑雪/运动**人工种
 TASK-2a(阶段2a:多方式**路线服务 + 费用估算** + `GET /api/routes` + deep-link 跳转链接,
 规格见 `docs/STAGE2-PLAN.md` 第 2/4 节)、
 TASK-2b(阶段2b:**前端路线面板** —— 点 pin 出多方式卡片 + 地图画线 + deep-link 跳转,
-规格见 `docs/STAGE2-PLAN.md` 第 3 节)。
+规格见 `docs/STAGE2-PLAN.md` 第 3 节)、
+TASK-2c(阶段2c:**路线/目的地收藏** —— `Collection`/`CollectionCat` 表 + 幂等 upsert +
+`/api/collections` 增删查,**仅后端**,规格见 `docs/STAGE2-PLAN.md` 第 3 节第 4 条)。
 
 ## 目录
 
@@ -24,6 +26,7 @@ backend/
 ├─ test_seed_data.py             阶段1c:种子数据校验/合并去重/来源标注/起点逆地理编码的纯 mock 单测(56 个用例)
 ├─ test_routes.py                阶段2a:路线编排/费用系数/deep-link/参数校验/OSRM 降级的纯 mock 单测(28 个用例)
 ├─ test_frontend_routes.py       阶段2b:前端路线面板静态页断言 + 前后端字段契约 + node 语法检查(23 个用例)
+├─ test_collections.py           阶段2c:收藏表约束/ref_key 纯函数/仓储幂等 CRUD/API 校验的纯 mock 单测(55 个用例)
 ├─ data_sources/                 数据获取层(阶段0,免费无 key)
 │  ├─ __init__.py                统一导出 route / geocode / reverse / nearby_places
 │  ├─ _common.py                 User-Agent、timeout(≤20s)、JSON 请求与中文错误
@@ -33,10 +36,12 @@ backend/
 │  ├─ overpass.py                周边 POI 检索 → [{lat, lng, name, tags}](with_id=True 时附 osm id/type;
 │  │                             nearby_places_grouped = 多组 tag 并集、每组独立配额,一次请求查完四分类)
 │  └─ verify_poc.py              真实网络端到端验证脚本(联网)
-├─ db/                           存储层(阶段1a,SQLite + SQLAlchemy 2.0)
-│  ├─ models.py                  Place / SegmentFetch 表定义 + 来源标注派生(place_source/is_seed)
+├─ db/                           存储层(阶段1a/2c,SQLite + SQLAlchemy 2.0)
+│  ├─ models.py                  Place / SegmentFetch / **Collection / CollectionCat** 表定义
+│  │                             + 来源标注派生(place_source/is_seed)+ 收藏引用串 ref_key 与默认标题
 │  ├─ base.py                    引擎与会话(懒加载;WHERE2GO_DB_URL 可覆盖库地址)
 │  └─ repository.py              upsert / 按段检索 / 分类计数 / **来源计数** / 抓取水位 / 缺简介行查询
+│                                + **收藏 CRUD**(幂等 upsert / 列表过滤 / 计数 / 分组增删查)
 ├─ services/                     业务层(阶段1a/1b/2a)
 │  ├─ bands.py                   环形距离分段定义(POC 与入库共用同一口径)
 │  ├─ classify.py                四分类归类引擎:OSM tag 线索 + 归类优先级 + 跨 tag 去重 + 检索并集分组
@@ -54,6 +59,7 @@ backend/
    ├─ api/places.py              GET /api/places、/api/places/meta、/api/places/intros、/api/geocode、
    │                             /api/geocode/reverse(浏览器"我的位置")
    ├─ api/routes.py              GET /api/routes(阶段2a:三方式时间 + 费用对比 + 跳转链接)
+   ├─ api/collections.py         POST/GET/DELETE /api/collections(阶段2c:收藏增删查,重复收藏幂等)
    └─ static/index.html          Leaflet 地图页(阶段2b:分类着色 pin + 简介 popup + 📍 我的位置
                                  + 路线面板 / 地图画线 / deep-link 跳转);list.html 为 POC 列表页
 ```
@@ -64,7 +70,7 @@ backend/
 python3 -m venv .venv && . .venv/bin/activate      # 或用 uv venv .venv
 pip install -r backend/requirements.txt
 
-python -m pytest backend/ -q                       # 单测(mock,不触网;212 个用例)
+python -m pytest backend/ -q                       # 单测(mock,不触网;267 个用例)
 python backend/test_data_sources.py                # 不装 pytest 也能跑阶段0 同一套断言
 
 python -m uvicorn app.main:app --app-dir backend --port 8000   # Web(地图页 http://127.0.0.1:8000/)
@@ -372,6 +378,76 @@ OSRM 降级时额外的「数据源不可用」灰徽标(`degraded`,时长/里�
 ③ **零回退**清单(见上)。装了 `node` 时再加一条 `node --check` 对内联脚本做**语法**校验
 (没装则 skip)。
 
+## 阶段2c:路线/目的地收藏 Collection(TASK-2c)
+
+**口径**:**仅后端**(`db/models.py`、`db/repository.py`、`app/api/collections.py`),
+`app/static/index.html` 一行没动 —— 前端「收藏路线」按钮与收藏面板另做。
+收藏存的是**快照**:`/api/routes` 返回什么就存什么(`mode`/`duration_min`/`cost_cny`/
+`distance_km`,以及 `kind=real|estimate`、`degraded`),`geometry` 主动丢掉不占库;之后价格
+系数变了、OSRM 降级了也**不回填**,列表始终显示用户收藏那一刻看到的数字
+(M4「对比总账」要的正是当时口径)。要看最新数字请重新调 `/api/routes`。
+
+**两张表**(`db/models.py`):
+
+| 表 | 用途 | 关键列 |
+|---|---|---|
+| `collections` | 一条收藏 | `kind`(`route` 路线 / `place` 目的地)、`ref_key`(引用串)、`mode`、`name`、`osm_type`/`osm_id`、`from_lat`/`from_lng`/`from_name`、`to_lat`/`to_lng`/`to_name`、`summary`(JSON 快照)、`cat_id`、`created_at`/`updated_at` |
+| `collection_cats` | 收藏分组(为 M4「统一收藏面板」铺路) | `name`(唯一)、`note`、`source`(`manual` 人工 / `auto` 程序建,自动分组可被脚本安全清理)、`sort_order`、`created_at`/`updated_at` |
+
+分组是**可选**的:收藏不挂分组照样能用(`cat_id` 可空);删分组只把旗下收藏**摘下来**
+(`cat_id` 置空,外键 `ON DELETE SET NULL` + 仓储同样解绑),不连带删收藏,
+免得用户整理标签时误删路线。
+
+**引用串 `ref_key`**(幂等的关键,`db.models.collection_ref_key`):优先用 OSM 身份
+(`node/7` → `route:31.2304000,121.4737000->node/7`,坐标固定 7 位小数,所以
+`31.2304`、`"31.2304"` 与 `31.23040000000000004` 都算同一个点);没有 OSM id 就退回坐标
+(`place:31.5000000,121.5000000`)。唯一约束 `uq_collection_kind_ref_mode` =
+`(kind, ref_key, mode)`:同一对起终点 + 同一方式只有一行;`place` 收藏没有出行方式,
+`mode` 恒为空串(`NO_MODE`),同一目的地收藏两次同样幂等。
+
+**幂等**(`repo.upsert_collection` 返回 `(row, created)`):重复收藏**不报错也不产生第二行**,
+只刷新 `summary`/`name`/`updated_at` 并返回原行,`id` 与 `created_at` 保持"第一次收藏"的值
+(列表排序才稳定);`summary` 走白名单归一(`collection_summary`:补规范键、`"94"`→`94`、
+`88.0`→`88`、丢掉 `geometry` 与其他杂键)。绕过仓储直插两行同键会被 DB 唯一键挡成
+`IntegrityError` —— 双保险。列表默认 `created_at desc, id desc`(新的在前),
+`limit<=0` 视为不限。
+
+**三个端点**(`app/api/collections.py`)。校验口径与 `/api/places`、`/api/routes` 一致:
+缺参 / 非法一律 **400 + 中文报错**,查不到 **404**;请求体故意收成裸 JSON 对象
+(`Body(None)`)而不是 pydantic 模型,否则字段类型不对会被 FastAPI 拦成 422 英文报错,
+同一个"参数不对"就有两种状态码。本模块**不触网**,只读写 SQLite
+(`test_collections.py` 有一条断言专门守着:源码里不许出现 `requests`/`data_sources`)。
+
+```bash
+# 新增(幂等:同一份 body 再 POST 一次 → created=false + 同一个 id)
+curl -s -X POST localhost:8000/api/collections -H 'content-type: application/json' -d '{
+  "kind":"route","mode":"driving","osm_type":"node","osm_id":7,
+  "from_lat":31.2304,"from_lng":121.4737,"from_name":"上海",
+  "to_lat":31.5,"to_lng":121.5,"to_name":"崇明",
+  "summary":{"duration_min":94,"cost_cny":88,"distance_km":122.4,"kind":"real"}}'
+# → {"collection":{"id":1,"kind":"route","mode":"driving",
+#                  "ref_key":"route:31.2304000,121.4737000->node/7",
+#                  "name":"上海 → 崇明 · 驾车", ...},
+#    "created":true,"idempotent":false,"count":1,
+#    "counts_by_kind":{"route":1,"place":0},"elapsed_s":0.01,"note":"收藏存的是快照:..."}
+
+curl -s 'localhost:8000/api/collections?kind=route&limit=20'   # 列表(新的在前,可按 kind/cat 过滤)
+curl -s -X DELETE localhost:8000/api/collections/1             # 删除(id 非法 400、不存在 404)
+```
+
+`name` 不给就按 `起点 → 目的地 · 方式` 生成(`db.models.default_collection_name`,
+方式标签取自 `services.routes.MODE_META`;缺地名时用坐标兜底),给了就照用。
+`GET` 一次带齐面板要的东西:`collections`/`count`/`kind`/`cat_id`/`total`/`counts_by_kind`/
+`cats`(含每组 `collection_count`)/`kinds`/`modes`/`elapsed_s`/`note`;
+`limit` 上限 `MAX_PAGE=200`,传更大按上限截断。
+
+**测试**(`test_collections.py`,55 个用例,全 mock 不触网):表结构 / 唯一键 / 索引断言、
+`ref_key` 与默认标题等纯函数、仓储 CRUD(幂等命中同一行、快照刷新、坐标字符串与浮点尾巴、
+列表排序与过滤、分组解绑)、端点直调,以及**手拼最小 ASGI scope 跑完整 HTTP 链**
+(仓库没装 httpx/TestClient,`app.dependency_overrides` 把 `get_session` 换成临时库会话),
+外加全部 400/404 中文报错分支。DB 用 `tmp_path` 下的临时 SQLite,不碰 `backend/data/`。
+`backend/` 全套 **267 passed**(阶段2b 基线 212 + 本阶段 55)。
+
 ## 用法示例(阶段0 数据源)
 
 ```python
@@ -446,8 +522,10 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
 阶段2a 增加多方式路线服务(驾车 OSRM 真实 + 铁路/飞机估算)、费用估算系数、
 `GET /api/routes` 与 deep-link 纯函数(**仅后端**);
 阶段2b 增加**前端路线面板**(点 pin → 多方式卡片 + 时长/费用/时效标注 + 地图画线 +
-deep-link 跳转,**纯前端**,后端不动)。
-**尚不含**:路线收藏 `Collection` 表与「收藏路线」按钮(TASK-2c,`docs/STAGE2-PLAN.md`
+deep-link 跳转,**纯前端**,后端不动);
+阶段2c 增加**路线/目的地收藏**(`Collection`/`CollectionCat` 两张表 + 幂等 upsert +
+`POST`/`GET`/`DELETE /api/collections`,**仅后端**)。
+**尚不含**:前端「收藏路线」按钮与收藏面板(TASK-2c 前端部分,`docs/STAGE2-PLAN.md`
 第 3 节第 4 条)、用户系统、住宿 M3 与预订聚合 M4;公交/大巴等复合方式(免费源无班次数据,见
 `docs/STAGE2-PLAN.md` 第 6 节风险 2);铁路/飞机的**真实轨迹**画线(免费源无航路/线路几何,
 现为起终点示意线)。

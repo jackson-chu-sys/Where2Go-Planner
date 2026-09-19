@@ -215,7 +215,7 @@
 
 ## [TASK-2c-fe] 前端路线收藏 UI(收口 M2)
 
-- 状态: pending
+- 状态: running
 - 目标: **仅前端**改动,补齐 TASK-2c 缺失的收藏 UI。在 `backend/app/static/index.html` 的路线面板中:1) 每个路线方式卡片(驾车/铁路/飞机)旁加「收藏路线」按钮;2) 新增「我的收藏」列表(弹层或侧栏),显示已收藏项的 类型/名称/时长/费用摘要;3) 支持取消收藏。**后端已于 commit ff2a7fd 完成**(`backend/app/api/collections.py`:POST/GET/DELETE `/api/collections`;pytest 267 passed)——**不要修改后端**,只对接。
 - 依赖: 无(后端就绪)。
 - 涉及: **仅** backend/app/static/index.html

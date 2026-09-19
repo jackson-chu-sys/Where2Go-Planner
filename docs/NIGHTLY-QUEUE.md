@@ -215,7 +215,7 @@
 
 ## [TASK-2c-fe] 前端路线收藏 UI(收口 M2)
 
-- 状态: running
+- 状态: needs_review
 - 目标: **仅前端**改动,补齐 TASK-2c 缺失的收藏 UI。在 `backend/app/static/index.html` 的路线面板中:1) 每个路线方式卡片(驾车/铁路/飞机)旁加「收藏路线」按钮;2) 新增「我的收藏」列表(弹层或侧栏),显示已收藏项的 类型/名称/时长/费用摘要;3) 支持取消收藏。**后端已于 commit ff2a7fd 完成**(`backend/app/api/collections.py`:POST/GET/DELETE `/api/collections`;pytest 267 passed)——**不要修改后端**,只对接。
 - 依赖: 无(后端就绪)。
 - 涉及: **仅** backend/app/static/index.html
@@ -225,7 +225,7 @@
   3. 页面无 JS 报错;既有地图/pin/路线面板不回归
   4. browser_exec 自动 QA:开页→点 pin→出路线卡片→点收藏→看收藏列表→删除→0 console error
   5. 不改任何后端文件
-- 结果: (待夜班回填)
+- 结果: **needs_review**(2026-09-19 夜班)。Codex 单次调用触 29min timeout 熔断(exit=124),中止时 git 工作区干净、零 commit、零产物,无可收尾内容;本条未达成任何验收项。日志留在 /tmp/w2g_task.log(末尾显示其仍在读测试 fixture 阶段,疑探索轮数过多)。与 TASK-2c 前端部分连续两晚熔断——建议神朱白天定夺:①改由白天会话/执行器直接手写该前端改动(index.html 收藏按钮+列表,对接已就绪的 /api/collections,工程量不大);②或再派 Codex 但把任务拆得更窄(先只做卡片按钮+POST,再单独做收藏面板)。
 
 ---
 

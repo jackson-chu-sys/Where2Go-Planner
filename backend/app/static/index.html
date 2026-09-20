@@ -941,7 +941,7 @@ async function addFavRoute(route,button){
   try{
     const data=await sendJSON("/api/collections",{method:"POST",
       headers:{"Content-Type":"application/json"},
-      body:JSON.stringify(favRoutePayload(route))});
+      body:JSON.stringify(routeFavPayload(route))});
     await refreshFavItems();   // 拉一次列表,已收藏判定键与弹层数据同源
     const name=(data.collection&&data.collection.name)||"该路线";
     setRouteMsg(data.created?("已收藏:「"+name+"」(可在「⭐ 我的收藏」查看/取消)")

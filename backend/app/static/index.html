@@ -86,6 +86,25 @@
   .rp-links a.jump:hover{background:#115e59}
   .rp-line{margin-top:9px;font-size:11px;color:#6b7280}
   .rp-meta{margin-top:7px;font-size:11px;color:#9ca3af;border-top:1px dashed #e5e7eb;padding-top:6px}
+  /* 收藏(TASK-2c-fe):卡片内收藏按钮 + 全屏「我的收藏」弹层 */
+  .rp-fav{margin-top:8px}
+  .fav-btn{padding:5px 11px;font-size:12px;background:#e5e7eb;color:#1f2937;border-radius:7px}
+  .fav-btn:hover{background:#fde68a;color:#92400e}
+  .fav-btn.faved{background:#fef3c7;color:#92400e;cursor:default}
+  .fav-btn:disabled{opacity:.7;cursor:wait}
+  #favPanel{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:2000;background:rgba(15,23,42,.45)}
+  .fp-box{background:#fff;max-width:540px;width:calc(100% - 32px);margin:7vh auto 0;border-radius:12px;
+          padding:14px 16px;max-height:82vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.3);box-sizing:border-box}
+  .fp-sub{color:#6b7280;font-size:12px;margin-top:4px}
+  .fp-item{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:9px;background:#fff}
+  .fp-nm{font-weight:700;font-size:14px}
+  .fp-badges{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
+  .fp-meta{color:#6b7280;font-size:12px;margin-top:5px}
+  .fp-time{color:#9ca3af;font-size:11px;margin-top:4px}
+  .fp-del{margin-top:7px;padding:4px 11px;font-size:12px;background:#fee2e2;color:#b91c1c;border-radius:7px}
+  .fp-del:hover{background:#fecaca}
+  .fp-empty{color:#9ca3af;font-size:13px;margin-top:12px;font-style:italic}
+  .fp-err{color:#b91c1c;background:#fee2e2;font-size:13px;margin-top:9px;padding:8px 10px;border-radius:8px}
   @media (max-width:680px){
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
@@ -116,6 +135,7 @@
         <div class="inline">
           <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass 四分类并集">重新抓取</button>
           <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
+          <button id="openFav" class="secondary" title="查看/管理收藏的路线与目的地(POST/GET/DELETE /api/collections)">⭐ 我的收藏</button>
         </div></div>
     </div>
     <div class="status" id="status">初始化…</div>
@@ -139,6 +159,18 @@
       <div class="rp-line" id="routePanelLegend" style="display:none"></div>
       <div class="rp-meta" id="routePanelMeta"></div>
     </aside>
+  </div>
+  <!-- 我的收藏弹层(TASK-2c-fe):对接 /api/collections;收藏按钮在路线卡片内,取消收藏在列表项内 -->
+  <div id="favPanel" role="dialog" aria-modal="true" aria-labelledby="favPanelTitle">
+    <div class="fp-box">
+      <div class="rp-head">
+        <div class="rp-ttl" id="favPanelTitle">⭐ 我的收藏</div>
+        <button type="button" id="favPanelClose" class="rp-x" title="关闭收藏列表">✕</button>
+      </div>
+      <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
+      <div id="favPanelErr" class="fp-err" style="display:none"></div>
+      <div id="favPanelList"></div>
+    </div>
   </div>
 </main>
 <footer>
@@ -179,7 +211,8 @@ const ROUTE_LINE_LEGEND="画线:🚗 青实线 = OSRM 真实路网折线 · 🚄
                         "✈️ 紫虚线 = 航段示意(铁路/飞机为起终点示意线,非真实轨迹)";
 
 const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
-             places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0}};
+             places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0},
+             fav:{open:false,items:[],busy:false,favedKeys:{}}};
 let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
 
 function esc(value){
@@ -436,6 +469,7 @@ function routeCardHtml(route){
     "</div>"+
     (route.note?'<div class="rp-note" title="'+esc(route.note)+'">'+esc(route.note)+"</div>":"")+
     routeLinksHtml(route.links)+
+    favButtonHtml(route)+
     "</div>";
 }
 
@@ -606,6 +640,24 @@ function closeRoutePanel(){
 function onDocumentClick(event){
   const target=event.target;
   if(!target||!target.closest) return;
+  // 收藏按钮(TASK-2c-fe):优先于卡片选中拦截,避免点收藏顺带切线
+  const favButton=target.closest("#routeCards .js-fav");
+  if(favButton){
+    event.stopPropagation();
+    const mode=favButton.getAttribute("data-mode");
+    const routes=(state.routePanel.data&&Array.isArray(state.routePanel.data.routes))
+      ?state.routePanel.data.routes:[];
+    const route=routes.find(item=>item&&(item.mode||"")===mode);
+    if(route&&!favButton.disabled) addFavRoute(route,favButton);
+    return;
+  }
+  // 收藏弹层内的取消收藏按钮
+  const delButton=target.closest("#favPanelList .js-fav-del");
+  if(delButton){
+    event.stopPropagation();
+    deleteFav(delButton.getAttribute("data-id"));
+    return;
+  }
   const popupButton=target.closest(".js-routes");
   if(popupButton){
     const place=state.places[Number(popupButton.getAttribute("data-i"))];
@@ -617,12 +669,16 @@ function onDocumentClick(event){
   if(card) selectRouteMode(card.getAttribute("data-mode"),true);
 }
 
-// 键盘可达:Enter/空格选中卡片(画线),Esc 关面板清线
+// 键盘可达:Enter/空格选中卡片(画线),Esc 关弹层/面板清线
 function onDocumentKeydown(event){
-  if(event.key==="Escape"){closeRoutePanel();return;}
+  if(event.key==="Escape"){
+    if(state.fav.open){closeFavPanel();return;}   // 先关收藏弹层,再关路线面板
+    closeRoutePanel();return;
+  }
   if(event.key!=="Enter"&&event.key!==" "&&event.key!=="Spacebar") return;
   const target=event.target;
   if(!target||!target.closest) return;
+  if(target.closest("button")) return;   // 按钮自己响应 Enter/空格(收藏/取消收藏),不当成选卡片
   const card=target.closest("#routeCards .rcard");
   if(!card) return;
   event.preventDefault();
@@ -811,6 +867,158 @@ async function fillIntros(){
   }finally{setBusy(false);}
 }
 
+// --------------------------------------------------------------------------- //
+// 我的收藏(TASK-2c-fe):对接 POST/GET/DELETE /api/collections。
+// 收藏按钮在路线卡片内(收藏的是「这条路线 · 这个方式」的快照),
+// 「⭐ 我的收藏」打开弹层看列表、取消收藏。后端幂等:重复收藏刷新快照返回原行。
+// --------------------------------------------------------------------------- //
+async function sendJSON(url,options){
+  const response=await fetch(url,options);
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data.detail||("HTTP "+response.status));
+  return data;
+}
+// 已收藏判定键:与后端唯一键 (kind, ref_key, mode) 同口径
+function favKey(item){return [item.kind,item.ref_key,item.mode||""].join("|");}
+function currentFavKeys(){
+  const keys={};
+  state.fav.items.forEach(item=>{keys[favKey(item)]=item.id;});
+  return keys;
+}
+function favRouteItem(route){
+  // 用当前面板数据拼出一条「伪收藏项」来算键:ref_key 规则见后端 models.collection_ref_key
+  // (坐标定点 7 位小数,与后端 COORD_PRECISION 一致;OSM 身份优先,退化到坐标串)
+  const panel=state.routePanel;
+  const place=panel.place||{};
+  const origin=state.origin||{};
+  const pointKey=point=>num(point.lat).toFixed(7)+","+num(point.lng).toFixed(7);
+  const target=(place.osm_type&&place.osm_id!==undefined&&place.osm_id!==null)
+    ? (String(place.osm_type).toLowerCase()+"/"+Number(place.osm_id))
+    : pointKey(place);
+  return {kind:"route",ref_key:"route:"+pointKey(origin)+"->"+target,mode:route.mode||""};
+}
+function routeFavPayload(route){
+  const panel=state.routePanel;
+  const place=panel.place||{};
+  const origin=state.origin||{};
+  const payload={kind:"route",mode:route.mode||"",
+    from_lat:num(origin.lat),from_lng:num(origin.lng),
+    to_lat:num(place.lat),to_lng:num(place.lng),
+    summary:{duration_min:route.duration_min,cost_cny:route.cost_cny,
+             distance_km:route.distance_km,kind:route.kind||"estimate"}};
+  if(origin.name) payload.from_name=String(origin.name);
+  if(place.name) payload.to_name=String(place.name);
+  if(place.osm_type&&place.osm_id!==undefined&&place.osm_id!==null){
+    payload.osm_type=place.osm_type;payload.osm_id=place.osm_id;
+  }
+  return payload;
+}
+// 卡片内的收藏按钮:已收藏显示「已收藏 ★」(再点只提示,不重复 POST)
+function favButtonHtml(route){
+  const keys=currentFavKeys();
+  const faved=!!keys[favKey(favRouteItem(route))];
+  const label=ROUTE_MODE_LABEL[route.mode]||route.mode||"路线";
+  return '<div class="rp-fav"><button type="button" class="fav-btn js-fav'+(faved?" faved":"")+'" '+
+    'data-mode="'+esc(route.mode||"")+'"'+(faved?" disabled":"")+
+    ' title="'+(faved?"这条路线已在收藏里(收藏幂等,重复收藏只会刷新快照)":"把这条「"+esc(label)+"」路线存入收藏(POST /api/collections)")+'">'+
+    (faved?"★ 已收藏":"☆ 收藏路线")+"</button></div>";
+}
+function syncFavButtons(){
+  const keys=currentFavKeys();
+  const panel=state.routePanel;
+  const routes=(panel.data&&Array.isArray(panel.data.routes))?panel.data.routes:[];
+  routes.forEach(route=>{
+    const button=document.querySelector('#routeCards .js-fav[data-mode="'+(route.mode||"")+'"]');
+    if(!button) return;
+    const faved=!!keys[favKey(favRouteItem(route))];
+    button.classList.toggle("faved",faved);
+    button.disabled=faved;
+    button.textContent=faved?"★ 已收藏":"☆ 收藏路线";
+  });
+}
+async function addFavRoute(route,button){
+  if(button) button.disabled=true;
+  try{
+    const data=await sendJSON("/api/collections",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(favRoutePayload(route))});
+    await refreshFavItems();   // 拉一次列表,已收藏判定键与弹层数据同源
+    const name=(data.collection&&data.collection.name)||"该路线";
+    setRouteMsg(data.created?("已收藏:「"+name+"」(可在「⭐ 我的收藏」查看/取消)")
+      :("这条路线之前已收藏,快照已刷新:「"+name+"」"),"warn");
+  }catch(error){
+    setRouteMsg("收藏失败:"+((error&&error.message)||error)+"(不影响路线查看)","err");
+  }finally{
+    syncFavButtons();
+  }
+}
+function favItemHtml(item){
+  const summary=item.summary||{};
+  const kindBadge=(item.kind==="route")
+    ? '<span class="badge real">路线</span>'
+    : '<span class="badge est">目的地</span>';
+  const modeLabel=item.mode?(ROUTE_MODE_EMOJI[item.mode]||"")+" "+
+    (ROUTE_MODE_LABEL[item.mode]||item.mode):"";
+  return '<div class="fp-item" data-id="'+Number(item.id)+'">'+
+    '<div class="fp-nm">'+esc(item.name||"(无名)")+"</div>"+
+    '<div class="fp-badges">'+kindBadge+(modeLabel?'<span class="badge">'+esc(modeLabel)+"</span>":"")+
+    (item.cat_name?'<span class="badge deg">'+esc(item.cat_name)+"</span>":"")+"</div>"+
+    '<div class="fp-meta">时长 <b>'+esc(fmtDuration(summary.duration_min))+"</b> · 费用 <b>"+
+      esc(fmtCost(summary.cost_cny))+"</b> · 里程 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+
+      (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
+        esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>"+
+    (item.created_at?'<div class="fp-time">收藏于 '+esc(fmtGeneratedAt(item.created_at))+"</div>":"")+
+    '<button type="button" class="fp-del js-fav-del" data-id="'+Number(item.id)+
+      '" title="DELETE /api/collections/'+Number(item.id)+'">取消收藏</button>'+
+    "</div>";
+}
+function renderFavItems(){
+  const box=$("favPanelList");
+  if(!box) return;
+  if(!state.fav.items.length){
+    box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin → 路线面板里点「☆ 收藏路线」。</div>';
+    return;
+  }
+  box.innerHTML=state.fav.items.map(favItemHtml).join("");
+}
+function setFavErr(message){
+  const box=$("favPanelErr");
+  if(!box) return;
+  box.textContent=message||"";
+  box.style.display=message?"block":"none";
+}
+async function refreshFavItems(){
+  const data=await getJSON("/api/collections");
+  state.fav.items=Array.isArray(data.collections)?data.collections:[];
+  state.fav.favedKeys=currentFavKeys();
+  if(state.fav.open){renderFavItems();setFavErr("");}
+  syncFavButtons();
+}
+async function openFavPanel(){
+  state.fav.open=true;
+  const panel=$("favPanel");
+  if(panel) panel.style.display="block";
+  $("favPanelList").innerHTML='<div class="fp-empty">正在读取收藏(GET /api/collections)…</div>';
+  try{await refreshFavItems();}
+  catch(error){
+    $("favPanelList").innerHTML="";
+    setFavErr("收藏列表读取失败:"+((error&&error.message)||error));
+  }
+}
+function closeFavPanel(){
+  state.fav.open=false;
+  const panel=$("favPanel");
+  if(panel) panel.style.display="none";
+}
+async function deleteFav(id){
+  try{
+    await sendJSON("/api/collections/"+Number(id),{method:"DELETE"});
+    await refreshFavItems();
+  }catch(error){
+    setFavErr("取消收藏失败:"+((error&&error.message)||error));
+  }
+}
+
 $("goCity").addEventListener("click",()=>searchCity($("city").value));
 $("locate").addEventListener("click",locateMe);
 $("city").addEventListener("keydown",event=>{if(event.key==="Enter") searchCity($("city").value);});
@@ -819,6 +1027,11 @@ $("category").addEventListener("change",event=>{state.category=event.target.valu
 $("reload").addEventListener("click",()=>loadPlaces(true));
 $("intro").addEventListener("click",fillIntros);
 $("routePanelClose").addEventListener("click",closeRoutePanel);
+$("openFav").addEventListener("click",openFavPanel);
+$("favPanelClose").addEventListener("click",closeFavPanel);
+$("favPanel").addEventListener("click",event=>{
+  if(event.target===$("favPanel")) closeFavPanel();   // 点遮罩空白处关闭
+});
 $("routeRetry").addEventListener("click",()=>{
   const place=state.routePanel.place;
   if(place) openRoutePanel(place);   // 失败重试:缓存里没东西,会重新打一次 /api/routes
@@ -833,6 +1046,7 @@ document.addEventListener("keydown",onDocumentKeydown);
   }
   initMap();
   try{await loadMeta();}catch(error){showErr("元信息加载失败:"+error.message);setStatus("元信息加载失败");return;}
+  refreshFavItems().catch(()=>{});   // 预取收藏列表:路线卡片的「已收藏」态要它;失败静默(点收藏时会再拉)
   await searchCity(($("city").value||"").trim()||DEFAULT_CITY);
 })();
 </script>

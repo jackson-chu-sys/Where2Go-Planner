@@ -409,3 +409,77 @@ def test_inline_script_is_single_block_and_utf8(html: str) -> None:
     assert inline_script(html), "内联脚本不应为空"
     assert '<meta charset="utf-8">' in html, "中文文案依赖 utf-8 声明"
     assert "ROUTE_MAX_POINTS" in html and "ROUTE_LINE_LEGEND" in html, "画线常量/图例文案在脚本里"
+
+
+# --------------------------------------------------------------------------- #
+# 6. 我的收藏 UI(TASK-2c-fe):卡片收藏按钮 + 收藏弹层 + /api/collections 对接
+#    (轻量静态断言:DOM/JS 函数/API 调用都在页面里;交互验证走 browser_exec QA)
+# --------------------------------------------------------------------------- #
+
+FAV_SECTION_START = "我的收藏(TASK-2c-fe)"
+
+
+def fav_section(html: str) -> str:
+    start = html.index(FAV_SECTION_START)
+    end = html.index('$("goCity").addEventListener', start)
+    return html[start:end]
+
+
+def test_fav_panel_dom_ids_present(html: str) -> None:
+    for element_id in ("openFav", "favPanel", "favPanelClose", "favPanelList", "favPanelErr"):
+        assert f'id="{element_id}"' in html, f"缺少收藏 UI DOM id:{element_id}"
+    assert 'id="favPanel"' in html and 'role="dialog"' in html, "收藏列表应是 dialog 弹层"
+
+
+def test_fav_panel_hidden_by_default(html: str) -> None:
+    assert re.search(r"#favPanel\{[^}]*display:none", html), "收藏弹层默认应 display:none"
+
+
+def test_fav_functions_present(html: str) -> None:
+    section = fav_section(html)
+    for name in ("addFavRoute", "deleteFav", "openFavPanel", "closeFavPanel",
+                 "renderFavItems", "refreshFavItems", "favButtonHtml", "syncFavButtons",
+                 "routeFavPayload", "favItemHtml", "sendJSON"):
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少收藏 JS 函数:{name}"
+
+
+def test_fav_card_button_wired_into_route_card(html: str) -> None:
+    assert "favButtonHtml(route)" in panel_section(html), "路线卡片 HTML 应包含收藏按钮"
+    assert "js-fav" in html and "收藏路线" in html, "收藏按钮的 class 与文案应在页面里"
+
+
+def test_fav_calls_collections_api(html: str) -> None:
+    section = fav_section(html)
+    assert 'sendJSON("/api/collections",{method:"POST"' in section, "收藏应 POST /api/collections"
+    assert 'getJSON("/api/collections")' in section, "收藏列表应 GET /api/collections"
+    assert 'method:"DELETE"' in section and '/api/collections/"' in section, \
+        "取消收藏应 DELETE /api/collections/{id}"
+
+
+def test_fav_payload_carries_required_fields(html: str) -> None:
+    section = fav_section(html)
+    payload_section = section[section.index("function routeFavPayload"):section.index("function favButtonHtml")]
+    for field in ("kind:", "mode:", "from_lat", "from_lng", "to_lat", "to_lng",
+                  "duration_min", "cost_cny", "distance_km"):
+        assert field in payload_section, f"收藏请求体缺少字段 {field}"
+    assert "osm_type" in payload_section and "osm_id" in payload_section, \
+        "目的地有 OSM 身份时应带上(后端 ref_key 优先用 OSM 身份)"
+
+
+def test_fav_click_handling_and_keyboard(html: str) -> None:
+    assert 'target.closest("#routeCards .js-fav")' in html, "收藏按钮点击应走事件委托拦截(不误触选卡片)"
+    assert 'target.closest("#favPanelList .js-fav-del")' in html, "取消收藏按钮应走事件委托"
+    assert "closeFavPanel" in html[html.index("function onDocumentKeydown")
+                                   :html.index("function drawPins(")], \
+        "Esc 应先关收藏弹层"
+    assert '$("openFav").addEventListener("click",openFavPanel)' in html, "入口按钮应绑定 openFavPanel"
+    assert '$("favPanelClose").addEventListener("click",closeFavPanel)' in html, "关闭按钮应绑定 closeFavPanel"
+
+
+def test_fav_item_shows_summary_fields(html: str) -> None:
+    section = fav_section(html)
+    item_html = section[section.index("function favItemHtml"):section.index("function renderFavItems")]
+    for token in ("fmtDuration(summary.duration_min)", "fmtCost(summary.cost_cny)",
+                  "fmtKm(summary.distance_km)", "js-fav-del"):
+        assert token in item_html, f"收藏列表项缺少展示元素 {token}"
+    assert "fp-empty" in section, "空列表应有占位文案"

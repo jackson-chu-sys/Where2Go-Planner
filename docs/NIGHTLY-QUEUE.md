@@ -190,7 +190,7 @@
 
 ## [TASK-2c] 路线收藏(Collection 表 + 收藏 API + UI)
 
-- 状态: needs_review
+- 状态: done
 - 目标: 依 docs/STAGE2-PLAN.md 第 4 节,新增 `Collection` / `CollectionCat` 表(为 M4 铺路)与收藏 API(增/删/查),前端路线面板加「收藏路线」按钮与收藏列表查看。收藏条目记录:类型(route/place)、引用、名称、快照摘要(时长/费用)、创建时间。
 - 依赖: TASK-2a/2b。
 - 涉及: backend/db/models.py、backend/db/repository.py、backend/app/api/、frontend static
@@ -208,14 +208,14 @@
     summary 含 mode/duration_min/cost_cny/distance_km 快照、DELETE 后 total=0、bad-id/bad-kind/empty-body 均 400。
   - 前端(收藏按钮+收藏列表面板)**未完成**:Codex 第2次调用超 30min 熔断线被中止(R7),
     中止时 git 工作区干净、零产物,无可收尾内容。验收第3条(前端能收藏并看列表)未达成。
-  - 待神朱定夺:下晚重派前端子任务(任务描述已备好,见本条目标)或白天处理。
+  - ~~待神朱定夺~~:神朱已裁定选①(执行器直接手写),前端由 TASK-2c-fe 于 2026-09-20 落地(commit `7618bc1`),本条收口 done。
   - 备注:POST route 收藏需 mode + 目的地引用(osm_type+osm_id 或 to_lat+to_lng),前端对接时注意。
 
 ---
 
 ## [TASK-2c-fe] 前端路线收藏 UI(收口 M2)
 
-- 状态: needs_review
+- 状态: done
 - 目标: **仅前端**改动,补齐 TASK-2c 缺失的收藏 UI。在 `backend/app/static/index.html` 的路线面板中:1) 每个路线方式卡片(驾车/铁路/飞机)旁加「收藏路线」按钮;2) 新增「我的收藏」列表(弹层或侧栏),显示已收藏项的 类型/名称/时长/费用摘要;3) 支持取消收藏。**后端已于 commit ff2a7fd 完成**(`backend/app/api/collections.py`:POST/GET/DELETE `/api/collections`;pytest 267 passed)——**不要修改后端**,只对接。
 - 依赖: 无(后端就绪)。
 - 涉及: **仅** backend/app/static/index.html
@@ -225,7 +225,22 @@
   3. 页面无 JS 报错;既有地图/pin/路线面板不回归
   4. browser_exec 自动 QA:开页→点 pin→出路线卡片→点收藏→看收藏列表→删除→0 console error
   5. 不改任何后端文件
-- 结果: **needs_review**(2026-09-19 夜班)。Codex 单次调用触 29min timeout 熔断(exit=124),中止时 git 工作区干净、零 commit、零产物,无可收尾内容;本条未达成任何验收项。日志留在 /tmp/w2g_task.log(末尾显示其仍在读测试 fixture 阶段,疑探索轮数过多)。与 TASK-2c 前端部分连续两晚熔断——建议神朱白天定夺:①改由白天会话/执行器直接手写该前端改动(index.html 收藏按钮+列表,对接已就绪的 /api/collections,工程量不大);②或再派 Codex 但把任务拆得更窄(先只做卡片按钮+POST,再单独做收藏面板)。
+- 结果: **完成**(2026-09-20,神朱选①后由执行器直接手写,不再派 Codex;commit `7618bc1` + 笔误修复 `64728b1`)。
+  - index.html(+约160行,仅前端,零后端改动):路线卡片内「☆ 收藏路线」按钮(POST /api/collections,
+    请求体含 kind=route/mode/起终点坐标与名称/osm_type+osm_id/summary{duration_min,cost_cny,distance_km,kind},
+    成功后按钮变「★ 已收藏」disabled;失败中文提示不阻塞);顶栏「⭐ 我的收藏」入口 → 全屏 dialog 弹层
+    (GET /api/collections 渲染列表:名称/类型徽章/方式/时长/费用/里程/真实·估算/收藏时间,空列表占位文案,
+    每项「取消收藏」→ DELETE /api/collections/{id});Esc 先关弹层再关路线面板,点遮罩空白也可关;
+    已收藏判定键与后端唯一键 (kind,ref_key,mode) 同口径(坐标定点 7 位小数,OSM 身份优先),
+    boot 时预取一次收藏列表让按钮初始态正确。
+  - 测试:test_frontend_routes.py 追加 8 个静态断言(DOM id/默认隐藏/JS 函数/卡片接线/API 调用/
+    请求体字段/事件委托与键盘/列表项摘要)。pytest backend/ = **275 passed**(267 基线零改动)。
+  - browser_exec 真实 QA(uvicorn :8000 StaticFiles 直接读盘,无需重启):开页 495 pin 正常 →
+    开路线面板出驾车卡片 → 点「☆ 收藏路线」→ 提示「已收藏:上海 → La Taverna · 驾车」+ 按钮变 ★ 已收藏 →
+    开「⭐ 我的收藏」弹层见 1 条(名称/路线徽章/🚗驾车/时长 50 分钟/费用 ¥60/里程 62.8 km/真实/收藏时间)→
+    取消收藏 → 列表回空态、卡片按钮复位「☆ 收藏路线」→ Esc 关弹层;全程 window error **0** 条。
+  - QA 中发现并当场修复一处笔误(调用名 favRoutePayload → routeFavPayload,`64728b1`);测试收藏已清空,库无残留。
+  - M2(阶段2c 路线收藏)至此收口:TASK-2c 后端 + TASK-2c-fe 前端全部落地。
 
 ---
 

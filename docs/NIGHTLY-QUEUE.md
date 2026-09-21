@@ -244,6 +244,33 @@
 
 ---
 
+## [TASK-JEV1] Jev 范式 PoC · 采集与分块器(第 1/2 晚)
+
+- 状态: pending
+- 目标: 验证「工具结果进上下文前先过廉价裁判」能省多少 token。今晚**不调用 Codex**(纯执行器手写),只做采集侧:
+  1. 建 `tools/jev_poc/` 目录:requirements 说明、`splitter.py`(把日志按 ~25 行分块,winnow 式,不依赖 Jev 包)、`judge.py`(裁判函数:读 .env 里的 key,走 OpenAI 兼容 `POST /v1/chat/completions` 单次调用,批量问每块「当前任务还需要吗 yes/no+置信度」,模型用 deepseek-chat 或 token-plan qwen 小杯;失败一律降级为"保留",绝不丢数据)、`__init__/README.md` 记录设计。
+  2. 写 20+ 个 pytest(`backend/test_jev_poc.py`,全 mock 不触网):分块边界、裁判解析健壮性(坏 JSON/超时/限流→保留)、stub 可逆性(restore key 能还原原文)、成本统计函数。
+  3. 真实回放素材:取昨夜 `~/.codex/sessions/` 最新 jsonl + 最近一次夜班执行器的工具输出样本,落一份脱敏副本到 `tools/jev_poc/samples/`(去掉 key/token 字样,正则扫 `sk-|gpo_|token` 复核)。
+- 涉及: tools/jev_poc/(新建)、backend/test_jev_poc.py
+- 验收: 1) pytest backend/ 全绿(基线 275 + 新增);2) splitter 对样本日志分块数、行数守恒(无丢行);3) judge.py 对样本跑一次真实调用能返回结构化结果且打印每块成本估算;4) 样本已脱敏(grep 无凭据残留);5) git commit(只 commit 不 push)。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-JEV2] Jev 范式 PoC · 回放测量与结论(第 2/2 晚)
+
+- 状态: pending
+- 目标: 依赖 TASK-JEV1 完成。今晚**不调用 Codex**。
+  1. `replay.py`:对 samples 里的历史工具输出,模拟一次夜班 turn 的"任务焦点描述"(从该 turn 上下文人工/程序提取),跑裁判,输出对照报告:原 token 数 vs 筛后 token 数、可筛除比例、裁判自身消耗、按现价折算省钱比例。
+  2. 写 `tools/jev_poc/FINDINGS.md`:省 token 百分比、误杀率(人工抽查 20 块标注)、结论三选一——a) 值得接入 SoL-Pi/codex 管道(给出接入草案) b) 用 adapter 不划算,若上真 Jev API($5 免费额度)预期如何 c) 范式不适合本项目场景,归档。
+  3. git commit(不 push)。
+- 依赖: TASK-JEV1。
+- 涉及: tools/jev_poc/replay.py、FINDINGS.md
+- 验收: 1) 回放报告数字可复算(附脚本输出);2) FINDINGS.md 结论明确、引用真实数字;3) pytest 仍全绿;4) 已 commit。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

@@ -1,0 +1,1295 @@
+--- output #0 ---
+Chunk ID: 2bf4d9
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 316
+Output:
+total 116
+drwxrwxrwx 9 root   root    4096 Sep  8 15:58 .
+drwxrwxrwx 8 hermes uucp    4096 Sep  2 12:19 ..
+drwxrwxrwx 8 hermes hermes  4096 Sep 19 14:02 .git
+-rwxrwxrwx 1 hermes hermes   279 Sep  9 14:38 .gitignore
+drwxr-xr-x 3 hermes hermes  4096 Sep  8 14:19 .pytest_cache
+drwxrwxrwx 3 hermes hermes  4096 Sep  8 14:28 .ruff_cache
+drwxrwxrwx 5 hermes hermes  4096 Sep  9 14:09 .venv
+-rwxrwxrwx 1 hermes hermes  8127 Sep  7 15:18 01-功能需求清单.md
+-rwxrwxrwx 1 hermes hermes 13693 Sep  8 14:38 02-项目计划与架构.md
+-rw------- 1 hermes uucp     277 Sep 13 12:29 Github_PAT.txt
+-rwxrwxrwx 1 hermes hermes 34523 Sep  7 15:28 LICENSE
+drwxrwxrwx 9 hermes hermes  4096 Sep 12 14:43 backend
+drwxrwxrwx 2 hermes hermes  4096 Sep 19 14:02 docs
+drwxrwxrwx 2 hermes hermes  4096 Sep  8 14:38 tasks
+-rwxrwxrwx 1 hermes uucp     733 Sep  7 15:07 意见.txt
+-rwxrwxrwx 1 hermes uucp    2435 Sep  7 12:02 需求文档.txt
+35c454f queue: TA[REDACTED] -> running (夜班开工)
+12ee145 queue: 新增 TA[REDACTED](前端收藏 UI,收口 M2);执行器上限 2→3 条
+95dbdc1 queue: TASK-2c -> needs_review(后端 done ff2a7fd/267 passed;前端 Codex 熔断无产物)
+ff2a7fd feat(backend): TASK-2c 路线收藏 Collection 表+API+单测
+5d4cbb1 queue: TASK-2c -> running
+
+--- output #1 ---
+Chunk ID: 2fd759
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 2728
+Output:
+Warning: truncated output (original token count: 2728)
+Total output lines: 256
+
+"""收藏 API(TASK-2c,阶段2c):路线 / 目的地收藏的增、删、查(**幂等**)。
+
+三条路由:
+
+* ``POST /api/collections`` —— 新增一条收藏(``kind=route`` 路线 / ``kind=place`` 目的地)。
+  唯一键 ``(kind, ref_key, mode)``:同一起终点 + 同一方式重复收藏**不报错也不产生第二行**,
+  而是刷新快照摘要并返回原行(``created=false``);``id`` 与 ``created_at`` 保持
+  "第一次收藏"的值,列表排序才稳定。
+* ``GET /api/collections?kind=&cat=&limit=`` —— 收藏列表(**新的在前**),可按类型 / 分组过滤;
+  响应附带 ``counts_by_kind`` 与分组清单,前端一个请求就能渲染整个收藏面板。
+* ``DELETE /api/collections/{id}`` —— 删除一条收藏;``id`` 非正整数 **400**,不存在 **404**。
+
+存的是**快照**:收藏那一刻的 ``mode``/``duration_min``/``cost_cny``/``distance_km``
+(``/api/routes`` 返回什么就存什么,``geometry`` 主动丢掉不占库)。之后价格系数变了、
+OSRM 降级了,列表仍显示用户当时看到的数字(M4 对比总账要的正是"当时口径");
+要看最新数字请重新调 ``/api/routes``。
+
+校验口径与 ``/api/places``、``/api/routes`` 一致:缺参 / 非法一律 **400 + 中文报错**。
+所以请求体故意收成裸 JSON 对象(``Body(None)``)而不是 pydantic 模型 —— 否则字段类型不对
+会被 FastAPI 拦成 422 英文报错,同一个"参数不对"就有两种状态码。
+本模块**不触网**:只读写 SQLite(收藏是快照,不需要重新算路线)。
+"""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Mapping
+from typing import Any, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+
+from db import models
+from db import repository as repo
+from db.base import get_session
+from services import routes as route_service
+
+router = APIRouter()
+
+MAX_PAGE = 200  # 单次列表上限:前端传更大的 limit 也按这个截断,免得一次把整库拉走
+
+COLLECTIONS_NOTE = (
+    "收藏存的是快照:收藏那一刻的方式/时长/费用/里程(即 /api/routes 的返回,geometry 不入库),"
+    "之后价格系数变了、OSRM 降级了也不回填,要看最新数字请重新调 /api/routes。"
+    "唯一键 (kind, ref_key, mode) 让重复收藏幂等:同一对起终点 + 同一方式只有一行,"
+    "再次收藏刷新快照并返回原行(created=false),id 与 created_at 保持第一次收藏的值;"
+    "place 收藏没有出行方式(mode 恒为空串),同一目的地收藏两次同样幂等。"
+)
+DELETE_NOTE = "只删这一条收藏,不影响目的地库(Place)、抓取水位与路线计算。"
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    """可选文本参数归一:只认真正的 ``str``。
+
+    直接调用端点函数(单测 / 脚本)时,FastAPI 的 ``Query(None)`` 默认值不会被解析,
+    传进来是 ``FieldInfo`` 对象;这里统一把"没给"归一成 ``None``(同 ``app.api.routes``)。
+    """
+    return value if isinstance(value, str) else None
+
+
+def _optional_int(name: str, value: Any) -> Optional[int]:
+    """可选整数参数归一:没给 → ``None``;非整数 / 非正数 → **400**(中文报错)。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if not isinstance(value, (str, int)):
+        return None  # FieldInfo 等"没给"的情况
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise HTTPException(400, f"参数 {name} 必须是整数,收到:{value!r}") from exc
+    if number <= 0:
+        raise HTTPException(400, f"参数 {name} 必须是正整数,收到:{value!r}")
+    return number
+
+
+def _payload_dict(payload: Any) -> dict[str, Any]:
+    """请求体归一:必须是 JSON 对象(``{...}``),否则 **400**(中文报错)。"""
+    if payload is None:
+        raise HTTPException(400, "缺少请求体:POST /api/collections 需要 JSON 对象")
+    if not isinstance(payload, Mapping):
+        raise HTTPException(
+            400, f"请求体必须是 JSON 对象,收到:{type(payload).__name__}"
+        )
+    return dict(payload)
+
+
+def _resolve_kind(raw_kind: Any) -> str:
+    """收藏类型归一(``route`` / ``place``);缺失 / 非法 → **400**。"""
+    try:
+        return models.collection_kind(raw_kind)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _resolve_mode(kind: str, raw_mode: Any) -> str:
+    """出行方式归一:``route`` 必填且要在 ``services.routes.MODES`` 里;``place`` 恒为空串。
+
+    非法取值一律 **400**(而不是静默丢弃):前端把 ``/api/routes`` 的 ``mode`` 原样带上即可,
+    拼错了当场报错比悄悄存成另一种方式安全。
+    """
+    wanted = (models.clean_text(raw_mode) or "").lower() or None
+    if wanted and wanted not in route_service.MODES:
+        raise HTTPException(
+            400, f"未…825 chars truncated…    """收藏标题:调用方给了就用,没给按 ``起点 → 目的地 · 方式`` 生成(见 :mod:`db.models`)。"""
+    given = models.clean_text(payload.get("name"), limit=models.NAME_LEN)
+    if given:
+        return given
+    meta = route_service.MODE_META.get(mode)
+--- output #2 ---
+Chunk ID: 2a0609
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 466
+Output:
+total 336
+drwxrwxrwx 9 hermes hermes  4096 Sep 12 14:43 .
+drwxrwxrwx 9 root   root    4096 Sep  8 15:58 ..
+drwxr-xr-x 3 hermes hermes  4096 Sep  9 14:25 .pytest_cache
+drwxrwxrwx 3 hermes hermes  4096 Sep  9 14:19 .ruff_cache
+-rwxrwxrwx 1 hermes hermes 40406 Sep 12 14:50 README.md
+drwxrwxrwx 4 hermes hermes  4096 Sep  8 14:45 app
+-rwxrwxrwx 1 hermes hermes  1080 Sep  9 17:27 conftest.py
+drwxrwxrwx 2 hermes hermes  4096 Sep 12 14:58 data
+drwxrwxrwx 2 hermes hermes  4096 Sep  8 14:38 data_sources
+drwxrwxrwx 2 hermes hermes  4096 Sep  9 14:23 db
+-rwxrwxrwx 1 hermes hermes   517 Sep  9 14:38 requirements.txt
+drwxrwxrwx 2 hermes hermes  4096 Sep 11 14:24 services
+-rwxrwxrwx 1 hermes hermes 47763 Sep 10 15:36 test_classify.py
+-rwxrwxrwx 1 hermes hermes 48215 Sep 12 14:52 test_collections.py
+-rwxrwxrwx 1 hermes hermes 34295 Sep 10 15:34 test_data_sources.py
+-rwxrwxrwx 1 hermes hermes 21794 Sep 11 15:17 test_frontend_routes.py
+-rwxrwxrwx 1 hermes hermes 23792 Sep  9 14:36 test_places.py
+-rwxrwxrwx 1 hermes hermes 32140 Sep 11 14:42 test_routes.py
+-rwxrwxrwx 1 hermes hermes 38166 Sep  9 17:46 test_seed_data.py
+app:
+total 20
+drwxrwxrwx 4 hermes hermes 4096 Sep  8 14:45 .
+drwxrwxrwx 9 hermes hermes 4096 Sep 12 14:43 ..
+-rwxrwxrwx 1 hermes hermes    0 Sep  8 14:45 __init__.py
+drwxrwxrwx 2 hermes hermes 4096 Sep 12 14:35 api
+-rwxrwxrwx 1 hermes hermes 1472 Sep 12 14:35 main.py
+drwxrwxrwx 2 hermes hermes 4096 Sep  9 14:38 static
+
+app/static:
+total 60
+drwxrwxrwx 2 hermes hermes  4096 Sep  9 14:38 .
+drwxrwxrwx 4 hermes hermes  4096 Sep  8 14:45 ..
+-rwxrwxrwx 1 hermes hermes 42343 Sep 11 15:06 index.html
+-rwxrwxrwx 1 hermes hermes  6424 Sep  9 14:38 list.html
+  840 app/static/index.html
+  411 test_frontend_routes.py
+ 1251 total
+README.md
+../docs:
+NIGHTLY-PLAN.md
+NIGHTLY-QUEUE.md
+STAGE1-PLAN.md
+STAGE2-PLAN.md
+
+../tasks:
+TA[REDACTED].md
+
+--- output #3 ---
+Chunk ID: 57981f
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1377
+Output:
+"""TASK-2b 单测:前端路线面板(``app/static/index.html``)的轻量断言。
+
+页面是**原生 JS 单文件**(Leaflet 走 CDN,没有构建步骤),所以这里不跑浏览器,
+只做三类**离线**断言:
+
+1. **DOM / JS 面**:路线面板的容器与控件 id、卡片渲染与画线相关函数名都在;
+   跳转链接是 ``<a target="_blank" rel="noopener">``;没有内联 ``onclick=``、
+   没有 ``alert``/``document.write``;面板默认 ``display:none``,只在打开时显示。
+2. **前后端契约**:用**替身 router**(不触网)真跑一遍 :func:`app.api.routes.list_routes`,
+   把前端在路线面板那一段里引用到的 ``data.*`` / ``route.*`` / ``link.*`` 字段名
+   逐个对回响应里的真实键 —— 后端改字段名而前端没跟上(或反过来)时,这里当场红。
+   同时校验前端抽稀上限不比后端 ``GEOMETRY_MAX_POINTS`` 松。
+3. **零回退**:阶段1a/1b/1c 的分类 pin、popup 简介、band 切换、城市搜索、
+   「📍 我的位置」「补简介」相关 id 与函数一个不少;Leaflet CDN + SRI 仍在。
+
+若环境里装了 ``node``,再加一条 ``node --check`` 对内联脚本做**语法**校验
+(仍不触网、不需要浏览器);没装就 skip。
+
+运行:``python -m pytest backend/ -q``
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+import requests
+
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if BACKEND_DIR not in sys.path:
+    sys.path.insert(0, BACKEND_DIR)
+
+from app.api import routes as routes_api  # noqa: E402
+from app.main import STATIC, app as fastapi_app  # noqa: E402
+from services import routes as route_service  # noqa: E402
+
+INDEX_HTML = STATIC / "index.html"
+# 路线面板那一段 JS 的切片边界(前面是 popup/identity,后面是 drawPins)
+# 契约断言的 JS 切片:从「路线面板」常量段起,到 drawPins 之前(含 openRoutePanel/画线/格式化)
+PANEL_START = "路线面板(TASK-2b,阶段2b)"
+PANEL_END = "function drawPins("
+
+# 面板必须有的 DOM id:容器 + 标题/副标题 + 状态提示 + 重试 + 卡片 + 图例 + 时效脚注 + 关闭
+PANEL_IDS = [
+    "mapWrap", "map", "routePanel", "routePanelTitle", "routePanelSub", "routePanelMsg",
+    "routeRetry", "routeCards", "routePanelLegend", "routePanelMeta", "routePanelClose",
+]
+# 面板相关的 JS 函数(展示 / 画线 / 状态 / 格式化)
+PANEL_FUNCTIONS = [
+    "openRoutePanel", "closeRoutePanel", "loadRoutes", "applyRouteData", "renderRouteCards",
+    "routeCardHtml", "routeLinksHtml", "selectRouteMode", "drawRouteLine", "clearRouteLine",
+    "thinPoints", "arcPoints", "setRouteMsg", "renderRouteMeta", "fmtDuration", "fmtCost",
+    "fmtGeneratedAt", "routeEnds",
+]
+# 阶段1a/1b/1c 既有功能的 id 与函数(零回退清单)
+STAGE1_IDS = ["city", "cityList", "goCity", "locate", "band", "category", "reload", "intro",
+              "status", "legend", "note", "err", "map"]
+STAGE1_FUNCTIONS = ["initMap", "renderBandOptions", "renderCategoryOptions", "renderLegend",
+                    "drawRings", "fitRings", "popupHtml", "identityHtml", "drawPins",
+                    "loadMeta", "searchCity", "applyOrigin", "locateMe", "onLocated",
+                    "onLocateFailed", "loadPlaces", "fillIntros", "categoryMeta"]
+# 后端每条路线的键(services/routes.py 的路线形状),前端应逐字段用到
+ROUTE_FIELDS = ["mode", "label", "emoji", "duration_min", "cost_cny", "distance_km",
+                "geometry", "kind", "degraded", "note", "links"]
+LINK_FIELDS = ["provider", "label", "url", "note"]
+
+SHANGHAI = {"lat": "31.2304", "lng": "121.4737", "name": "上海"}
+BEIJING = {"lat": "39.9042", "lng": "116.4074", "name": "北京"}   # 直线约 1067km → 三方式都出现
+
+
+class FakeRouter:
+    """OSRM 替身:返回一条带**长 geometry** 的驾车 leg(前端抽稀逻辑才有意义),不触网。"""
+
+    def __init__(self, *, distance_km: float = 1216.4, duration_min: float = 812.0,
+                 points: int = 3000) -> None:
+        self.leg = {
+            "distance_km": distance_km,
+            "duration_min": duration_min,
+            "geometry": [[SHANGHAI_LAT + (BEIJING_LAT - SHANGHAI_LAT) * i / (points - 1),
+                          SHANGHAI_LNG + (BEIJING_LNG - SHANGHAI_LNG) * i / (points - 1)]
+                         for i in range(points)],
+        }
+        self.calls = 0
+
+    def __call__(self, start_lnglat: Any, end_lnglat: Any) -> dict[str, Any]:
+        self.calls += 1
+        return dict(self.leg)
+
+
+SHANGHAI_LAT, SHANGHAI_LNG = float(SHANGHAI["lat"]), float(SHANGHAI["lng"])
+BEIJING_LAT, BEIJING_LNG = float(BEIJING["lat"]), float(BEIJING["lng"])
+
+
+def read_index() -> str:
+ 
+--- output #4 ---
+Chunk ID: 0bacac
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 4073
+Output:
+Warning: truncated output (original token count: 4073)
+Total output lines: 292
+
+
+
+def inline_script(html: str) -> str:
+    blocks = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert len(blocks) == 1, "页面应只有一段内联脚本(其余是带 src 的 CDN 引用)"
+    return blocks[0]
+
+
+# --------------------------------------------------------------------------- #
+# fixtures:全程不触网
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """兜底:任何 requests 调用都视为测试失败(本套单测必须纯 mock)。"""
+
+    def blocked(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("单测不允许触网:requests.Session.request 被调用")
+
+    monkeypatch.setattr(requests.Session, "request", blocked)
+
+
+@pytest.fixture(scope="module")
+def html() -> str:
+    return read_index()
+
+
+@pytest.fixture()
+def payload(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """用替身 router 跑一遍**真实 API 函数**,拿到前端要消费的响应(上海 → 北京,三方式齐全)。"""
+    monkeypatch.setattr(route_service, "default_router", FakeRouter())
+    return routes_api.list_routes(
+        from_lat=SHANGHAI["lat"], from_lng=SHANGHAI["lng"],
+        to_lat=BEIJING["lat"], to_lng=BEIJING["lng"],
+        to_name=BEIJING["name"], from_name=SHANGHAI["name"],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 1. 页面装配:静态页就是被挂载的那一份,/api/routes 已注册
+# --------------------------------------------------------------------------- #
+
+
+def test_index_html_is_the_mounted_static_page() -> None:
+    assert INDEX_HTML.is_file(), f"缺少静态页:{INDEX_HTML}"
+    mounts = [route for route in fastapi_app.routes if type(route).__name__ == "Mount"]
+    assert mounts, "根路径应挂载 StaticFiles(地图页)"
+    directory = getattr(getattr(mounts[-1], "app", None), "directory", None)
+    assert directory and Path(directory).resolve() == STATIC.resolve(), "挂载目录应是 app/static"
+    assert "/api/routes" in fastapi_app.openapi()["paths"], "前端要调的 /api/routes 应已注册(TASK-2a)"
+
+
+# --------------------------------------------------------------------------- #
+# 2. DOM / JS 面:面板、卡片、画线、跳转
+# --------------------------------------------------------------------------- #
+
+
+def test_route_panel_dom_ids_present(html: str) -> None:
+    for element_id in PANEL_IDS:
+        assert f'id="{element_id}"' in html, f"缺少路线面板 DOM id:{element_id}"
+
+
+def test_route_panel_functions_present(html: str) -> None:
+    for name in PANEL_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", html), f"缺少 JS 函数:{name}"
+
+
+def test_route_panel_is_hidden_until_opened(html: str) -> None:
+    assert re.search(r"#routePanel\{[^}]*display:none", html), "面板默认应 display:none(不占地图)"
+    assert 'panel.style.display="block"' in html, "打开面板时应显式置 display:block"
+    assert 'panel.style.display="none"' in html, "关闭面板时应显式置 display:none"
+    assert '<aside id="routePanel"' in html, "面板用 aside 侧栏语义"
+    assert html.index('<div id="map">') < html.index('<aside id="routePanel"'), "面板应挂在地图容器里"
+
+
+def test_pin_click_opens_panel_and_popup_keeps_route_entry(html: str) -> None:
+    assert 'marker.on("popupopen"' in html, "点 pin(popup 打开)应触发路线面板"
+    assert "openRoutePanel(place)" in html, "popupopen 应调用 openRoutePanel"
+    assert "js-routes" in html, "popup 内应保留一个显式的路线入口按钮"
+    assert "popupHtml(place,index)" in html, "popup 按钮要靠 pin 序号取回该 Place"
+    assert "state.places" in html, "当前渲染的 Place 列表应存进 state 供面板取用"
+
+
+def test_frontend_calls_api_routes_with_required_params(html: str) -> None:
+    assert '"/api/routes?"' in html, "应调用 GET /api/routes"
+    section = panel_section(html)
+    for param in ("from_lat", "from_lng", "to_lat", "to_lng"):
+        assert f"{param}:String(" in section, f"/api/routes 缺少必要参数 {param}"
+    for optional in ("to_name", "from_name"):
+        assert f'params.set("{optional}"' in section, f"应带上 {optional}(deep-link 文案/URL 用)"
+    assert "new URLSearchParams
+--- output #5 ---
+Chunk ID: 5f9cc1
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 3054
+Output:
+Warning: truncated output (original token count: 3054)
+Total output lines: 200
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Where2Go · 目的地地图(阶段2b)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<style>
+  body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f5f7fa;color:#1f2937}
+  header{background:#0f766e;color:#fff;padding:14px 22px}
+  header h1{margin:0;font-size:19px}
+  header p{margin:5px 0 0;font-size:13px;opacity:.92}
+  header a{color:#ccfbf1}
+  main{max-width:1180px;margin:16px auto;padding:0 16px}
+  .card{background:#fff;border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:12px}
+  label{font-weight:600;font-size:13px;display:block;margin-bottom:5px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+  .field{flex:1;min-width:150px}
+  .inline{display:flex;gap:8px}
+  input,select{width:100%;padding:9px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;box-sizing:border-box}
+  button{background:#0f766e;color:#fff;border:none;padding:10px 16px;border-radius:8px;font-size:14px;cursor:pointer;white-space:nowrap}
+  button.secondary{background:#e5e7eb;color:#1f2937}
+  button:disabled{opacity:.5;cursor:wait}
+  #map{height:62vh;min-height:420px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);background:#e8eef1}
+  .status{color:#6b7280;font-size:13px;margin-top:10px}
+  .status b{color:#0f766e}
+  .err{color:#b91c1c;background:#fee2e2;padding:10px 14px;border-radius:8px;margin-top:10px;font-size:14px}
+  .note{color:#0f766e;background:#ccfbf1;padding:10px 14px;border-radius:8px;margin-top:10px;font-size:14px}
+  .note.warn{color:#92400e;background:#fef3c7}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#374151}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:5px;vertical-align:-1px}
+  .legend b{color:#6b7280}
+  .pin{width:26px;height:26px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:2px solid #fff;
+       box-shadow:0 1px 4px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;box-sizing:border-box}
+  .pin span{transform:rotate(45deg);font-size:12px;line-height:1}
+  .leaflet-popup-content{margin:12px 14px}
+  .pop .nm{font-weight:700;font-size:15px;margin-bottom:5px}
+  .pop .cat{display:inline-block;color:#fff;font-size:12px;padding:1px 8px;border-radius:10px}
+  .pop .kv{color:#374151;font-size:13px;margin-top:6px}
+  .pop .kv b{color:#0f766e}
+  .pop .intro{color:#1f2937;font-size:13px;line-height:1.55;margin-top:8px;border-top:1px dashed #e5e7eb;padding-top:7px}
+  .pop .intro.empty{color:#9ca3af;font-style:italic}
+  .pop .osm{color:#9ca3af;font-size:11px;margin-top:7px}
+  .pop .src{color:#0f766e;font-size:11px;margin-top:7px}
+  .pop .src b{color:#0f766e}
+  .pop .blurb{color:#6b7280;font-size:12px;margin-top:5px}
+  .pop .acts{margin-top:9px}
+  .pop-go{width:100%;padding:7px 10px;font-size:13px}
+  /* 路线面板(TASK-2b):浮在地图右上角的侧栏;窄屏降级成地图下方的普通卡片 */
+  #mapWrap{position:relative}
+  #routePanel{display:none;position:absolute;top:10px;right:10px;z-index:1000;
+              width:min(366px,calc(100% - 20px));max-height:calc(100% - 20px);overflow:auto;
+              background:#fff;border-radius:12px;box-shadow:0 3px 14px rgba(0,0,0,.28);
+              padding:12px 14px;box-sizing:border-box}
+  .rp-head{display:flex;align-items:flex-start;gap:8px}
+  .rp-ttl{font-weight:700;font-size:15px;flex:1}
+  .rp-x{background:#e5e7eb;color:#1f2937;padding:2px 9px;font-size:13px;border-radius:6px;line-height:1.5}
+  .rp-sub{color:#6b7280;font-size:12px;margin-top:4px}
+  .rp-msg{margin-top:9px;font-size:13px;padding:8px 10
+--- output #6 ---
+Chunk ID: 18a38d
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1711
+Output:
+async function getJSON(url){
+  const response=await fetch(url);
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data.detail||("HTTP "+response.status));
+  return data;
+}
+
+function categoryMeta(key){
+  return state.meta.categories.find(item=>item.key===key)
+    ||{key:key||"其他",label:key||"其他",color:"#6b7280",emoji:"📍"};
+}
+function currentBand(){
+  return state.meta.bands.find(band=>band.key===state.band)
+    ||state.meta.bands[0]||{key:state.band,label:state.band,low:50,high:100};
+}
+
+function initMap(){
+  map=L.map("map").setView(FALLBACK_CENTER,8);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{
+    maxZoom:19,
+    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+  rings=L.layerGroup().addTo(map);
+  pins=L.layerGroup().addTo(map);
+  routeLayer=L.layerGroup().addTo(map);   // 路线画线专用图层:同一时刻只留一条
+}
+
+function renderBandOptions(){
+  $("band").innerHTML=state.meta.bands.map(band=>{
+    const count=state.cached[band.key];
+    const suffix=(count===undefined)?"(未入库,首次需抓取)":("(已入库 "+count+" 条)");
+    const selected=band.key===state.band?" selected":"";
+    return '<option value="'+esc(band.key)+'"'+selected+'>'+esc(band.label)+" "+esc(suffix)+"</option>";
+  }).join("");
+}
+
+function renderCategoryOptions(){
+  const all='<option value=""'+(state.category?"":" selected")+'>全部分类</option>';
+  $("category").innerHTML=all+state.meta.categories.map(item=>{
+    const selected=item.key===state.category?" selected":"";
+    return '<option value="'+esc(item.key)+'"'+selected+">"+esc(item.label)+"</option>";
+  }).join("");
+}
+
+function renderLegend(counts){
+  $("legend").innerHTML=state.meta.categories.map(item=>{
+    const total=(counts||{})[item.key]||0;
+    const hint=item.blurb?(" title="+esc('"'+item.blurb+'"')):"";
+    return '<span'+hint+'><i style="background:'+item.color+'"></i>'+esc(item.label)+" <b>"+total+"</b></span>";
+  }).join("");
+  const priority=(state.meta.category_priority||[]).join(" > ");
+  const llm=state.meta.llm||{};
+  $("legend").innerHTML+='<span><b>归类优先级</b> '+esc(priority)+"</span>"+
+    '<span><b>简介</b> '+(llm.enabled?esc(llm.label||llm.provider||"LLM"):"未配置 LLM key,简介留空")+"</span>"+
+    '<span title="OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据(真实经纬度 + 静态简介)垫底">'+
+    "<b>种子数据</b> "+seedLegend()+"</span>";
+}
+
+// 图例里的种子一句话:开启时报总量与分类分布,关闭时报开关名
+function seedLegend(){
+  const seeds=state.meta.seeds||{};
+  if(!seeds.enabled) return "已关闭("+esc(seeds.env||"WHERE2GO_SEEDS")+")";
+  const by=seeds.by_category||{};
+  return "人工补录 "+(seeds.total||0)+" 条(滑雪场 "+(by["滑雪场"]||0)+" / 运动 "+(by["运动"]||0)+")";
+}
+
+// 当前 band 的环形范围圈:外圆(上限半径)+ 内圆虚线(下限半径)= 环带示意
+function drawRings(){
+  if(!map||!rings||!state.origin) return;   // Leaflet 没加载成功时静默跳过(boot 里已给降级提示)
+  rings.clearLayers();
+  outerRing=null;
+  const band=currentBand();
+  const at=[state.origin.lat,state.origin.lng];
+  outerRing=L.circle(at,{radius:band.high*1000,color:RING_COLOR,weight:2,fillColor:RING_COLOR,fillOpacity:.06});
+  const innerRing=L.circle(at,{radius:band.low*1000,color:RING_COLOR,weight:1.5,dashArray:"6 6",fill:false});
+  outerRing.bindTooltip(band.label+" 外圈("+band.high+" km)");
+  innerRing.bindTooltip(band.label+" 内圈("+band.low+" km)");
+  const center=L.circleMarker(at,{radius:6,color:"#fff",weight:2,fillColor:RING_COLOR,fillOpacity:1});
+  center.bindTooltip(state.origin.name+"(起点)",{direction:"top"});
+  rings.addLayer(outerRing);rings.addLayer(innerRing);rings.addLayer(center);
+}
+
+function fitRings(){if(map&&outerRing&&outerRing.getBounds) map.fitBounds(outerRing.getBounds(),{padding:[24,24]});}
+
+// popup 卡片:名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介 + OSM 身份脚注 + 路线入口
+function popupHtml(place,index){
+  const meta=categoryMeta(place.category);
+  const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
+  const distance=(place.distance_km===null||pl
+--- output #7 ---
+Chunk ID: df5013
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1480
+Output:
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="city">起点城市 / 我的位置</label>
+        <div class="inline">
+          <input id="city" value="上海" placeholder="如:北京、上海、崇礼" autocomplete="off" list="cityList">
+          <datalist id="cityList"></datalist>
+          <button id="goCity">搜索</button>
+          <button id="locate" class="secondary"
+                  title="用浏览器定位(GPS)反查起点城市;不支持或被拒绝时只给提示,不影响城市搜索">📍 我的位置</button>
+        </div>
+      </div>
+      <div class="field"><label for="band">距离分段(环形,互斥)</label><select id="band"></select></div>
+      <div class="field"><label for="category">分类</label><select id="category"></select></div>
+      <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
+        <div class="inline">
+          <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass 四分类并集">重新抓取</button>
+          <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
+        </div></div>
+    </div>
+    <div class="status" id="status">初始化…</div>
+    <div class="legend" id="legend"></div>
+    <div class="note" id="note" style="display:none"></div>
+    <div class="err" id="err" style="display:none"></div>
+  </div>
+  <div id="mapWrap">
+    <div id="map"></div>
+    <!-- 路线面板(TASK-2b):点 pin 自动展开;✕ 关闭时清掉地图上的路线 -->
+    <aside id="routePanel" aria-live="polite">
+      <div class="rp-head">
+        <div class="rp-ttl" id="routePanelTitle">🧭 路线对比</div>
+        <button type="button" id="routePanelClose" class="rp-x"
+                title="关闭路线面板并清除地图上的路线">✕</button>
+      </div>
+      <div class="rp-sub" id="routePanelSub"></div>
+      <div class="rp-msg" id="routePanelMsg" style="display:none"></div>
+      <button type="button" id="routeRetry" class="rp-retry" style="display:none">重试</button>
+      <div class="rp-cards" id="routeCards"></div>
+      <div class="rp-line" id="routePanelLegend" style="display:none"></div>
+      <div class="rp-meta" id="routePanelMeta"></div>
+    </aside>
+  </div>
+</main>
+<footer>
+  Where2Go 阶段2b · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 四分类 tag 并集抓取后入 SQLite,
+  同一「城市 + 分段」二次查询只读库不触网 · 归类优先级 滑雪 &gt; 运动 &gt; 人文美食 &gt; 自然,
+  按 OSM (type, id) 去重、一地只属一类 · 一句话简介由 LLM 生成并按 POI 缓存 ·
+  OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据垫底(popup 标注来源=种子)·
+  路线:驾车时长/里程来自 OSRM 真实路网(费用为估算),铁路/飞机为经验估算,
+  一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价
+</footer>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+const $=id=>document.getElementById(id);
+const DEFAULT_CITY="上海";
+const FALLBACK_CENTER=[31.2304,121.4737];
+const RING_COLOR="#0f766e";
+const INTRO_LIMIT=40;
+const GEO_TIMEOUT_MS=12000;
+const SEED_SOURCE="种子";
+const CITY_HINTS=["上海","北京","广州","深圳","杭州","苏州","南京","成都","重庆","武汉","西安",
+                  "张家口","崇礼","吉林","哈尔滨"];
+// 路线面板(TASK-2b,阶段2b):口径全在后端 services/routes.py,前端只管展示/画线/降级提示
+const ROUTE_MAX_POINTS=600;   // 前端再抽稀一次(后端已按 GEOMETRY_MAX_POINTS=1200 抽过)
+const ROUTE_FLIGHT_BOW=.12;   // 飞机示意线弧度(相对起终点连线的垂直偏移比例);铁路画直线
+const ROUTE_ARC_SEGMENTS=28;
+const ROUTE_CACHE_LIMIT=40;   // 同一「起点 + 目的地」的路线结果缓存上限(点回同一个 pin 秒开)
+const ROUTE_MODE_EMOJI={driving:"🚗",rail:"🚄",flight:"✈️"};
+const ROUTE_MODE_LABEL={driving:"驾车",rail:"铁路",flight:"飞机"};
+const ROUTE_LINE_STYLE={
+  driving:{color:"#0f766e",weight:5,opacity:.9},
+  rail:{color:"#2563eb",weight:4,opacity:.85,dashArray:"10 8"},
+  flight:{color:"#7c3aed",weight:4,opacity:.85,dashArray:"2 8"}
+};
+const KIND_BADGE={real:{cls:"real",text:"真实"},estimate:{cls:"est",text:"估算"}};
+const ROUTE_DISCLAIMER="估算·非实时·以官方为准";
+const ROUTE_LINE_LEGEND="画线:🚗 青实线 = OSRM 真实路网折线 · 🚄 蓝虚线 = 铁路示意 · "+
+                        "✈️ 紫虚线 = 航段示意(铁路/飞机为起终点示意线,非真实轨迹)";
+
+const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
+             places:[],routeCa
+--- output #8 ---
+Chunk ID: b2eab5
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1523
+Output:
+}
+function fmtCost(cny){
+  const value=num(cny);
+  return isFinite(value)?("¥"+Math.round(Math.max(0,value))):"—";
+}
+function fmtKm(km){
+  const value=num(km);
+  return isFinite(value)?(Math.max(0,value).toFixed(1)+" km"):"—";
+}
+// 后端 generated_at 是 ISO(UTC);统一显示成 "YYYY-MM-DD HH:MM UTC",解析不了就原样显示
+function fmtGeneratedAt(value){
+  if(!value) return "";
+  const stamp=new Date(String(value));
+  if(isNaN(stamp.getTime())) return String(value);
+  const pad=item=>String(item).padStart(2,"0");
+  return stamp.getUTCFullYear()+"-"+pad(stamp.getUTCMonth()+1)+"-"+pad(stamp.getUTCDate())+
+    " "+pad(stamp.getUTCHours())+":"+pad(stamp.getUTCMinutes())+" UTC";
+}
+
+// 折线抽稀:等间隔取点、**首尾必留**(后端已按 GEOMETRY_MAX_POINTS 抽过,这里再收一道,
+// 免得长路线几千个点把画线拖慢;坏点直接丢掉,不抛错)
+function thinPoints(points,max){
+  const coords=[];
+  (points||[]).forEach(pair=>{
+    const lat=num(pair&&pair[0]),lng=num(pair&&pair[1]);
+    if(isFinite(lat)&&isFinite(lng)) coords.push([lat,lng]);
+  });
+  if(coords.length<3||!max||max<2||coords.length<=max) return coords;
+  const step=(coords.length-1)/(max-1);
+  const picked=[];
+  for(let index=0;index<max-1;index++) picked.push(coords[Math.round(index*step)]);
+  picked.push(coords[coords.length-1]);
+  return picked;
+}
+
+// 飞机示意线:起终点之间拉一条二次贝塞尔弧(垂直偏移 bow),看起来像航段而不是铁轨
+function arcPoints(from,to,bow){
+  const points=[];
+  const midLat=(from[0]+to[0])/2,midLng=(from[1]+to[1])/2;
+  const dLat=to[0]-from[0],dLng=to[1]-from[1];
+  const ctrlLat=midLat-dLng*(bow||0),ctrlLng=midLng+dLat*(bow||0);
+  for(let index=0;index<=ROUTE_ARC_SEGMENTS;index++){
+    const t=index/ROUTE_ARC_SEGMENTS,inv=1-t;
+    points.push([inv*inv*from[0]+2*inv*t*ctrlLat+t*t*to[0],
+                 inv*inv*from[1]+2*inv*t*ctrlLng+t*t*to[1]]);
+  }
+  return points;
+}
+
+function setRouteMsg(message,tone){
+  const box=$("routePanelMsg");
+  if(box){
+    box.textContent=message||"";
+    box.className="rp-msg"+((tone==="warn"||tone==="err")?(" "+tone):"");
+    box.style.display=message?"block":"none";
+  }
+  const retry=$("routeRetry");
+  if(retry) retry.style.display=(message&&tone==="err")?"inline-block":"none";
+}
+function showRouteLegend(on){
+  const box=$("routePanelLegend");
+  if(!box) return;
+  box.textContent=on?ROUTE_LINE_LEGEND:"";
+  box.style.display=on?"block":"none";
+}
+function renderRouteMeta(data){
+  const box=$("routePanelMeta");
+  if(!box) return;
+  if(!data){box.textContent="";return;}
+  const parts=[];
+  const km=num(data.distance_km);
+  if(isFinite(km)) parts.push("起终点直线 "+km.toFixed(1)+" km");
+  if(data.generated_at) parts.push("生成于 "+fmtGeneratedAt(data.generated_at));
+  parts.push((data.cost_model&&data.cost_model.disclaimer)||ROUTE_DISCLAIMER);
+  if(data.elapsed_s!==null&&data.elapsed_s!==undefined) parts.push("规划耗时 "+data.elapsed_s+"s");
+  box.textContent=parts.join(" · ");
+}
+
+// 跳转按钮:URL 一律来自后端 links[].url(deep-link 纯函数生成),新页打开且不带 referrer 泄露
+function routeLinksHtml(links){
+  const items=(links||[]).filter(link=>link&&link.url);
+  if(!items.length) return '<div class="rp-links empty">该方式暂无跳转链接</div>';
+  return '<div class="rp-links">'+items.map(link=>
+    '<a class="jump" href="'+esc(link.url)+'" target="_blank" rel="noopener noreferrer"'+
+    (link.note?(' title="'+esc(link.note)+'"'):"")+">"+
+    esc(link.label||link.provider||"跳转")+" ↗</a>").join("")+"</div>";
+}
+
+function routeCardHtml(route){
+  const mode=route.mode||"";
+  const badge=KIND_BADGE[route.kind]||KIND_BADGE.estimate;
+  const selected=(state.routePanel.mode===mode);
+  const degraded=route.degraded
+    ? '<span class="badge deg" title="OSRM 本次没给出驾车时长/里程,不做瞎估;跳转导航照常可用">数据源不可用</span>'
+    : "";
+  return '<div class="rcard'+(selected?" sel":"")+'" role="button" tabindex="0" '+
+    'aria-pressed="'+(selected?"true":"false")+'" data-mode="'+esc(mode)+'" '+
+    'title="点一下在地图上画这条线">'+
+    '<div class="rp-top"><span class="rp-ico">'+esc(route.emoji||ROUTE_MODE_EMOJI[mode]||"🚗")+"</span>"+
+      '<span 
+--- output #9 ---
+Chunk ID: 45a68d
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1357
+Output:
+function routeEnds(){
+  const panel=state.routePanel;
+  const data=panel.data||{};
+  const from=data.from||state.origin;
+  const to=data.to||panel.place;
+  if(!coordsReady(from)||!coordsReady(to)) return null;
+  return {from:[num(from.lat),num(from.lng)],to:[num(to.lat),num(to.lng)]};
+}
+
+function routeTooltip(route,schematic){
+  const label=route.label||ROUTE_MODE_LABEL[route.mode]||route.mode||"路线";
+  const badge=(KIND_BADGE[route.kind]||KIND_BADGE.estimate).text;
+  const figs=[fmtDuration(route.duration_min),fmtCost(route.cost_cny),fmtKm(route.distance_km)].join(" · ");
+  return label+" "+figs+"("+badge+")"+(schematic?" · 示意线,非真实轨迹":" · OSRM 真实折线");
+}
+
+function clearRouteLine(){
+  if(routeLayer) routeLayer.clearLayers();
+  routeLine=null;
+}
+
+// 画线:驾车有 geometry 就画真实折线(抽稀后),铁路/飞机(以及 OSRM 降级)画起终点示意线;
+// 先清后画 → 同一时刻地图上只有一条路线
+function drawRouteLine(route){
+  clearRouteLine();
+  if(!map||!routeLayer||!route) return;
+  const ends=routeEnds();
+  if(!ends) return;
+  let points=(Array.isArray(route.geometry)&&route.geometry.length>1)
+    ? thinPoints(route.geometry,ROUTE_MAX_POINTS):null;
+  const schematic=!points||points.length<2;
+  if(schematic) points=(route.mode==="flight")?arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW):[ends.from,ends.to];
+  const style=ROUTE_LINE_STYLE[route.mode]||ROUTE_LINE_STYLE.rail;
+  routeLine=L.polyline(points,{color:style.color,weight:style.weight,opacity:style.opacity,
+    dashArray:style.dashArray||null});
+  routeLine.bindTooltip(routeTooltip(route,schematic),{sticky:true});
+  routeLayer.addLayer(routeLine);
+}
+
+function selectRouteMode(mode,fit){
+  state.routePanel.mode=mode;
+  const cards=document.querySelectorAll("#routeCards .rcard");
+  Array.prototype.forEach.call(cards,card=>{
+    const on=(card.getAttribute("data-mode")===mode);
+    card.classList.toggle("sel",on);
+    card.setAttribute("aria-pressed",on?"true":"false");
+  });
+  drawRouteLine(currentRoute());
+  if(fit&&map&&routeLine&&routeLine.getBounds) map.fitBounds(routeLine.getBounds(),{padding:[40,40],maxZoom:12});
+}
+
+function applyRouteData(data){
+  state.routePanel.data=data;
+  const routes=(data&&Array.isArray(data.routes))?data.routes:[];
+  renderRouteMeta(data);
+  if(!routes.length){
+    renderRouteCards([]);
+    showRouteLegend(false);
+    clearRouteLine();
+    setRouteMsg("这条起终点暂时给不出路线(后端返回空)。换个目的地,或重设起点后再试。","warn");
+    return;
+  }
+  renderRouteCards(routes);
+  setRouteMsg("");
+  showRouteLegend(true);
+  // 默认选中能画出真实折线的那条(通常是驾车),OSRM 降级时退回第一条有数字的
+  const preferred=routes.find(route=>!route.degraded&&Array.isArray(route.geometry)&&route.geometry.length>1)||
+                  routes.find(route=>!route.degraded)||routes[0];
+  selectRouteMode(preferred?preferred.mode:null,false);
+}
+
+async function loadRoutes(place,token){
+  const params=new URLSearchParams({from_lat:String(state.origin.lat),from_lng:String(state.origin.lng),
+    to_lat:String(place.lat),to_lng:String(place.lng)});
+  if(place.name) params.set("to_name",String(place.name));
+  if(state.origin.name) params.set("from_name",String(state.origin.name));
+  try{
+    const data=await getJSON("/api/routes?"+params.toString());
+    if(token!==state.routePanel.token) return;   // 已切到别的 pin 或已关面板:丢掉过期响应
+    cacheRoutes(place,data);
+    applyRouteData(data);
+  }catch(error){
+    if(token!==state.routePanel.token) return;
+    renderRouteCards([]);
+    showRouteLegend(false);
+    clearRouteLine();
+    setRouteMsg("路线查询失败:"+((error&&error.message)||error)+
+      "(公共 OSRM 可能繁忙,可点「重试」;地图与目的地列表不受影响)","err");
+  }
+}
+
+async function openRoutePanel(place,options){
+  if(!place) return;
+  const panel=$("routePanel");
+  if(!panel) return;
+  state.routePanel.token+=1;
+  const [REDACTED];
+  state.routePanel.open=true;
+  state.routePanel.place=place;
+  state.routePanel.data=null;
+  state.routePanel.mode=null;
+  $("routePanelTitle").textContent="🧭 路线 · "+(place.name||"(无名)");
+  $(
+--- output #10 ---
+Chunk ID: c0229f
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1602
+Output:
+  renderRouteMeta(null);
+  showRouteLegend(false);
+  clearRouteLine();
+}
+
+// 卡片选中与跳转都走事件委托(卡片/链接都是运行时 innerHTML 生成的)
+function onDocumentClick(event){
+  const target=event.target;
+  if(!target||!target.closest) return;
+  const popupButton=target.closest(".js-routes");
+  if(popupButton){
+    const place=state.places[Number(popupButton.getAttribute("data-i"))];
+    if(place) openRoutePanel(place,{scroll:true});
+    return;
+  }
+  if(target.closest("#routePanel a")) return;   // 跳转链接自己开新页,不算选卡片
+  const card=target.closest("#routeCards .rcard");
+  if(card) selectRouteMode(card.getAttribute("data-mode"),true);
+}
+
+// 键盘可达:Enter/空格选中卡片(画线),Esc 关面板清线
+function onDocumentKeydown(event){
+  if(event.key==="Escape"){closeRoutePanel();return;}
+  if(event.key!=="Enter"&&event.key!==" "&&event.key!=="Spacebar") return;
+  const target=event.target;
+  if(!target||!target.closest) return;
+  const card=target.closest("#routeCards .rcard");
+  if(!card) return;
+  event.preventDefault();
+  selectRouteMode(card.getAttribute("data-mode"),true);
+}
+
+function drawPins(places){
+  if(!pins) return;
+  closeRoutePanel();   // 换 band/分类/起点或重抓:旧 pin 可能已不在图上,面板与画线一并清掉
+  state.places=places||[];
+  pins.clearLayers();
+  state.places.forEach((place,index)=>{
+    const meta=categoryMeta(place.category);
+    const icon=L.divIcon({className:"",iconSize:[26,26],iconAnchor:[13,26],popupAnchor:[0,-24],
+      html:'<div class="pin" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
+    const marker=L.marker([place.lat,place.lng],{icon:icon,title:place.name||""});
+    marker.bindPopup(popupHtml(place,index));
+    marker.on("popupopen",()=>openRoutePanel(place));   // 点 pin → 侧栏路线面板自动展开
+    pins.addLayer(marker);
+  });
+}
+
+async function loadMeta(){
+  state.meta=await getJSON("/api/places/meta");
+  if(!state.meta.bands.some(band=>band.key===state.band)) state.band=state.meta.bands[0].key;
+  renderBandOptions();renderCategoryOptions();renderLegend({});renderCityHints();
+}
+
+function renderCityHints(){
+  $("cityList").innerHTML=CITY_HINTS.map(name=>'<option value="'+esc(name)+'"></option>').join("");
+}
+
+// 起点城市搜索:复用后端 /api/geocode(Nominatim),顺便拿到"哪些分段已入库"。
+// 空输入与"没搜到"都不当错误:给可见提示并**保留当前起点**(地图与已渲染的 pin 不动)。
+async function searchCity(city){
+  const name=(city||"").trim();
+  if(!name){
+    showNote("请输入起点城市名(如:北京、上海、崇礼),或点「📍 我的位置」用浏览器定位。",true);
+    return;
+  }
+  clearMessages();setBusy(true);
+  setStatus('正在用 Nominatim 定位「'+esc(name)+'」…');
+  try{
+    applyOrigin(await getJSON("/api/geocode?city="+encodeURIComponent(name)));
+    await loadPlaces(false);
+  }catch(error){
+    const message=String(error.message||"");
+    const kept=state.origin?("起点保持为「"+state.origin.name+"」"):"";
+    if(message.indexOf("未找到")>=0){
+      showNote('没有找到与「'+name+"」匹配的城市"+(kept?(","+kept):"")+
+        "。可换个写法(带上省份,如「河北 崇礼」),或点「📍 我的位置」。",true);
+      setStatus(kept?("起点未变:"+esc(state.origin.name)):"起点定位失败");
+    }else{
+      showErr("城市定位失败:"+message+(kept?("("+kept+")"):""));
+      setStatus(kept?("起点未变:"+esc(state.origin.name)):"起点定位失败");
+    }
+  }finally{setBusy(false);}
+}
+
+// 起点落地(城市搜索与浏览器定位共用):换 state、清分段计数缓存、重画范围圈并 fit
+function applyOrigin(data){
+  state.origin=data.origin;
+  state.cached={};
+  state.routeCache={};   // 起点变了 → 已缓存的路线全部作废
+  closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉
+  (data.segments||[]).forEach(seg=>{state.cached[seg.band]=seg.place_count;});
+  renderBandOptions();drawRings();fitRings();
+}
+
+// --------------------------------------------------------------------------- //
+// 浏览器"我的位置"(需求 M1.01):navigator.geolocation → 后端逆地理编码反查城市起点。
+// 不支持 / 被拒 / 超时 / 反查不到城市名,一律给**可见提示**,不抛 JS 错误、不清当前起点。
+// --------------------------------------------------------------------------- //
+function locateMe(){
+  if(!("geolocation" in navigator)){
+    showNote("当前浏览器不支持定位(navigator.geolocation),请直接用城市搜索。",true);
+    return;
+  }
+  if(window.isSecureContext===false){
+    // 非 ht
+--- output #11 ---
+Chunk ID: 4a1436
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1387
+Output:
+  const reason=reasons[error&&error.code]||("定位失败:"+((error&&error.message)||"未知原因"));
+  const kept=state.origin?("起点保持为「"+state.origin.name+"」,可直接搜索城市。"):"请改用城市搜索。";
+  showNote(reason+" · "+kept,true);
+  setStatus(state.origin?("起点未变:"+esc(state.origin.name)):"起点定位未完成");
+  setBusy(false);
+}
+
+async function loadPlaces(refresh){
+  if(!state.origin) return;
+  showErr("");setBusy(true);
+  const known=state.cached[state.band];
+  if(refresh) setStatus("正在重新抓取 Overpass 四分类并集(公共源较慢,约 20-120s)…");
+  else if(known===undefined) setStatus("该分段尚未入库,正在抓取 Overpass 四分类并集(约 20-120s)…");
+  else setStatus("正在读取本地库(已入库,不触网)…");
+  const params=new URLSearchParams({origin:state.origin.city,band:state.band,
+    lat:String(state.origin.lat),lng:String(state.origin.lng)});
+  if(state.category) params.set("category",state.category);
+  if(refresh) params.set("refresh","true");
+  try{
+    const data=await getJSON("/api/places?"+params.toString());
+    state.origin=data.origin;
+    state.bandMeta=data.band;
+    const total=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
+    state.cached[state.band]=total;
+    renderBandOptions();drawRings();fitRings();drawPins(data.places);renderLegend(data.counts_by_category);
+    const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"Overpass 实时抓取 → 已入库";
+    const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
+    setStatus('起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
+      " · 分类 <b>"+esc(state.category||"全部")+"</b> · 显示 <b>"+data.count+"</b> / 库内 "+total+
+      " 条 · 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+introNote(data));
+    if(!data.count) showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
+  }catch(error){
+    showErr("查询失败:"+error.message);setStatus("查询失败");
+  }finally{setBusy(false);}
+}
+
+// 来源计数:OSM 抓取 vs 人工种子(TASK-1c 补 OSM 国内滑雪/运动缺口);没种子就不占状态栏
+function sourceNote(data){
+  const counts=data.counts_by_source||{};
+  const seeds=counts[SEED_SOURCE]||0;
+  if(!seeds) return "";
+  const fresh=(data.seeded>0)?("(本次补种 "+data.seeded+" 条)"):"";
+  return " · 人工种子 <b>"+seeds+"</b> 条"+fresh+" / OSM "+(counts["OSM"]||0)+" 条";
+}
+
+// 简介进度:抓取路径会带回本次 LLM 生成统计;读库路径只报还缺多少条
+function introNote(data){
+  const stats=data.intro_stats;
+  if(stats) return " · 简介:新增 <b>"+stats.filled+"</b> 条 / 降级 "+stats.failed+" 条 · 仍缺 "+data.intro_pending+" 条";
+  return (data.intro_pending>0)?(" · 待补简介 <b>"+data.intro_pending+"</b> 条(点「补简介」)"):"";
+}
+
+// 补简介:给该分段还没有 intro 的 POI 调 LLM(DB 即缓存,已有的不重复调用)
+async function fillIntros(){
+  if(!state.origin) return;
+  showErr("");setBusy(true);
+  setStatus("正在调 LLM 补缺失简介(最多 "+INTRO_LIMIT+" 条,已有简介的跳过)…");
+  const params=new URLSearchParams({origin:state.origin.city,band:state.band,limit:String(INTRO_LIMIT)});
+  if(state.category) params.set("category",state.category);
+  try{
+    const data=await getJSON("/api/places/intros?"+params.toString());
+    const summary="简介:生成 <b>"+data.filled+"</b> 条 · 降级 "+data.failed+
+      " 条 · 仍缺 "+data.pending+" 条 · "+esc(data.provider||"LLM")+" · 耗时 "+data.elapsed_s+"s";
+    if(data.filled>0){await loadPlaces(false);setStatus($("status").innerHTML+" · "+summary);}
+    else{
+      setStatus(summary);
+      showErr(data.scanned===0?"该分段没有缺简介的 POI(或 LLM 未配置 key)。"
+        :"本次没有拿到新简介(LLM 调用降级),可稍后再点「补简介」重试。");
+    }
+  }catch(error){
+    showErr("补简介失败:"+error.message);setStatus("补简介失败");
+  }finally{setBusy(false);}
+}
+
+$("goCity").addEventListener("click",()=>searchCity($("city").value));
+$("locate").addEventListener("click",locateMe);
+$("city").addEventListener("keydown",event=>{if(event.key==="Enter") searchCity($("city").value);});
+$("band").addEventListener("change",event=>{state.band=event.target.value;drawRings();fitRings();loadPlaces(false);});
+$("category").addEventListener("change",event=>{state.category=event.target.value;loadPlaces(false);});
+$("re
+--- output #12 ---
+Chunk ID: 6dafef
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1363
+Output:
+461:def collection_to_dict(row: Collection, *, cat_name: Optional[str] = None) -> dict[str, Any]:
+462-    """收藏 ORM 行 → API/前端用的 dict(起终点平铺,含分组名与 ISO8601 时间戳)。"""
+463-    return {
+464-        "id": row.id,
+465-        "kind": row.kind,
+466-        "mode": row.mode,
+467-        "ref_key": row.ref_key,
+468-        "name": row.name,
+469-        "osm_type": row.osm_type,
+470-        "osm_id": row.osm_id,
+471-        "from_lat": row.from_lat,
+472-        "from_lng": row.from_lng,
+473-        "from_name": row.from_name or None,
+474-        "to_lat": row.to_lat,
+475-        "to_lng": row.to_lng,
+476-        "to_name": row.to_name or None,
+477-        "summary": dict(row.summary or {}),
+478-        "cat_id": row.cat_id,
+479-        "cat_name": cat_name,
+480-        "created_at": iso_utc(row.created_at),
+481-        "updated_at": iso_utc(row.updated_at),
+482-    }
+483-
+484-
+485-def upsert_collection(
+486-    session: Session,
+487-    *,
+488-    kind: Any,
+489-    mode: Any = None,
+490-    name: Optional[str] = None,
+491-    ref_key: Optional[str] = None,
+492-    osm_type: Any = None,
+493-    osm_id: Any = None,
+494-    from_lat: Any = None,
+495-    from_lng: Any = None,
+496-    from_name: Optional[str] = None,
+497-    to_lat: Any = None,
+498-    to_lng: Any = None,
+499-    to_name: Optional[str] = None,
+500-    summary: Optional[Mapping[str, Any]] = None,
+501-    cat_id: Any = None,
+485:def upsert_collection(
+486-    session: Session,
+487-    *,
+488-    kind: Any,
+489-    mode: Any = None,
+490-    name: Optional[str] = None,
+491-    ref_key: Optional[str] = None,
+492-    osm_type: Any = None,
+493-    osm_id: Any = None,
+494-    from_lat: Any = None,
+495-    from_lng: Any = None,
+496-    from_name: Optional[str] = None,
+497-    to_lat: Any = None,
+498-    to_lng: Any = None,
+499-    to_name: Optional[str] = None,
+500-    summary: Optional[Mapping[str, Any]] = None,
+501-    cat_id: Any = None,
+502-) -> tuple[Collection, bool]:
+503-    """写一条收藏,按唯一键 ``(kind, ref_key, mode)`` **幂等**;返回 ``(行, 是否新建)``。
+504-
+505-    重复收藏既不报错也不产生第二行:刷新名称 / 坐标 / 快照摘要 / 分组并顶 ``updated_at``,
+506-    而 ``id`` 与 ``created_at`` 保持原样 —— 收藏时间是"第一次收藏"的时间,M4 排序才稳定。
+507-    ``kind=place`` 的 ``mode`` 恒为 :data:`~db.models.NO_MODE`(空串),否则同一个目的地
+508-    会按方式裂成多行、幂等失效;路线的 ``mode`` 取值由 API 层按 ``services.routes.MODES`` 校验。
+509-    引用串缺省时按 :func:`db.models.collection_ref_key` 算(OSM 身份优先,退化到坐标定点串);
+510-    ``ref_key`` 只留给脚本/M4 显式指定,常规调用不要传。
+511-    参数非法(类型未知、坐标越界、引用不完整、分组不存在)抛 :class:`ValueError`(API 层转 400)。
+512-    """
+513-    resolved_kind = collection_kind(kind)
+514-    resolved_mode = NO_MODE if resolved_kind == KIND_PLACE else (clean_text(mode) or NO_MODE)
+515-    resolved_from_lat = optional_coordinate("from_lat", from_lat, limit=LAT_LIMIT)
+516-    resolved_from_lng = optional_coordinate("from_lng", from_lng, limit=LNG_LIMIT)
+517-    resolved_to_lat = optional_coordinate("to_lat", to_lat, limit=LAT_LIMIT)
+518-    resolved_to_lng = optional_coordinate("to_lng", to_lng, limit=LNG_LIMIT)
+519-    resolved_osm_type, resolved_osm_id = _resolve_osm(osm_type, osm_id)
+520-    resolved_ref_key = clean_text(ref_key, limit=REF_KEY_LEN) or collection_ref_key(
+521-        kind=resolved_kind,
+522-        osm_type=resolved_osm_type,
+523-        osm_id=resolved_osm_id,
+524-        to_lat=resolved_to_lat,
+525-        to_lng=resolved_to_lng,
+526-        from_lat=resolved_from_lat,
+527-        from_lng=resolved_from_lng,
+528-    )
+529-    resolved_from_name = clean_text(from_name, limit=POINT_NAME_LEN) or ""
+530-    resolved_to_name = clean_text(to_name, limit=POINT_NAME_LEN) or ""
+531-    resolved_name = clean_text(name, limit=NAME_LEN) or default_collection_name(
+532-        kind=resolved_kind,
+533-        from_name=resolved_from_name,
+534-        to_name=resolved_to_name,
+535-        from_lat=resolved_from_lat,
+536-        from_lng=resolved_from_lng,
+537-        to_lat=resolved_to_lat,
+
+--- output #13 ---
+Chunk ID: 0fd71d
+Wall time: 0.0000 seconds
+Process exited with code 0
+Original token count: 1432
+Output:
+147:COLLECTION_KINDS: tuple[str, ...] = (KIND_ROUTE, KIND_PLACE)
+148-# place 收藏没有"出行方式"。这里用**空串**而不是 NULL:SQLite 唯一键里的 NULL 互不相等,
+149-# 同一目的地收藏两次会得到两行,幂等就失效了。
+150-NO_MODE = ""
+151-CAT_MANUAL = "manual"
+152-CAT_AUTO = "auto"
+153-COLLECTION_CAT_SOURCES: tuple[str, ...] = (CAT_MANUAL, CAT_AUTO)
+154-# 收藏引用可以指向种子/无名 POI 的指纹身份(point/-1234,见 services.place_loader.place_identity)
+155-OSM_REF_TYPES: tuple[str, ...] = OSM_ELEMENT_TYPES + (FALLBACK_OSM_TYPE,)
+156-
+157-REF_KEY_LEN = 200
+158-CAT_NAME_LEN = 60
+159-POINT_NAME_LEN = 300
+160-LAT_LIMIT = 90.0
+161-LNG_LIMIT = 180.0
+162-LABEL_PRECISION = 4  # 没有地名时,用坐标当展示名的精度(与 services.routes 同口径)
+163-# 快照摘要的规范键:收藏列表就按这几项显示(方式/时长/费用/里程),恒在
+164:SUMMARY_MODE_KEY = "mode"
+165:SUMMARY_NUMBER_KEYS: tuple[str, ...] = ("duration_min", "cost_cny", "distance_km")
+166-COLLECTION_ORIGIN_LABEL = "我的位置"
+167-COLLECTION_TARGET_LABEL = "目的地"
+168-
+169-
+170-def clean_text(value: Any, *, limit: Optional[int] = None) -> Optional[str]:
+171-    """可选文本归一:只认真正的 ``str``,去首尾空白;空/非字符串 → ``None``。
+172-
+173-    ``limit`` 用来在入库前按列宽截断(与 :func:`db.repository` 的写入口径一致),
+174-    免得前端多带几个字就撞 ``String(n)`` 报错。
+175-    """
+176-    if not isinstance(value, str):
+177-        return None
+178-    text = value.strip()
+179-    if not text:
+180-        return None
+181-    return text[:limit] if limit else text
+182-
+183-
+184-def collection_kind(value: Any) -> str:
+185-    """收藏类型归一(``route`` / ``place``);非法抛 :class:`ValueError`(API 层转 400)。"""
+186-    kind = str(value or "").strip().lower()
+187:    if kind not in COLLECTION_KINDS:
+188:        raise ValueError(f"未知收藏类型:{value!r}(可选:{'、'.join(COLLECTION_KINDS)})")
+189-    return kind
+190-
+191-
+192-def optional_coordinate(name: str, value: Any, *, limit: float) -> Optional[float]:
+193-    """可选经纬度归一:没给 → ``None``;非数字/NaN/越界 → :class:`ValueError`(中文说明)。
+194-
+195-    与 :func:`services.routes.require_coordinates` 的口径一致,只是这里坐标**可选**
+196-    (收藏允许只有 OSM 身份、没有坐标),校验文案沿用同一套,前端提示不用分两处。
+197-    """
+198-    if value is None or (isinstance(value, str) and not value.strip()):
+199-        return None
+200-    if isinstance(value, bool):
+201-        raise ValueError(f"参数 {name} 必须为数字,收到:{value!r}")
+202-    try:
+203-        number = float(value)
+204-    except (TypeError, ValueError) as exc:
+205-        raise ValueError(f"参数 {name} 必须为数字,收到:{value!r}") from exc
+206-    if number != number or number in (float("inf"), float("-inf")):
+207-        raise ValueError(f"参数 {name} 不是有效数字:{value!r}")
+208-    if not -limit <= number <= limit:
+209-        raise ValueError(f"参数 {name} 超出 [-{limit:g}, {limit:g}] 范围:{value!r}")
+210-    return number
+211-
+212-
+213-def osm_key(osm_type: Any, osm_id: Any) -> Optional[str]:
+--
+289:def default_collection_name(
+290-    *,
+291-    kind: Any,
+292-    mode_label: Any = None,
+293-    from_name: Any = None,
+294-    to_name: Any = None,
+295-    from_lat: Any = None,
+296-    from_lng: Any = None,
+297-    to_lat: Any = None,
+298-    to_lng: Any = None,
+299-) -> str:
+300-    """没给名字时的默认标题:``起点 → 目的地 · 方式``(``place`` 收藏只有目的地)。
+301-
+302-    地名缺失就退化成坐标短标签(:func:`point_label`),再缺就用
+303-    :data:`COLLECTION_ORIGIN_LABEL` / :data:`COLLECTION_TARGET_LABEL` 兜底,
+304-    保证收藏列表里每一行都有可读文案(与前端路线面板的起终点口径一致)。
+305-    """
+306-    normalized = collection_kind(kind)
+307-    label = clean_text(mode_label)
+308-    destination = (
+309-        clean_text(to_name) or point_label(to_lat, to_lng) or COLLECTION_TARGET_LABEL
+310-    )
+311-    if normalized == KIND_PLACE:
+312-        title = f"{destination} · {label}" if label else destination
+313-    else:
+314-        origin = (
+--
+321:class CollectionCat(Base):
+322-    """收藏分组(M4「统一收藏面板」用):名字唯一的分类,如"周末去"/"雪季计划"。
+323-
+324-    分组是**可选**的 —— 收藏不挂分组照样能用(``Collection.cat_id`` 可空);
+325-    删除分组只把旗下收藏**摘下来**(``cat_id`` 置空),不连带删收藏,
+326-    避免用户整理标签时误删路线。``source`` 区分人工建的与程序自动建的
+327-    (:data:`CAT_MANUAL` / :data:`CAT_AUTO`),自动分组可被脚本安全清理。
+328-    """
+329-
+330-    _
+--- output #14 ---
+Chunk ID: 98e469
+Wall time: 0.0000 seconds
+Process exited with code 1
+Original token count: 0
+Output:

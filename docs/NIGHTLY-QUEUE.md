@@ -246,14 +246,29 @@
 
 ## [TASK-JEV1] Jev 范式 PoC · 采集与分块器(第 1/2 晚)
 
-- 状态: pending
+- 状态: done
 - 目标: 验证「工具结果进上下文前先过廉价裁判」能省多少 token。今晚**不调用 Codex**(纯执行器手写),只做采集侧:
   1. 建 `tools/jev_poc/` 目录:requirements 说明、`splitter.py`(把日志按 ~25 行分块,winnow 式,不依赖 Jev 包)、`judge.py`(裁判函数:读 .env 里的 key,走 OpenAI 兼容 `POST /v1/chat/completions` 单次调用,批量问每块「当前任务还需要吗 yes/no+置信度」,模型用 deepseek-chat 或 token-plan qwen 小杯;失败一律降级为"保留",绝不丢数据)、`__init__/README.md` 记录设计。
   2. 写 20+ 个 pytest(`backend/test_jev_poc.py`,全 mock 不触网):分块边界、裁判解析健壮性(坏 JSON/超时/限流→保留)、stub 可逆性(restore key 能还原原文)、成本统计函数。
   3. 真实回放素材:取昨夜 `~/.codex/sessions/` 最新 jsonl + 最近一次夜班执行器的工具输出样本,落一份脱敏副本到 `tools/jev_poc/samples/`(去掉 key/token 字样,正则扫 `sk-|gpo_|token` 复核)。
 - 涉及: tools/jev_poc/(新建)、backend/test_jev_poc.py
 - 验收: 1) pytest backend/ 全绿(基线 275 + 新增);2) splitter 对样本日志分块数、行数守恒(无丢行);3) judge.py 对样本跑一次真实调用能返回结构化结果且打印每块成本估算;4) 样本已脱敏(grep 无凭据残留);5) git commit(只 commit 不 push)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-21 夜班,执行器手写,未调 Codex)。commit 见 git log。
+  - `tools/jev_poc/`:`splitter.py`(25 行/块、行数守恒、逐字符可还原;`StubStore` stub↔原文
+    可逆,restore key=内容哈希;`approx_tokens`=chars/3 统一口径)、`judge.py`(qwen token-plan
+    优先/deepseek 备选注册表,OpenAI 兼容单次批量调用;坏 JSON/超时/限流/无 key 一律降级为
+    全部保留;drop 需置信度 ≥0.75;成本统计 `estimate_screening_savings` + `cost_cny`)、
+    `README.md`(设计记录/铁律/用法)、`__init__.py`。
+  - 测试:`backend/test_jev_poc.py` **46 个用例**(全 mock,no_network fixture 偷跑当场失败),
+    pytest backend/ = **321 passed**(275 基线零改动 + 46 新增)。
+  - 样本脱敏落盘 `tools/jev_poc/samples/`:`codex_session_outputs.log`(1295 行,取 9/19 最新
+    session 的 function_call_output)+ `nightly_tool_outputs.log`(156 行,pytest 尾段/git log/
+    routes.py 片段);正则扫 sk-/gpo_/ghp_/github_pat_/key=value 凭据残留 **0 命中**。
+  - 真实调用实测(qwen3.8-max,样本2/156行/7块):22.8s 返回结构化裁决,KEEP 2 / DROP 5
+    (drop 置信 0.98,被丢的是与任务焦点无关的 git log/源码段,判定合理),
+    tokens 1945→756(省 61.1%),裁判自身成本 ≈0.0073 元;drop 块 restore == 原文 ✓。
+  - 备注:JEV2 用 samples 跑回放测量。裁判单次调用 22.8s/2597 prompt tokens,
+    replay 时注意样本1(1295行/52块)单次全量喂可能超窗口,应分批。
 
 ---
 

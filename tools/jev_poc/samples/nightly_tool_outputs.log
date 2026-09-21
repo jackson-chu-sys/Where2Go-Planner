@@ -1,0 +1,156 @@
+--- nightly: pytest backend/ (tail 40) ---
+........................................................................ [ 26%]
+........................................................................ [ 52%]
+........................................................................ [ 78%]
+...........................................................              [100%]
+275 passed in 8.48s
+
+--- nightly: git log --stat -3 ---
+commit 834efd31e330d2a53e8d4e794ca241229e098b54
+Author: Where2Go Control <where2go@local>
+Date:   Mon Sep 21 09:32:38 2026 +0000
+
+    docs(queue): add TA[REDACTED]/2 — Jev-style context-sieve PoC (measure token savings on codex logs)
+
+ docs/NIGHTLY-QUEUE.md | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+commit 4ec85a23bb3e6a9858db45eac8051a203c64d78f
+Author: Where2Go Control <where2go@local>
+Date:   Sun Sep 20 02:08:40 2026 +0000
+
+    queue: TA[REDACTED] -> done(执行器手写前端收藏 UI,275 passed,浏览器 QA 0 error);TASK-2c 收口 done
+
+ docs/NIGHTLY-QUEUE.md | 23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+commit 64728b13679a4c312d7c78ccf25255415ab2217c
+Author: Where2Go Control <where2go@local>
+Date:   Sun Sep 20 02:05:30 2026 +0000
+
+    fix(frontend): TA[REDACTED] 收藏按钮调用名笔误 favRoutePayload->routeFavPayload
+
+ backend/app/static/index.html | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- nightly: read_file routes.py (head 120) ---
+"""路线编排 + 费用估算 + deep-link 跳转链接(TASK-2a,阶段2 M2 的后端)。
+
+一个入口 :func:`plan_routes`:给起点/目的地坐标,返回**驾车 / 铁路 / 飞机**三种方式的
+时间 + 费用对比,每条路线形状统一(docs/STAGE2-PLAN.md 第 2/4 节)::
+
+    {"mode": "driving|rail|flight", "label": "驾车", "duration_min": 94,
+     "cost_cny": 884, "distance_km": 122.4, "geometry": [[lat, lng], ...] | None,
+     "kind": "real|estimate", "degraded": False, "source": "OSRM",
+     "note": "...", "links": [{"provider", "label", "url", "note"}, ...]}
+
+口径与**诚实标注**(ADR-007:公共交通/OTA 不抓实时数据,只做估算 + deep-link):
+
+* **驾车**:走现有 OSRM 数据源(:func:`data_sources.route` 带 ``with_geometry=True``),
+  时长/里程/折线都是真实路网 → ``kind="real"``;**费用仍是估算**(油耗 + 高速过路费系数),
+  note 里写明。OSRM 失败(公共实例繁忙、两点不连通)时**不抛错**:该条降级成
+  ``kind="estimate"`` + ``degraded=True``、时长/费用/geometry 为 ``None``,
+  note 说明原因,deep-link 照给(跳转导航不依赖 OSRM)。
+* **铁路 / 飞机**:耗时沿用 POC ``app/api/discover.py`` 的 ``_est_mode`` 口径
+  (直线距离 × 绕行系数 / 均速 + 地面接驳),费用按里程 × 单价 → 全是估算,
+  ``kind="estimate"``,note 一律带「估算·非实时·以官方为准」。
+* **出现阈值**(同样沿用 POC):直线距离 ≥ :data:`RAIL_MIN_KM` 才出铁路、
+  ≥ :data:`FLIGHT_MIN_KM` 才出飞机;驾车始终出现。
+
+所有费用系数集中在下面「费用估算系数」一段常量里,日后换成真实票价/实时路况只改那里,
+:func:`cost_coefficients` 会把当前系数原样吐给前端做标注。
+
+deep-link(:func:`amap_navigation_url` / :func:`google_maps_directions_url` /
+:func:`rail_12306_url` / :func:`flight_ota_url`)都是**纯函数**:不触网、不查库、
+中文地名按 UTF-8 百分号编码,给定同样的入参永远得到同样的 URL,可直接单测。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
+from urllib.parse import quote
+
+from data_sources import DataSourceError
+from data_sources import haversine_km
+from data_sources import route as ds_route
+from db.models import iso_utc, utcnow
+
+# --------------------------------------------------------------------------- #
+# 出行方式、出现阈值与耗时系数(沿用 POC app/api/discover.py 的 _est_mode 口径)
+# --------------------------------------------------------------------------- #
+
+MODE_DRIVING = "driving"
+MODE_RAIL = "rail"
+MODE_FLIGHT = "flight"
+MODES: tuple[str, ...] = (MODE_DRIVING, MODE_RAIL, MODE_FLIGHT)
+
+# 卡片文案与图标(emoji 与 services.classify 的四分类 pin 一个路子,前端可直接用)
+MODE_META: dict[str, dict[str, str]] = {
+    MODE_DRIVING: {"label": "驾车", "emoji": "🚗"},
+    MODE_RAIL: {"label": "铁路(估算)", "emoji": "🚄"},
+    MODE_FLIGHT: {"label": "飞机(估算)", "emoji": "✈️"},
+}
+
+RAIL_MIN_KM = 100.0     # 直线距离 >= 才出现铁路
+FLIGHT_MIN_KM = 300.0   # 直线距离 >= 才出现飞机
+RAIL_DETOUR = 1.20      # 铁路路径绕行系数(相对直线)
+RAIL_SPEED_KMH = 220.0  # 城际均速(含中间停靠)
+RAIL_GROUND_MIN = 110.0  # 候车 + 起/终点站与景点接驳
+FLIGHT_DETOUR = 1.10
+FLIGHT_SPEED_KMH = 780.0
+FLIGHT_GROUND_MIN = 210.0  # 值机安检 + 两端机场接驳
+
+# --------------------------------------------------------------------------- #
+# 费用估算系数(docs/STAGE2-PLAN.md 第 2 节)—— 全部集中在此,换真实数据只改这一段
+# --------------------------------------------------------------------------- #
+
+FUEL_L_PER_100KM = 8.0      # 百公里油耗(L)
+FUEL_PRICE_CNY_PER_L = 7.5  # 油价(元/L)
+HIGHWAY_RATIO = 0.7         # 高速里程占比(默认 0.7)
+TOLL_CNY_PER_KM = 0.5       # 高速通行费(元/km)
+RAIL_CNY_PER_KM = 0.45      # 铁路二等座(元/km)
+RAIL_MIN_FARE_CNY = 20.0    # 铁路起步价下限(元)
+FLIGHT_CNY_PER_KM = 0.6     # 经济舱(元/km)
+FLIGHT_BASE_CNY = 100.0     # 机建 + 燃油(元/程)
+
+COST_PRECISION = 0       # 费用取整到元
+DISTANCE_PRECISION = 1   # 里程保留 1 位小数
+COORD_LABEL_PRECISION = 4  # 没有地名时,用坐标当展示名的精度
+# geometry 抽稀上限:OSRM overview=full 长路线动辄上万点,服务端先抽到画线够用的量级,
+# 前端要更平滑可自行再插值(见 STAGE2-PLAN 第 6 节风险 3)
+GEOMETRY_MAX_POINTS = 1200
+
+# 计费里程:铁路按线路里程(≈ 直线 × 绕行),机票按航段里程(≈ 大圆 × 绕行);
+# 驾车直接用 OSRM 的真实里程,不用系数。
+BILLABLE_DETOUR = {MODE_RAIL: RAIL_DETOUR, MODE_FLIGHT: FLIGHT_DETOUR}
+
+KIND_REAL = "real"
+KIND_ESTIMATE = "estimate"
+SOURCE_OSRM = "OSRM"
+SOURCE_ESTIMATE = "estimate"
+SOURCE_UNAVAILABLE = "unavailable"
+ESTIMATE_DISCLAIMER = "估算·非实时·以官方为准"
+
+DRIVING_NOTE = (
+    f"时长/里程为 OSRM 真实路网(非实时路况,不含拥堵与休息);费用为估算:"
+    f"油费 {FUEL_L_PER_100KM:g}L/100km × {FUEL_PRICE_CNY_PER_L:g}元/L"
+    f" + 高速占比 {HIGHWAY_RATIO:g} × 里程 × {TOLL_CNY_PER_KM:g}元/km。{ESTIMATE_DISCLAIMER}"
+)
+DRIVING_DEGRADED_NOTE = (
+    "OSRM 驾车路线暂不可用(公共实例繁忙,或两点不在同一路网/坐标离路网太远):"
+    f"时长与费用本次给不出,不做瞎估;可直接用下方导航链接跳转官方。{ESTIMATE_DISCLAIMER}"
+)
+
+ORIGIN_FALLBACK_LABEL = "我的位置"
+DESTINATION_FALLBACK_LABEL = "目的地"
+
+RouterFn = Callable[[Sequence[float], Sequence[float]], Mapping[str, Any]]
+
+
+# --------------------------------------------------------------------------- #
+# 费用估算(纯函数)
+# --------------------------------------------------------------------------- #
+

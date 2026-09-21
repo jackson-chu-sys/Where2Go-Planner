@@ -207,6 +207,18 @@ class TestParseVerdicts:
         verdicts = parse_verdicts(raw, 2)
         assert verdicts[0].keep is True and verdicts[1].keep is False
 
+    def test_nonzero_based_ids_for_batches(self):
+        # 分批调用时裁判按 prompt 里的真实块号(id=12..13)回复,不能要求 0 基
+        raw = json.dumps([
+            {"id": 12, "keep": False, "confidence": 0.9},
+            {"id": 13, "keep": True, "confidence": 0.9},
+        ])
+        assert parse_verdicts(raw, 2, ids=[12, 13]) is not None
+        verdicts = parse_verdicts(raw, 2, ids=[12, 13])
+        assert verdicts[0].keep is False and verdicts[1].keep is True
+        # ids 不匹配 -> None 降级
+        assert parse_verdicts(raw, 2, ids=[0, 1]) is None
+
 
 # ---------------------------------------------------------------- JudgeClient(网络全 mock)
 

@@ -274,7 +274,7 @@
 
 ## [TASK-JEV2] Jev 范式 PoC · 回放测量与结论(第 2/2 晚)
 
-- 状态: pending
+- 状态: done
 - 目标: 依赖 TASK-JEV1 完成。今晚**不调用 Codex**。
   1. `replay.py`:对 samples 里的历史工具输出,模拟一次夜班 turn 的"任务焦点描述"(从该 turn 上下文人工/程序提取),跑裁判,输出对照报告:原 token 数 vs 筛后 token 数、可筛除比例、裁判自身消耗、按现价折算省钱比例。
   2. 写 `tools/jev_poc/FINDINGS.md`:省 token 百分比、误杀率(人工抽查 20 块标注)、结论三选一——a) 值得接入 SoL-Pi/codex 管道(给出接入草案) b) 用 adapter 不划算,若上真 Jev API($5 免费额度)预期如何 c) 范式不适合本项目场景,归档。
@@ -282,7 +282,22 @@
 - 依赖: TASK-JEV1。
 - 涉及: tools/jev_poc/replay.py、FINDINGS.md
 - 验收: 1) 回放报告数字可复算(附脚本输出);2) FINDINGS.md 结论明确、引用真实数字;3) pytest 仍全绿;4) 已 commit。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-21 夜班,执行器手写,未调 Codex;与 JEV1 同晚完成)。
+  - `tools/jev_poc/replay.py`:两场景回放(样本1=9/19 codex session/焦点=前端收藏UI,
+    样本2=9/12 夜班输出/焦点=收藏API验证),分批 12 块喂裁判,行数守恒+逐字符还原断言,
+    报告落 `replay_report.md`、逐块明细 `replay_chunks.jsonl`(59 块)。
+  - 实测(qwen3.8-max,0 降级批):样本1 筛前 17216 → 筛后 12146 tokens(**省 29.4%**,
+    KEEP 36/DROP 16),裁判 30519 tokens/≈0.071 元/253s;样本2 1945 → 438(**省 77.5%**,
+    KEEP 1/DROP 6),裁判 ≈0.006 元/18s。
+  - 误杀率人工抽查 22 个 DROP 块:**≈9%(2/22 边缘误杀,均为目标文件 index.html 既有
+    函数段)**,stub 可逆兜底(restore==原文 抽查通过),不丢数据。
+  - 关键发现:裁判用推理型模型时自身 token = 筛除量的 2.2-6.0 倍(reasoning_tokens 占大头);
+    盈亏平衡 = 输出在上下文存活 sample1 ≈11.6 轮 / sample2 ≈3.5 轮。
+  - 结论(FINDINGS.md):**选 a) 值得接入**,限定三条——①裁判换非推理小杯(平衡点降到~2轮)
+    ②只筛 ≥1000 tokens 且预计存活 ≥10 轮的大输出 ③stub 可逆为硬前提+目标文件白名单。
+    附 SoL-Pi 接入草案;真 Jev API($5 额度)建议仅作生产级 A/B,优先级低于①。
+  - 修复 JEV1 遗留 bug:分批调用时裁判按真实块号回复,parse_verdicts 硬要求 0 基 id 导致
+    首跑 4/5 批误降级;加 `ids` 参数修复+回归用例。pytest backend/ = **322 passed**。
 
 ---
 

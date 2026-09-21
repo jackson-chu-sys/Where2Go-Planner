@@ -1,0 +1,59 @@
+{"file": "codex_session_outputs.log", "id": 0, "lines": [1, 25], "tokens": 370, "keep": false, "confidence": 0.9, "degraded": false, "head": "--- output #0 ---"}
+{"file": "codex_session_outputs.log", "id": 1, "lines": [26, 50], "tokens": 289, "keep": true, "confidence": 0.95, "degraded": false, "head": "95dbdc1 queue: TASK-2c -> needs_review(后端 done ff2a7fd/267 passed;前端 Codex 熔断无产物)"}
+{"file": "codex_session_outputs.log", "id": 2, "lines": [51, 75], "tokens": 258, "keep": true, "confidence": 0.85, "degraded": false, "head": "存的是**快照**:收藏那一刻的 ``mode``/``duration_min``/``cost_cny``/``distance_km``"}
+{"file": "codex_session_outputs.log", "id": 3, "lines": [76, 100], "tokens": 277, "keep": true, "confidence": 0.6, "degraded": false, "head": "router = APIRouter()"}
+{"file": "codex_session_outputs.log", "id": 4, "lines": [101, 125], "tokens": 281, "keep": true, "confidence": 0.7, "degraded": false, "head": "    if value is None or isinstance(value, bool):"}
+{"file": "codex_session_outputs.log", "id": 5, "lines": [126, 150], "tokens": 300, "keep": true, "confidence": 0.85, "degraded": false, "head": ""}
+{"file": "codex_session_outputs.log", "id": 6, "lines": [151, 175], "tokens": 408, "keep": false, "confidence": 0.85, "degraded": false, "head": "Chunk ID: 2a0609"}
+{"file": "codex_session_outputs.log", "id": 7, "lines": [176, 200], "tokens": 235, "keep": true, "confidence": 0.6, "degraded": false, "head": "app:"}
+{"file": "codex_session_outputs.log", "id": 8, "lines": [201, 225], "tokens": 279, "keep": true, "confidence": 0.8, "degraded": false, "head": "../tasks:"}
+{"file": "codex_session_outputs.log", "id": 9, "lines": [226, 250], "tokens": 183, "keep": false, "confidence": 0.8, "degraded": false, "head": "(仍不触网、不需要浏览器);没装就 skip。"}
+{"file": "codex_session_outputs.log", "id": 10, "lines": [251, 275], "tokens": 431, "keep": true, "confidence": 0.9, "degraded": false, "head": ""}
+{"file": "codex_session_outputs.log", "id": 11, "lines": [276, 300], "tokens": 380, "keep": true, "confidence": 0.85, "degraded": false, "head": "                    \"onLocateFailed\", \"loadPlaces\", \"fillIntros\", \"categoryMeta\"]"}
+{"file": "codex_session_outputs.log", "id": 12, "lines": [301, 325], "tokens": 207, "keep": false, "confidence": 0.85, "degraded": false, "head": "        self.calls += 1"}
+{"file": "codex_session_outputs.log", "id": 13, "lines": [326, 350], "tokens": 243, "keep": false, "confidence": 0.85, "degraded": false, "head": ""}
+{"file": "codex_session_outputs.log", "id": 14, "lines": [351, 375], "tokens": 397, "keep": false, "confidence": 0.8, "degraded": false, "head": "    monkeypatch.setattr(route_service, \"default_router\", FakeRouter())"}
+{"file": "codex_session_outputs.log", "id": 15, "lines": [376, 400], "tokens": 389, "keep": true, "confidence": 0.75, "degraded": false, "head": ""}
+{"file": "codex_session_outputs.log", "id": 16, "lines": [401, 425], "tokens": 295, "keep": true, "confidence": 0.75, "degraded": false, "head": "    assert \"state.places\" in html, \"当前渲染的 Place 列表应存进 state 供面板取用\""}
+{"file": "codex_session_outputs.log", "id": 17, "lines": [426, 450], "tokens": 566, "keep": true, "confidence": 0.6, "degraded": false, "head": "<title>Where2Go · 目的地地图(阶段2b)</title>"}
+{"file": "codex_session_outputs.log", "id": 18, "lines": [451, 475], "tokens": 554, "keep": true, "confidence": 0.8, "degraded": false, "head": "  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#374151}"}
+{"file": "codex_session_outputs.log", "id": 19, "lines": [476, 500], "tokens": 324, "keep": true, "confidence": 0.8, "degraded": false, "head": "  .rp-head{display:flex;align-items:flex-start;gap:8px}"}
+{"file": "codex_session_outputs.log", "id": 20, "lines": [501, 525], "tokens": 321, "keep": true, "confidence": 0.65, "degraded": false, "head": "}"}
+{"file": "codex_session_outputs.log", "id": 21, "lines": [526, 550], "tokens": 388, "keep": false, "confidence": 0.8, "degraded": false, "head": "    const selected=item.key===state.category?\" selected\":\"\";"}
+{"file": "codex_session_outputs.log", "id": 22, "lines": [551, 575], "tokens": 416, "keep": true, "confidence": 0.6, "degraded": false, "head": "}"}
+{"file": "codex_session_outputs.log", "id": 23, "lines": [576, 600], "tokens": 371, "keep": false, "confidence": 0.8, "degraded": false, "head": "--- output #7 ---"}
+{"file": "codex_session_outputs.log", "id": 24, "lines": [601, 625], "tokens": 348, "keep": true, "confidence": 0.95, "degraded": false, "head": "        </div></div>"}
+{"file": "codex_session_outputs.log", "id": 25, "lines": [626, 650], "tokens": 385, "keep": true, "confidence": 0.7, "degraded": false, "head": "<footer>"}
+{"file": "codex_session_outputs.log", "id": 26, "lines": [651, 675], "tokens": 317, "keep": true, "confidence": 0.75, "degraded": false, "head": "const ROUTE_MODE_EMOJI={driving:\"🚗\",rail:\"🚄\",flight:\"✈️\"};"}
+{"file": "codex_session_outputs.log", "id": 27, "lines": [676, 700], "tokens": 323, "keep": false, "confidence": 0.8, "degraded": false, "head": "function fmtKm(km){"}
+{"file": "codex_session_outputs.log", "id": 28, "lines": [701, 725], "tokens": 298, "keep": false, "confidence": 0.78, "degraded": false, "head": "  for(let index=0;index<max-1;index++) picked.push(coords[Math.round(index*step)]);"}
+{"file": "codex_session_outputs.log", "id": 29, "lines": [726, 750], "tokens": 305, "keep": true, "confidence": 0.72, "degraded": false, "head": "  }"}
+{"file": "codex_session_outputs.log", "id": 30, "lines": [751, 775], "tokens": 374, "keep": true, "confidence": 0.95, "degraded": false, "head": "  const items=(links||[]).filter(link=>link&&link.url);"}
+{"file": "codex_session_outputs.log", "id": 31, "lines": [776, 800], "tokens": 292, "keep": false, "confidence": 0.8, "degraded": false, "head": "Output:"}
+{"file": "codex_session_outputs.log", "id": 32, "lines": [801, 825], "tokens": 390, "keep": true, "confidence": 0.65, "degraded": false, "head": "  clearRouteLine();"}
+{"file": "codex_session_outputs.log", "id": 33, "lines": [826, 850], "tokens": 296, "keep": true, "confidence": 0.8, "degraded": false, "head": "}"}
+{"file": "codex_session_outputs.log", "id": 34, "lines": [851, 875], "tokens": 274, "keep": true, "confidence": 0.7, "degraded": false, "head": "  if(place.name) params.set(\"to_name\",String(place.name));"}
+{"file": "codex_session_outputs.log", "id": 35, "lines": [876, 900], "tokens": 228, "keep": true, "confidence": 0.9, "degraded": false, "head": "  state.routePanel.data=null;"}
+{"file": "codex_session_outputs.log", "id": 36, "lines": [901, 925], "tokens": 318, "keep": true, "confidence": 0.86, "degraded": false, "head": "  if(target.closest(\"#routePanel a\")) return;   // 跳转链接自己开新页,不算选卡片"}
+{"file": "codex_session_outputs.log", "id": 37, "lines": [926, 950], "tokens": 329, "keep": true, "confidence": 0.72, "degraded": false, "head": "      html:'<div class=\"pin\" style=\"background:'+meta.color+'\"><span>'+meta.emoji+\"</span></div>\"});"}
+{"file": "codex_session_outputs.log", "id": 38, "lines": [951, 975], "tokens": 294, "keep": false, "confidence": 0.85, "degraded": false, "head": "  }"}
+{"file": "codex_session_outputs.log", "id": 39, "lines": [976, 1000], "tokens": 326, "keep": false, "confidence": 0.88, "degraded": false, "head": "  closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉"}
+{"file": "codex_session_outputs.log", "id": 40, "lines": [1001, 1025], "tokens": 435, "keep": false, "confidence": 0.8, "degraded": false, "head": "  setStatus(state.origin?(\"起点未变:\"+esc(state.origin.name)):\"起点定位未完成\");"}
+{"file": "codex_session_outputs.log", "id": 41, "lines": [1026, 1050], "tokens": 346, "keep": false, "confidence": 0.84, "degraded": false, "head": "      \" · 分类 <b>\"+esc(state.category||\"全部\")+\"</b> · 显示 <b>\"+data.count+\"</b> / 库内 \"+total+"}
+{"file": "codex_session_outputs.log", "id": 42, "lines": [1051, 1075], "tokens": 415, "keep": false, "confidence": 0.82, "degraded": false, "head": "async function fillIntros(){"}
+{"file": "codex_session_outputs.log", "id": 43, "lines": [1076, 1100], "tokens": 308, "keep": true, "confidence": 0.83, "degraded": false, "head": "$(\"category\").addEventListener(\"change\",event=>{state.category=event.target.value;loadPlaces(false);"}
+{"file": "codex_session_outputs.log", "id": 44, "lines": [1101, 1125], "tokens": 246, "keep": true, "confidence": 0.9, "degraded": false, "head": "478-        \"cat_id\": row.cat_id,"}
+{"file": "codex_session_outputs.log", "id": 45, "lines": [1126, 1150], "tokens": 336, "keep": true, "confidence": 0.85, "degraded": false, "head": "486-    session: Session,"}
+{"file": "codex_session_outputs.log", "id": 46, "lines": [1151, 1175], "tokens": 463, "keep": true, "confidence": 0.82, "degraded": false, "head": "511-    参数非法(类型未知、坐标越界、引用不完整、分组不存在)抛 :class:`ValueError`(API 层转 400)。"}
+{"file": "codex_session_outputs.log", "id": 47, "lines": [1176, 1200], "tokens": 280, "keep": true, "confidence": 0.8, "degraded": false, "head": "536-        from_lng=resolved_from_lng,"}
+{"file": "codex_session_outputs.log", "id": 48, "lines": [1201, 1225], "tokens": 303, "keep": true, "confidence": 0.68, "degraded": false, "head": "163-# 快照摘要的规范键:收藏列表就按这几项显示(方式/时长/费用/里程),恒在"}
+{"file": "codex_session_outputs.log", "id": 49, "lines": [1226, 1250], "tokens": 356, "keep": true, "confidence": 0.62, "degraded": false, "head": "188:        raise ValueError(f\"未知收藏类型:{value!r}(可选:{'、'.join(COLLECTION_KINDS)})\")"}
+{"file": "codex_session_outputs.log", "id": 50, "lines": [1251, 1275], "tokens": 280, "keep": true, "confidence": 0.74, "degraded": false, "head": "213-def osm_key(osm_type: Any, osm_id: Any) -> Optional[str]:"}
+{"file": "codex_session_outputs.log", "id": 51, "lines": [1276, 1295], "tokens": 189, "keep": true, "confidence": 0.7, "degraded": false, "head": "312-        title = f\"{destination} · {label}\" if label else destination"}
+{"file": "nightly_tool_outputs.log", "id": 0, "lines": [1, 25], "tokens": 356, "keep": true, "confidence": 0.95, "degraded": false, "head": "--- nightly: pytest backend/ (tail 40) ---"}
+{"file": "nightly_tool_outputs.log", "id": 1, "lines": [26, 50], "tokens": 331, "keep": false, "confidence": 0.75, "degraded": false, "head": ""}
+{"file": "nightly_tool_outputs.log", "id": 2, "lines": [51, 75], "tokens": 311, "keep": false, "confidence": 0.95, "degraded": false, "head": "  note 里写明。OSRM 失败(公共实例繁忙、两点不连通)时**不抛错**:该条降级成"}
+{"file": "nightly_tool_outputs.log", "id": 3, "lines": [76, 100], "tokens": 309, "keep": false, "confidence": 0.95, "degraded": false, "head": "from data_sources import DataSourceError"}
+{"file": "nightly_tool_outputs.log", "id": 4, "lines": [101, 125], "tokens": 309, "keep": false, "confidence": 0.95, "degraded": false, "head": "RAIL_GROUND_MIN = 110.0  # 候车 + 起/终点站与景点接驳"}
+{"file": "nightly_tool_outputs.log", "id": 5, "lines": [126, 150], "tokens": 270, "keep": false, "confidence": 0.95, "degraded": false, "head": "# 计费里程:铁路按线路里程(≈ 直线 × 绕行),机票按航段里程(≈ 大圆 × 绕行);"}
+{"file": "nightly_tool_outputs.log", "id": 6, "lines": [151, 156], "tokens": 59, "keep": false, "confidence": 0.95, "degraded": false, "head": ""}

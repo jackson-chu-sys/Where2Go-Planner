@@ -124,8 +124,9 @@ def _all_keep(n: int, error: str) -> JudgeResult:
     )
 
 
-def parse_verdicts(raw: str, n_chunks: int) -> Optional[List[Verdict]]:
+def parse_verdicts(raw: str, n_chunks: int, ids: Optional[Sequence[int]] = None) -> Optional[List[Verdict]]:
     """解析裁判回复。健壮性:剥 code fence、抓首个 JSON 数组、宽容单对象;
+    ``ids`` 为各块的真实编号(分批调用时非 0 基),缺省按 0..n-1;
     解析不出 n_chunks 个有效条目 -> None(调用方降级)。"""
     text = (raw or "").strip()
     if not text:
@@ -145,7 +146,8 @@ def parse_verdicts(raw: str, n_chunks: int) -> Optional[List[Verdict]]:
     for item in data:
         if isinstance(item, dict) and isinstance(item.get("id"), int):
             by_id[item["id"]] = item
-    for i in range(n_chunks):
+    expected_ids = list(range(n_chunks)) if ids is None else list(ids)
+    for i in expected_ids:
         item = by_id.get(i)
         if not isinstance(item, dict) or not isinstance(item.get("keep"), bool):
             return None
@@ -216,7 +218,7 @@ class JudgeClient:
             content = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
             pass
-        verdicts = parse_verdicts(content, len(chunks))
+        verdicts = parse_verdicts(content, len(chunks), ids=[c.index for c in chunks])
         result = JudgeResult(
             model=resolved["model"],
             prompt_tokens=int(usage.get("prompt_tokens") or 0),

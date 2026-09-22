@@ -201,6 +201,15 @@ class JudgeClient:
             ],
             "temperature": 0,
         }
+        # 额外请求参数(如关推理):WHERE2GO_LLM_EXTRA_PARAMS 传 JSON,坏配置仅不加参数。
+        extra_raw = (self.environ.get("WHERE2GO_LLM_EXTRA_PARAMS") or "").strip()
+        if extra_raw:
+            try:
+                extra = json.loads(extra_raw)
+                if isinstance(extra, dict):
+                    payload.update(extra)
+            except (ValueError, TypeError):
+                pass
         try:
             response = self.session.post(
                 resolved["base_url"].rstrip("/") + CHAT_PATH,

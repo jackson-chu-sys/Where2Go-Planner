@@ -325,6 +325,32 @@ class TestJudgeClient:
         result = JudgeClient(session=session, environ=FAKE_ENV).judge("焦点", CHUNKS3)
         assert result.prompt_tokens == 0 and result.cost_cny() == 0.0
 
+    @pytest.mark.usefixtures("no_network")
+    def test_extra_params_merged_into_payload(self):
+        env = dict(FAKE_ENV)
+        env["WHERE2GO_LLM_EXTRA_PARAMS"] = '{"enable_thinking": false}'
+        session = _FakeSession(response=_FakeResponse(_payload(_ok_json(3))))
+        JudgeClient(session=session, environ=env).judge("焦点", CHUNKS3)
+        assert session.calls[0][1]["json"]["enable_thinking"] is False
+
+    @pytest.mark.usefixtures("no_network")
+    def test_bad_extra_params_json_ignored_not_degraded(self):
+        env = dict(FAKE_ENV)
+        env["WHERE2GO_LLM_EXTRA_PARAMS"] = "not-json{{"
+        session = _FakeSession(response=_FakeResponse(_payload(_ok_json(3))))
+        result = JudgeClient(session=session, environ=env).judge("焦点", CHUNKS3)
+        assert not result.degraded_all and result.kept == 3
+        assert "enable_thinking" not in session.calls[0][1]["json"]
+
+    @pytest.mark.usefixtures("no_network")
+    def test_extra_params_model_override(self):
+        env = dict(FAKE_ENV)
+        env["WHERE2GO_LLM_MODEL"] = "qwen3.8-flash"
+        session = _FakeSession(response=_FakeResponse(_payload(_ok_json(3))))
+        result = JudgeClient(session=session, environ=env).judge("焦点", CHUNKS3)
+        assert session.calls[0][1]["json"]["model"] == "qwen3.8-flash"
+        assert result.model == "qwen3.8-flash"
+
 
 # ---------------------------------------------------------------- prompt & cost
 

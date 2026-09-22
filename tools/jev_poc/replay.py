@@ -117,7 +117,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=12)
     parser.add_argument("--dry", action="store_true")
+    parser.add_argument("--model", default=None,
+                        help="裁判模型覆盖(如 qwen3.8-flash);设 WHERE2GO_LLM_MODEL")
+    parser.add_argument("--extra-params", default=None,
+                        help='额外请求参数 JSON(如 \'{"enable_thinking":false}\' 关推理);设 WHERE2GO_LLM_EXTRA_PARAMS')
     args = parser.parse_args()
+    if args.model:
+        os.environ["WHERE2GO_LLM_MODEL"] = args.model
+    if args.extra_params:
+        os.environ["WHERE2GO_LLM_EXTRA_PARAMS"] = args.extra_params
 
     if not args.dry:
         open(CHUNKS_PATH, "w").close()  # 清旧明细

@@ -301,6 +301,68 @@
 
 ---
 
+## [TASK-3a] 住宿数据层 + AI 预估参考价 + /api/stays(后端)
+
+- 状态: pending
+- 目标: 依 docs/STAGE3-PLAN.md 第 1 节。用 OSM `tourism=hotel/guest_house/hostel/apartment/chalet` 按目的地周边半径检索住宿(复用 data_sources 的 Overpass 端点链);用 LLM(复用 services/intro 的 Provider 抽象)生成**预估参考价区间**(如「约 ¥300-500/晚」)与一句话简介,按住宿缓存到 DB(已有不重复调用)。数据模型可新建 `Stay` 表或复用 Place 加 type。新增 `GET /api/stays?place_id=|lat=&lng=&radius=`。
+- 依赖: 无。
+- 涉及: backend/services/stays.py、backend/db/models.py、backend/app/api/stays.py、backend/test_stays.py
+- 验收:
+  1. `/api/stays` 对真实坐标返回住宿列表(名称/类型/距离/预估参考价/简介),字段稳定
+  2. 预估价为 **AI 估算**且带标注字段(kind=estimate / note),页面可识别
+  3. 预估与简介按住宿缓存,重复查询不重复调 LLM
+  4. 单测覆盖:检索解析/缓存命中/降级(无 key 时留空不抛异常)
+  5. pytest backend/ 全绿
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-3b] 住宿前端展示(面板卡片 + 预估价标注)
+
+- 状态: pending
+- 目标: 依 docs/STAGE3-PLAN.md 第 1/2 节,**仅前端**改动:在地图页选中目的地后,除现有路线面板外增加「住宿」区块,展示该目的地周边住宿卡片(名称/类型/距离/预估参考价/简介),并**强标注**「AI 预估 · 仅供参考 · 以 OTA 实时为准」。可加「收藏住宿」按钮(复用 /api/collections,type=stay)。
+- 依赖: TASK-3a。
+- 涉及: 仅 backend/app/static/index.html
+- 验收:
+  1. 选目的地能看到住宿卡片(含预估价与「AI 预估」标注)
+  2. 收藏住宿可存入收藏(不影响既有路线收藏)
+  3. 页面无 JS 报错;既有地图/pin/路线面板不回归
+  4. browser_exec QA:开页→点 pin→看住宿区块→(可选)收藏→0 console error
+  5. 不改后端文件
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-4a] 统一收藏面板 + 行程对比 + 总账
+
+- 状态: pending
+- 目标: 依 docs/STAGE3-PLAN.md 第 2 节,把收藏统一成可对比的面板:汇总 目的地/路线/住宿;以简洁信息展示 路线时长、路线费用、住宿费用 供对比;支持把「目的地+路线+住宿」组合为一个**行程方案**并给出大致总花费。必要时加后端聚合 API。
+- 依赖: TASK-2c-fe / 3b。
+- 涉及: backend/app/static/index.html、backend/app/api/collections.py(如需聚合)
+- 验收:
+  1. 收藏面板按类型分组展示,含路线时长/费用、住宿费用等对比字段
+  2. 能创建行程方案(目的地+路线+住宿)并显示总花费
+  3. 无 JS 报错;既有收藏功能不回归
+  4. pytest backend/ 全绿(若动后端)
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-4b] 预订界面 + 跳转预订(deep-link 聚合)
+
+- 状态: pending
+- 目标: 依 docs/STAGE3-PLAN.md 第 2 节,给最终选定的目的地提供「前往预订」入口:列出可用/已收藏的路线与住宿供勾选组合;点击跳转对应外部应用(住宿→携程/Booking/Airbnb;机票/火车票→12306/OTA;自驾→地图导航)。**仅 deep-link 跳转,不代订、不抓实时价**,页面含免责声明。
+- 依赖: TASK-4a。
+- 涉及: 仅 backend/app/static/index.html(如需后端加 deep-link 生成则加纯函数 + 单测)
+- 验收:
+  1. 「前往预订」能列出已收藏/可用的路线与住宿
+  2. 跳转按钮 URL 正确、新页打开(携程/12306/地图等)
+  3. 页面明确免责(价格仅供参考 · 不代订)
+  4. 无 JS 报错;browser QA 通过
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

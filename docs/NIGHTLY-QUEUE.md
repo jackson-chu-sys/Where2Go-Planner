@@ -303,7 +303,7 @@
 
 ## [TASK-3a] 住宿数据层 + AI 预估参考价 + /api/stays(后端)
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE3-PLAN.md 第 1 节。用 OSM `tourism=hotel/guest_house/hostel/apartment/chalet` 按目的地周边半径检索住宿(复用 data_sources 的 Overpass 端点链);用 LLM(复用 services/intro 的 Provider 抽象)生成**预估参考价区间**(如「约 ¥300-500/晚」)与一句话简介,按住宿缓存到 DB(已有不重复调用)。数据模型可新建 `Stay` 表或复用 Place 加 type。新增 `GET /api/stays?place_id=|lat=&lng=&radius=`。
 - 依赖: 无。
 - 涉及: backend/services/stays.py、backend/db/models.py、backend/app/api/stays.py、backend/test_stays.py

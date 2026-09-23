@@ -303,7 +303,7 @@
 
 ## [TASK-3a] 住宿数据层 + AI 预估参考价 + /api/stays(后端)
 
-- 状态: running
+- 状态: needs_review
 - 目标: 依 docs/STAGE3-PLAN.md 第 1 节。用 OSM `tourism=hotel/guest_house/hostel/apartment/chalet` 按目的地周边半径检索住宿(复用 data_sources 的 Overpass 端点链);用 LLM(复用 services/intro 的 Provider 抽象)生成**预估参考价区间**(如「约 ¥300-500/晚」)与一句话简介,按住宿缓存到 DB(已有不重复调用)。数据模型可新建 `Stay` 表或复用 Place 加 type。新增 `GET /api/stays?place_id=|lat=&lng=&radius=`。
 - 依赖: 无。
 - 涉及: backend/services/stays.py、backend/db/models.py、backend/app/api/stays.py、backend/test_stays.py
@@ -313,7 +313,15 @@
   3. 预估与简介按住宿缓存,重复查询不重复调 LLM
   4. 单测覆盖:检索解析/缓存命中/降级(无 key 时留空不抛异常)
   5. pytest backend/ 全绿
-- 结果: (待夜班回填)
+- 结果: **needs_review**(2026-09-23 夜班,Codex 熔断)。
+  - 单次 Codex 调用运行 ~37 分钟触发 30min 熔断线(R7),已 kill。中止时 git 工作区干净、**零产物**
+    (backend/services/stays.py、backend/app/api/stays.py、backend/test_stays.py 均未创建),无可收尾内容。
+  - 日志(/tmp/w2g_task.log,40272 行)显示 Codex 全程在大量读文件探索(基线 pytest 325 passed 确认过、
+    读了 collections/places/place_loader/queue 等),始终未进入写码阶段——探索轮数失控,疑似任务描述
+    虽窄但仓库上下文读取过多。未自动重试(R7)。
+  - 留神朱白天定夺:①执行器直接手写(参照 TASK-2c-fe 先例,后端量较大) ②再派 Codex 一次并把任务
+    拆更小(先只做 Stay 表+检索,再做 LLM 估价,再做 API) ③其他。
+  - 连带影响:TASK-3b(依赖 3a)、TASK-4a(依赖 3b)今晚未启动,保持 pending;TASK-4b 同样顺延。
 
 ---
 

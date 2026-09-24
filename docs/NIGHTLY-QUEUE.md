@@ -334,12 +334,14 @@
 
 ## [TASK-3a2] GET /api/stays 路由(薄 API)
 
-- 状态: running
+- 状态: done
 - 目标: 仅新增 `app/api/stays.py` 路由 + `app/main.py` 挂 `include_router(stays.router, prefix="/api")`,复用 3a1 的 `services.stays`。
 - **只读清单**: `backend/app/api/collections.py`(校验/报错/裸 Body 口径)、`backend/app/main.py`、`backend/services/stays.py`(3a1 产物)。
 - 落地契约: `GET /api/stays?lat=&lng=&radius_km=8&refresh=`;`place_id=` 可选(有则从 Place 表取坐标,二者只给其一,都缺 → 400 中文报错)。响应 `{"lat","lng","radius_km","count","source","note","items":[{id,osm_type,osm_id,name,kind,lat,lng,distance_km,price_estimate,currency,intro,estimated:"AI 预估 · 仅供参考 · 以 OTA 实时为准"}]}`;`note` 常量写明预估口径;radius_km 上限 30。
 - 验收: `backend/test_stays_api.py` ≥8 用例(TestClient,网络/LLM 全 mock);pytest 全绿;既有路由零回归;不改 index.html。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-24 夜班,Codex 执行,commit `de35fb5`,单次调用 ~11min)。
+  - 新增 `app/api/stays.py`(GET /api/stays,lat/lng 或 place_id 二选一、radius_km≤30、400 中文报错、note+estimated「AI 预估 · 仅供参考 · 以 OTA 实时为准」标注)+ main.py 挂路由;`test_stays_api.py` 34 用例(超出 ≥8 要求:refresh 不调 LLM、无 key/限流降级仍 200、Overpass 全挂空列表、FieldInfo 直调不崩等)。
+  - 执行器复跑 pytest backend/ = **425 passed**(391 基线零改动 + 34 新增);index.html 未动、工作区干净。
 
 ---
 

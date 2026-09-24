@@ -311,7 +311,7 @@
 
 ## [TASK-3a1] Stay 表 + 住宿检索 + LLM 估价/简介缓存(服务层,无 API)
 
-- 状态: running
+- 状态: done
 - 背景: 原 TASK-3a(9/23 Codex 37min 熔断零产物)按 R9 拆小。本条只做**服务层**,不做路由、不改前端。
 - 目标: 新建 Stay 表与 `services/stays.py`:OSM `tourism in (hotel,guest_house,hostel,apartment,chalet)` 单圆检索周边住宿 → haversine 排序算距 → LLM 生成**预估参考价区间 + 一句话简介**(按住宿缓存,已生成不重调;无 key/超时降级为空,不抛异常)。
 - **只读清单(只准读这 5 个,读完立即写码)**: `backend/db/models.py`(Place/Collection 定义风格)、`backend/db/base.py`、`backend/services/intro.py`、`backend/data_sources/overpass.py`、`backend/test_collections.py`(mock 与 fixture 套路)。禁止再读其他文件、禁止跑全量 pytest 超过 2 次。
@@ -325,13 +325,16 @@
     - `def load_or_fetch_stays(session, lat, lng, *, radius_m=8000, refresh=False) -> list[dict]` — 库里该坐标半径已有行 ≥ 阈值则直接读库返回(`source="db"`),否则检索+入库+批量估价;每项 dict 带 `distance_km`(haversine,round 2)。
   - `backend/test_stays.py`:**全部 mock**(网络:替换 `requests.Session.request`;LLM:注入假 client),≥15 用例,覆盖:检索解析、kind 归一、upsert 幂等不覆盖已生成、缓存命中零 LLM 调用、无 key 降级、坐标定点、排序。
 - 验收: `cd backend && ../.venv/bin/python -m pytest -q` 全绿(基线 325 passed 只增不减);不新增第三方依赖;不动 `app/` 任何文件。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-24 夜班,Codex 执行,commit `3d20958`)。
+  - `db/models.py` 新增 Stay 表(唯一键 (osm_type,osm_id)、坐标定点 COORD_PRECISION、currency 默认 CNY、ix_stay_location 索引);`services/stays.py` 按落地契约实现 search_stays(Overpass 单组并集,失败降级空列表)/estimate_price(LLM 两行输出价格区间+40字简介,无 key/异常/格式不对一律 ("",""),绝不抛)/upsert_stays(幂等,不覆盖已生成 price_estimate/intro)/load_or_fetch_stays(DB 即缓存,distance_km haversine round2)+ 预抓 CLI。
+  - `backend/test_stays.py` 66 用例全 mock;执行器复跑 pytest backend/ = **391 passed**(基线 325 零改动 + 66 新增,9.9s)。未动 app/ 任何文件、未新增第三方依赖。
+  - Codex 单次调用 ~28min 完成(上次同族任务 37min 零产物熔断,R8/R9 拆分后首战通过)。
 
 ---
 
 ## [TASK-3a2] GET /api/stays 路由(薄 API)
 
-- 状态: pending(依赖 TASK-3a1 done)
+- 状态: running
 - 目标: 仅新增 `app/api/stays.py` 路由 + `app/main.py` 挂 `include_router(stays.router, prefix="/api")`,复用 3a1 的 `services.stays`。
 - **只读清单**: `backend/app/api/collections.py`(校验/报错/裸 Body 口径)、`backend/app/main.py`、`backend/services/stays.py`(3a1 产物)。
 - 落地契约: `GET /api/stays?lat=&lng=&radius_km=8&refresh=`;`place_id=` 可选(有则从 Place 表取坐标,二者只给其一,都缺 → 400 中文报错)。响应 `{"lat","lng","radius_km","count","source","note","items":[{id,osm_type,osm_id,name,kind,lat,lng,distance_km,price_estimate,currency,intro,estimated:"AI 预估 · 仅供参考 · 以 OTA 实时为准"}]}`;`note` 常量写明预估口径;radius_km 上限 30。

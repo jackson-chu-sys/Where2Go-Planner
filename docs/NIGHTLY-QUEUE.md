@@ -4,6 +4,14 @@
 > 队列空 → 整轮跳过(0 token)。白天把重活追加为条目;完成后更新该条状态。
 > 执行顺序 = 文件内自上而下(依赖已排好)。continuity=true,单晚做不完下轮续。
 >
+## 执行约定(2026-09-24 神朱拍板,三条硬规则)
+
+- **R8 写码截止线**:派给 Codex 的任务,启动后 **12 分钟内必须出现第一条写文件动作**(heredoc/tee/`open(...,'w')/patch),看 rollout jsonl 的 exec_command 即可判定。超时 → 立即 kill、按零产物记 needs_review,不许等到 30min 墙钟熔断才收(9/23 的 TASK-3a 就是 37min、274 次调用、零写入才死,后 25 分钟全是白烧)。
+- **R9 投喂式简报**:Codex 任务描述必须含「只读清单」(≤5 个确切文件路径,读完即开工,禁止浏览式探索仓库)+「落地契约」(新文件路径、精确签名/字段名/响应形状)。只写"见 docs/xxx 第 N 节"这类宽指引 = 必熔断。
+- **R10 二次熔断自动降级**:同一任务族 Codex 累计熔断 **2 次** → 第 2 次发生时不再 kill 后留案,当轮直接改由**执行器手写**;needs_review 只留给"手写也失败"或需要神朱拍板的口径问题。
+
+---
+
 > 条目格式:
 > ```
 > ## [TASK-xxx] 标题
@@ -301,27 +309,34 @@
 
 ---
 
-## [TASK-3a] 住宿数据层 + AI 预估参考价 + /api/stays(后端)
+## [TASK-3a1] Stay 表 + 住宿检索 + LLM 估价/简介缓存(服务层,无 API)
 
-- 状态: needs_review
-- 目标: 依 docs/STAGE3-PLAN.md 第 1 节。用 OSM `tourism=hotel/guest_house/hostel/apartment/chalet` 按目的地周边半径检索住宿(复用 data_sources 的 Overpass 端点链);用 LLM(复用 services/intro 的 Provider 抽象)生成**预估参考价区间**(如「约 ¥300-500/晚」)与一句话简介,按住宿缓存到 DB(已有不重复调用)。数据模型可新建 `Stay` 表或复用 Place 加 type。新增 `GET /api/stays?place_id=|lat=&lng=&radius=`。
-- 依赖: 无。
-- 涉及: backend/services/stays.py、backend/db/models.py、backend/app/api/stays.py、backend/test_stays.py
-- 验收:
-  1. `/api/stays` 对真实坐标返回住宿列表(名称/类型/距离/预估参考价/简介),字段稳定
-  2. 预估价为 **AI 估算**且带标注字段(kind=estimate / note),页面可识别
-  3. 预估与简介按住宿缓存,重复查询不重复调 LLM
-  4. 单测覆盖:检索解析/缓存命中/降级(无 key 时留空不抛异常)
-  5. pytest backend/ 全绿
-- 结果: **needs_review**(2026-09-23 夜班,Codex 熔断)。
-  - 单次 Codex 调用运行 ~37 分钟触发 30min 熔断线(R7),已 kill。中止时 git 工作区干净、**零产物**
-    (backend/services/stays.py、backend/app/api/stays.py、backend/test_stays.py 均未创建),无可收尾内容。
-  - 日志(/tmp/w2g_task.log,40272 行)显示 Codex 全程在大量读文件探索(基线 pytest 325 passed 确认过、
-    读了 collections/places/place_loader/queue 等),始终未进入写码阶段——探索轮数失控,疑似任务描述
-    虽窄但仓库上下文读取过多。未自动重试(R7)。
-  - 留神朱白天定夺:①执行器直接手写(参照 TASK-2c-fe 先例,后端量较大) ②再派 Codex 一次并把任务
-    拆更小(先只做 Stay 表+检索,再做 LLM 估价,再做 API) ③其他。
-  - 连带影响:TASK-3b(依赖 3a)、TASK-4a(依赖 3b)今晚未启动,保持 pending;TASK-4b 同样顺延。
+- 状态: pending
+- 背景: 原 TASK-3a(9/23 Codex 37min 熔断零产物)按 R9 拆小。本条只做**服务层**,不做路由、不改前端。
+- 目标: 新建 Stay 表与 `services/stays.py`:OSM `tourism in (hotel,guest_house,hostel,apartment,chalet)` 单圆检索周边住宿 → haversine 排序算距 → LLM 生成**预估参考价区间 + 一句话简介**(按住宿缓存,已生成不重调;无 key/超时降级为空,不抛异常)。
+- **只读清单(只准读这 5 个,读完立即写码)**: `backend/db/models.py`(Place/Collection 定义风格)、`backend/db/base.py`、`backend/services/intro.py`、`backend/data_sources/overpass.py`、`backend/test_collections.py`(mock 与 fixture 套路)。禁止再读其他文件、禁止跑全量 pytest 超过 2 次。
+- 落地契约(照此实现,不得自创字段):
+  - `db/models.py` 追加 `Stay` 表:`id, osm_type(String16), osm_id(Integer), name(String255), kind(String32), lat(Float), lng(Float), tags(JSON), distance_km(Float,nullable), price_estimate(String64,nullable), currency(String8,default"CNY"), intro(Text,nullable), fetched_at(DateTime)`;唯一键 `(osm_type, osm_id)`;复用 `utcnow()/iso_utc()`,坐标定点用 `COORD_PRECISION`。
+  - `services/stays.py`:
+    - `STAY_TAGS: tuple[str,...] = ("hotel","guest_house","hostel","apartment","chalet")`(值即 `kind`)
+    - `def search_stays(lat: float, lng: float, radius_m: int = 8000, *, client=None) -> list[dict]` — 用 `overpass.build_grouped_query`(单组、selector `{"tourism": tag}` 逐个)+ `parse_places(payload, lat, lng, limit=None, require_name=False, with_id=True)`;返回项含 `osm_type/osm_id/name/lat/lng/tags`(解析函数已给)。检索失败按既有降级口径返回空列表。
+    - `def estimate_price(stay: Mapping, *, client=None, environ=None) -> tuple[str, str]` — 返回 `(price_estimate, intro)`;prompt 里给名称/kind/位置/tags 摘要,要求输出两行:`价格: 约¥A-B/晚` 与 `简介: <40字内>`;复用 `intro.LLMClient`、`resolve_provider`、`clean_intro` 的降级风格:未配 key、异常、格式不对一律 `("", "")`,**绝不抛出**。已有 price_estimate 的行不再调用。
+    - `def upsert_stays(session: Session, rows: Sequence[Mapping]) -> int`(按 `(osm_type,osm_id)` upsert,不覆盖已有 price_estimate/intro)
+    - `def load_or_fetch_stays(session, lat, lng, *, radius_m=8000, refresh=False) -> list[dict]` — 库里该坐标半径已有行 ≥ 阈值则直接读库返回(`source="db"`),否则检索+入库+批量估价;每项 dict 带 `distance_km`(haversine,round 2)。
+  - `backend/test_stays.py`:**全部 mock**(网络:替换 `requests.Session.request`;LLM:注入假 client),≥15 用例,覆盖:检索解析、kind 归一、upsert 幂等不覆盖已生成、缓存命中零 LLM 调用、无 key 降级、坐标定点、排序。
+- 验收: `cd backend && ../.venv/bin/python -m pytest -q` 全绿(基线 325 passed 只增不减);不新增第三方依赖;不动 `app/` 任何文件。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-3a2] GET /api/stays 路由(薄 API)
+
+- 状态: pending(依赖 TASK-3a1 done)
+- 目标: 仅新增 `app/api/stays.py` 路由 + `app/main.py` 挂 `include_router(stays.router, prefix="/api")`,复用 3a1 的 `services.stays`。
+- **只读清单**: `backend/app/api/collections.py`(校验/报错/裸 Body 口径)、`backend/app/main.py`、`backend/services/stays.py`(3a1 产物)。
+- 落地契约: `GET /api/stays?lat=&lng=&radius_km=8&refresh=`;`place_id=` 可选(有则从 Place 表取坐标,二者只给其一,都缺 → 400 中文报错)。响应 `{"lat","lng","radius_km","count","source","note","items":[{id,osm_type,osm_id,name,kind,lat,lng,distance_km,price_estimate,currency,intro,estimated:"AI 预估 · 仅供参考 · 以 OTA 实时为准"}]}`;`note` 常量写明预估口径;radius_km 上限 30。
+- 验收: `backend/test_stays_api.py` ≥8 用例(TestClient,网络/LLM 全 mock);pytest 全绿;既有路由零回归;不改 index.html。
+- 结果: (待夜班回填)
 
 ---
 
@@ -329,7 +344,7 @@
 
 - 状态: pending
 - 目标: 依 docs/STAGE3-PLAN.md 第 1/2 节,**仅前端**改动:在地图页选中目的地后,除现有路线面板外增加「住宿」区块,展示该目的地周边住宿卡片(名称/类型/距离/预估参考价/简介),并**强标注**「AI 预估 · 仅供参考 · 以 OTA 实时为准」。可加「收藏住宿」按钮(复用 /api/collections,type=stay)。
-- 依赖: TASK-3a。
+- 依赖: TASK-3a2(3a1+3a2 均 done 后执行)。
 - 涉及: 仅 backend/app/static/index.html
 - 验收:
   1. 选目的地能看到住宿卡片(含预估价与「AI 预估」标注)

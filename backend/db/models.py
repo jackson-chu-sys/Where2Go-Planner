@@ -1,5 +1,5 @@
 """SQLAlchemy 2.0 数据模型:目的地(Place)+ 抓取水位(SegmentFetch)
-+ 收藏(Collection / CollectionCat)。
++ 收藏(Collection / CollectionCat)+ 住宿(Stay)。
 
 阶段 1a(TASK-1a)落这两张表,存储用 SQLite(见 02-项目计划与架构.md):
 
@@ -12,6 +12,10 @@
   为 M4「统一收藏面板」铺路)。收藏存的是**快照摘要**(当时的方式/时长/费用/里程),
   不随价格系数与路况变化;唯一键 ``(kind, ref_key, mode)`` 让重复收藏**幂等**
   (upsert 刷新快照并返回原行,不报错、不产生重复条目)。
+* :class:`Stay` —— 一处住宿(TASK-3a1,阶段3a「住哪儿」)。与 ``Place`` 分开存:住宿是
+  行程的**落脚点**、不进需求四分类,展示要的是价格区间估算而不是分类标签;唯一键
+  ``(osm_type, osm_id)``,同一家酒店从不同起点搜到只存一行,``price_estimate`` / ``intro``
+  由 LLM 生成后**不再被重抓覆盖**(见 services.stays)。
 
 去重口径(docs/STAGE1-PLAN.md 第 3 节):同一 OSM 实体在同一个城市库里只存一行,
 唯一键 ``(osm_type, osm_id, origin_city)``。环形分段互斥,所以 band 不进唯一键;
@@ -395,3 +399,59 @@ class Collection(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
         return f"<Collection {self.id} {self.kind}/{self.mode or '-'} {self.name!r}>"
+
+
+# --------------------------------------------------------------------------- #
+# 住宿(TASK-3a1,阶段3a):Stay
+# --------------------------------------------------------------------------- #
+
+KIND_LEN = 32
+PRICE_LEN = 64
+CURRENCY_LEN = 8
+# 价格估算串(price_estimate)恒为人民币口径,串里自带"约"字标注是估算而非报价
+DEFAULT_CURRENCY = "CNY"
+
+
+class Stay(Base):
+    """一处住宿(酒店/民宿/青旅/公寓/小屋):Overpass ``tourism=*`` 抓取 + LLM 估价与简介。
+
+    为什么不复用 :class:`Place`:住宿是行程编排的**落脚点**(M5「住哪儿」),不进需求
+    四分类,展示字段也不同(要价格区间、要"约"字口径的估算标注),所以单独一张表 ——
+    没有 ``origin_city``/``band``/``category``,唯一键只有 ``(osm_type, osm_id)``:
+    同一家酒店无论从哪个起点搜到都只存一行,``distance_km`` 记的是**最近一次检索**时
+    离起点的距离(可空,纯展示用,不作为身份的一部分)。
+
+    缓存口径与 ``Place.intro`` 一致:``price_estimate``(形如 ``约¥300-500/晚``)与
+    ``intro`` 由 LLM 生成后落库,**重新抓取不覆盖**(见 services.stays.upsert_stays);
+    ``currency`` 默认 :data:`DEFAULT_CURRENCY`,与价格串里的 ``¥`` 对应。
+    """
+
+    __tablename__ = "stays"
+    __table_args__ = (
+        UniqueConstraint("osm_type", "osm_id", name="uq_stay_osm"),
+        Index("ix_stay_location", "lat", "lng"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    osm_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    osm_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    name: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False, default="")
+    kind: Mapped[str] = mapped_column(String(KIND_LEN), nullable=False, default="", index=True)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    tags: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    distance_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    price_estimate: Mapped[Optional[str]] = mapped_column(String(PRICE_LEN), nullable=True)
+    currency: Mapped[str] = mapped_column(
+        String(CURRENCY_LEN), nullable=False, default=DEFAULT_CURRENCY
+    )
+    intro: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return (
+            f"<Stay {self.osm_type}/{self.osm_id} {self.name!r} {self.kind} "
+            f"{self.price_estimate or '未估价'}>"
+        )

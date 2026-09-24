@@ -2,7 +2,8 @@
 
 分三个模块:
 
-* :mod:`db.models` —— ``Place`` / ``SegmentFetch`` / ``Collection`` / ``CollectionCat`` 表定义;
+* :mod:`db.models` —— ``Place`` / ``SegmentFetch`` / ``Collection`` / ``CollectionCat`` /
+  ``Stay`` 表定义;
 * :mod:`db.base` —— 引擎、会话工厂、建表与 FastAPI 依赖;
 * :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询,
   并按分类/来源(OSM / 种子)计数;收藏的幂等 upsert、按类型过滤与分组维护)。
@@ -35,6 +36,7 @@ from .models import (
     CAT_MANUAL,
     COLLECTION_CAT_SOURCES,
     COLLECTION_KINDS,
+    DEFAULT_CURRENCY,
     KIND_PLACE,
     KIND_ROUTE,
     NO_MODE,
@@ -47,6 +49,7 @@ from .models import (
     CollectionCat,
     Place,
     SegmentFetch,
+    Stay,
     clean_text,
     collection_kind,
     collection_ref_key,
@@ -102,6 +105,7 @@ __all__ = [
     "CAT_MANUAL",
     "CAT_AUTO",
     "COLLECTION_CAT_SOURCES",
+    "DEFAULT_CURRENCY",
     "is_seed",
     "place_source",
     "clean_text",
@@ -117,6 +121,7 @@ __all__ = [
     "SegmentFetch",
     "Collection",
     "CollectionCat",
+    "Stay",
     "database_url",
     "get_engine",
     "get_session",

@@ -347,7 +347,7 @@
 
 ## [TASK-3b] 住宿前端展示(面板卡片 + 预估价标注)
 
-- 状态: running
+- 状态: done
 - 目标: 依 docs/STAGE3-PLAN.md 第 1/2 节,**仅前端**改动:在地图页选中目的地后,除现有路线面板外增加「住宿」区块,展示该目的地周边住宿卡片(名称/类型/距离/预估参考价/简介),并**强标注**「AI 预估 · 仅供参考 · 以 OTA 实时为准」。可加「收藏住宿」按钮(复用 /api/collections,type=stay)。
 - 依赖: TASK-3a2(3a1+3a2 均 done 后执行)。
 - 涉及: 仅 backend/app/static/index.html
@@ -357,7 +357,28 @@
   3. 页面无 JS 报错;既有地图/pin/路线面板不回归
   4. browser_exec QA:开页→点 pin→看住宿区块→(可选)收藏→0 console error
   5. 不改后端文件
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-25 夜班,执行器直接手写,未派 Codex;commit `0a027ed`)。
+  - index.html(+约210行,仅前端,零后端文件改动):路线面板下方新增「🛏️ 周边住宿」区块,
+    openRoutePanel 时与路线**并行**拉 GET /api/stays(半径 5km;token 守卫作废过期响应);
+    卡片含 名称/类型徽章(酒店/民宿/青旅/公寓/木屋)/距离/AI 预估价区间/一句话简介,
+    每卡片强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」;超 12 家显示「共 N 家」汇总;
+    冷坐标加载中文案(Overpass+LLM 30-120s)/失败「重试」/空结果降级提示,均不抛 JS 错;
+    「☆ 收藏住宿」复用既有 POST /api/collections(**kind=place + Stay 的 OSM 身份**,后端无
+    stay 类型、零改动),判定键复刻后端 collection_ref_key 的 place 规则(type/id),
+    与收藏弹层/路线收藏按钮同源刷新;closeRoutePanel/Esc 一并清住宿区块;页头页脚口径更新。
+  - test_frontend_routes.py 追加 9 个静态断言(DOM id/JS 函数面/API 调用/预估标注/收藏
+    payload 字段/事件委托/**前后端字段契约**:前端 item.* 引用必须是 /api/stays ITEM_KEYS
+    子集)。pytest backend/ = **434 passed**(425 基线零改动,13.4s)。
+  - browser_exec 真实 QA(uvicorn 已重启到含 /api/stays 的新代码):开页 495 pin 0 error →
+    点 pin 出路线面板+住宿区块 → 库缓存命中(source=db)143 家渲染 12 卡(Hi Inn 约¥250-450/晚
+    +标注+简介齐)→ 点「☆ 收藏住宿」→ 提示已收藏+按钮变 ★ → 收藏弹层见 1 条「🛏️ Hi Inn · 住宿」
+    → 取消收藏 → 列表回空态、卡片按钮复位 → 关面板/Esc 清区块;全程 window error **0** 条。
+  - 附带:发现旧 uvicorn 进程(跑了 12 天)未含 TASK-3a2 路由,已带 /opt/data/.env 重启;
+    市中心坐标(31.2304,121.4737, 2km)住宿 143 条入库,LLM 估价回填 **131/143**(12 条估不出
+    留 null,前端显示「暂无 AI 预估价」,不编数字)。
+  - 备注:browser daemon 曾连挂 5 个会话(Runtime.evaluate timed out),根因是 16 天前的
+    chrome-headless-shell 僵死;kill 后按 hermes-browser-cdp-setup skill 原参数重启
+    (端口 9222,新 user-data-dir=/tmp/chrome-cdp-w2g3)即恢复。
 
 ---
 

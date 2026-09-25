@@ -347,7 +347,7 @@
 
 ## [TASK-3b] 住宿前端展示(面板卡片 + 预估价标注)
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE3-PLAN.md 第 1/2 节,**仅前端**改动:在地图页选中目的地后,除现有路线面板外增加「住宿」区块,展示该目的地周边住宿卡片(名称/类型/距离/预估参考价/简介),并**强标注**「AI 预估 · 仅供参考 · 以 OTA 实时为准」。可加「收藏住宿」按钮(复用 /api/collections,type=stay)。
 - 依赖: TASK-3a2(3a1+3a2 均 done 后执行)。
 - 涉及: 仅 backend/app/static/index.html

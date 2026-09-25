@@ -483,3 +483,93 @@ def test_fav_item_shows_summary_fields(html: str) -> None:
                   "fmtKm(summary.distance_km)", "js-fav-del"):
         assert token in item_html, f"收藏列表项缺少展示元素 {token}"
     assert "fp-empty" in section, "空列表应有占位文案"
+
+
+# --------------------------------------------------------------------------- #
+# 7. 住宿区块(TASK-3b):路线面板内「周边住宿」卡片 + AI 预估价强标注 + 收藏住宿
+#    (轻量静态断言,同 TASK-2c-fe 模式;交互验证走 browser_exec QA)
+# --------------------------------------------------------------------------- #
+
+STAY_SECTION_START = "住宿区块(TASK-3b):openRoutePanel"
+
+
+def stay_section(html: str) -> str:
+    start = html.index(STAY_SECTION_START)
+    end = html.index("// 卡片选中与跳转都走事件委托", start)
+    return html[start:end]
+
+
+def test_stay_dom_ids_present(html: str) -> None:
+    for element_id in ("staySection", "stayTitle", "staySub", "stayMsg",
+                       "stayCards", "stayMore", "stayRetry"):
+        assert f'id="{element_id}"' in html, f"缺少住宿区块 DOM id:{element_id}"
+    # 住宿区块在路线面板 aside 内(面板开时才有意义),默认 display:none
+    panel = html[html.index('<aside id="routePanel"'):html.index("</aside>")]
+    assert 'id="staySection"' in panel, "住宿区块应放在路线面板内"
+    assert 'id="staySection" style="display:none"' in html, "住宿区块默认应隐藏"
+
+
+def test_stay_functions_present(html: str) -> None:
+    section = stay_section(html)
+    for name in ("openStaySection", "closeStaySection", "loadStays", "applyStayData",
+                 "renderStayCards", "stayCardHtml", "setStayMsg", "staysCacheKey",
+                 "stayFavButtonHtml", "syncStayFavButtons", "addFavStay", "stayFavItem"):
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少住宿 JS 函数:{name}"
+
+
+def test_stay_calls_api(html: str) -> None:
+    section = stay_section(html)
+    assert 'getJSON("/api/stays?"' in section, "住宿应 GET /api/stays"
+    assert "data.items" not in section, "住宿段不得用 data.* 变量名(会被路线契约测试误扫)"
+    assert "radius_km" in section and "STAYS_RADIUS_KM" in html, "请求应带检索半径参数"
+    assert "token!==state.stays.token" in section, "在飞的住宿响应应有 token 守卫(换 pin 作废)"
+
+
+def test_stay_card_shows_required_fields(html: str) -> None:
+    section = stay_section(html)
+    card_html = section[section.index("function stayCardHtml"):section.index("function renderStayCards")]
+    for token in ("item.name", "item.kind", "item.price_estimate", "item.distance_km",
+                  "item.intro", "STAYS_EST_FALLBACK", "item.estimated"):
+        assert token in card_html, f"住宿卡片缺少展示字段 {token}"
+
+
+def test_stay_estimate_label_prominent(html: str) -> None:
+    # 强标注口径:后端 ESTIMATED_LABEL 原文 + 前端兜底常量,都必须出现
+    assert "AI 预估 · 仅供参考 · 以 OTA 实时为准" in html, "每张卡片须强标注 AI 预估口径"
+    assert "不代订" in html and "实时价" in html, "页脚应写明不代订、不抓实时价"
+
+
+def test_stay_fav_uses_place_kind(html: str) -> None:
+    section = stay_section(html)
+    payload = section[section.index("async function addFavStay"):section.index("function stayCardHtml")]
+    assert 'kind:"place"' in payload, "收藏住宿走既有 kind=place(后端无 stay 类型,不改后端)"
+    for token in ("osm_type:item.osm_type", "osm_id:item.osm_id", "to_lat", "to_lng", "price_estimate"):
+        assert token in payload, f"收藏住宿请求体缺少 {token}"
+    # 已收藏判定键与后端唯一键 (kind,ref_key,mode) 同口径:place:{type}/{id}
+    key_fn = section[section.index("function stayFavItem"):section.index("function stayFavButtonHtml")]
+    assert '"place:"' in key_fn and "osm_type" in key_fn, "判定键须复刻后端 collection_ref_key 的 place 规则"
+
+
+def test_stay_section_wired_into_route_panel(html: str) -> None:
+    section = html[html.index("async function openRoutePanel"):html.index("function closeStaySection")]
+    assert "openStaySection(place,state.stays.token)" in section, "开路线面板应同时拉住宿"
+    assert "closeStaySection()" in html[html.index("function closeRoutePanel"):], \
+        "关路线面板应一并清住宿区块"
+    assert '$("stayRetry").addEventListener("click"' in html, "住宿重试按钮应绑定"
+
+
+def test_stay_fav_click_delegated(html: str) -> None:
+    assert 'target.closest("#stayCards .js-stay-fav")' in html, "收藏住宿按钮应走事件委托拦截"
+    assert "syncStayFavButtons();" in html[html.index("async function refreshFavItems"):], \
+        "收藏列表刷新应同步住宿按钮态"
+
+
+def test_stays_contract_matches_api_item_shape(html: str) -> None:
+    """前端引用的 item.* 字段必须是 GET /api/stays 出参投影白名单(ITEM_KEYS+estimated)的子集。"""
+    from app.api.stays import ITEM_KEYS  # noqa: PLC0415
+    section = stay_section(html)
+    referenced = referenced_fields(section, "item") - {"kind"}
+    # item.kind 也在白名单里;剔除 JS 本地变量后逐一核对
+    allowed = set(ITEM_KEYS) | {"estimated", "kind"}
+    unknown = {name for name in referenced if name not in allowed}
+    assert not unknown, f"前端引用了 /api/stays 不存在的字段:{sorted(unknown)}"

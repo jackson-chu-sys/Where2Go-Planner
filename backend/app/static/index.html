@@ -105,6 +105,19 @@
   .fp-del:hover{background:#fecaca}
   .fp-empty{color:#9ca3af;font-size:13px;margin-top:12px;font-style:italic}
   .fp-err{color:#b91c1c;background:#fee2e2;font-size:13px;margin-top:9px;padding:8px 10px;border-radius:8px}
+  /* 住宿区块(TASK-3b):路线面板下方的周边住宿卡片 + AI 预估价强标注 */
+  .stay-sec{margin-top:12px;border-top:2px solid #e5e7eb;padding-top:9px}
+  .stay-hd{display:flex;align-items:center;gap:7px}
+  .stay-ttl{font-weight:700;font-size:14px;flex:1}
+  .scard{border:1px solid #e5e7eb;border-radius:10px;padding:8px 10px;margin-top:8px;background:#fff}
+  .sc-nm{font-weight:700;font-size:13px}
+  .sc-badges{margin-top:4px;display:flex;gap:6px;flex-wrap:wrap}
+  .sc-price{color:#b45309;font-weight:700}
+  .sc-meta{color:#6b7280;font-size:12px;margin-top:4px}
+  .sc-intro{color:#1f2937;font-size:12px;line-height:1.5;margin-top:5px}
+  .sc-intro.empty{color:#9ca3af;font-style:italic}
+  .sc-est{color:#92400e;background:#fef3c7;font-size:10px;padding:1px 6px;border-radius:8px}
+  .stay-more{color:#6b7280;font-size:11px;margin-top:7px}
   @media (max-width:680px){
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
@@ -113,7 +126,7 @@
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段2b · 路线面板 + 画线 + 跳转)</span></h1>
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段3b · 路线 + 周边住宿 AI 预估价)</span></h1>
   <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
@@ -158,6 +171,18 @@
       <div class="rp-cards" id="routeCards"></div>
       <div class="rp-line" id="routePanelLegend" style="display:none"></div>
       <div class="rp-meta" id="routePanelMeta"></div>
+      <!-- 住宿区块(TASK-3b):周边住宿卡片,价格全部是 AI 预估、强标注、不代订 -->
+      <div class="stay-sec" id="staySection" style="display:none">
+        <div class="stay-hd">
+          <div class="stay-ttl" id="stayTitle">🛏️ 周边住宿</div>
+          <button type="button" id="stayRetry" class="rp-x" style="display:none"
+                  title="重新拉一次 /api/stays">重试</button>
+        </div>
+        <div class="rp-sub" id="staySub"></div>
+        <div class="rp-msg" id="stayMsg" style="display:none"></div>
+        <div id="stayCards"></div>
+        <div class="stay-more" id="stayMore" style="display:none"></div>
+      </div>
     </aside>
   </div>
   <!-- 我的收藏弹层(TASK-2c-fe):对接 /api/collections;收藏按钮在路线卡片内,取消收藏在列表项内 -->
@@ -179,7 +204,9 @@
   按 OSM (type, id) 去重、一地只属一类 · 一句话简介由 LLM 生成并按 POI 缓存 ·
   OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据垫底(popup 标注来源=种子)·
   路线:驾车时长/里程来自 OSRM 真实路网(费用为估算),铁路/飞机为经验估算,
-  一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价
+  一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价 ·
+  住宿:OSM tourism 检索目的地周边落脚点,价格与简介为 AI 预估参考价
+  (强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」),不代订、不抓 OTA 实时价
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -210,8 +237,17 @@ const ROUTE_DISCLAIMER="估算·非实时·以官方为准";
 const ROUTE_LINE_LEGEND="画线:🚗 青实线 = OSRM 真实路网折线 · 🚄 蓝虚线 = 铁路示意 · "+
                         "✈️ 紫虚线 = 航段示意(铁路/飞机为起终点示意线,非真实轨迹)";
 
+// 住宿(TASK-3b,阶段3b):口径全在后端 services/stays.py + /api/stays,前端只管展示与降级提示。
+// 价格是 AI 预估参考价(不是报价),每卡片强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」。
+const STAYS_RADIUS_KM=5;      // 「周边」口径:目的地 5 km 内(后端默认 8,这里收一点聚焦落脚)
+const STAYS_MAX_CARDS=12;     // 面板里最多渲染几张卡片(其余给「共 N 家」汇总,免得侧栏过长)
+const STAYS_KIND_META={hotel:{emoji:"🏨",label:"酒店"},guest_house:{emoji:"🏡",label:"民宿/客栈"},
+  hostel:{emoji:"🛏️",label:"青旅"},apartment:{emoji:"🏢",label:"公寓"},chalet:{emoji:"🏔️",label:"度假木屋"}};
+const STAYS_EST_FALLBACK="AI 预估 · 仅供参考 · 以 OTA 实时为准";   // 后端 estimated 缺失时兜底
+
 const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
              places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0},
+             stays:{token:0,loadedKey:null,payload:null},
              fav:{open:false,items:[],busy:false,favedKeys:{}}};
 let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
 
@@ -610,6 +646,12 @@ async function openRoutePanel(place,options){
   clearRouteLine();
   panel.style.display="block";
   if(options&&options.scroll&&panel.scrollIntoView) panel.scrollIntoView({behavior:"smooth",block:"nearest"});
+  if(coordsReady(place)){
+    state.stays.token+=1;
+    openStaySection(place,state.stays.token);   // 住宿与路线并行拉,互不阻塞
+  }else{
+    closeStaySection();
+  }
 
   if(!coordsReady(state.origin)||!coordsReady(place)){
     setRouteMsg(state.origin
@@ -624,6 +666,7 @@ async function openRoutePanel(place,options){
 }
 
 function closeRoutePanel(){
+  closeStaySection();          // 住宿区块随路线面板一起清(TASK-3b)
   state.routePanel.token+=1;   // 让在飞的请求作废,免得回填到已关闭的面板
   const token=state.routePanel.token;
   state.routePanel={open:false,place:null,data:null,mode:null,token:token};
@@ -634,6 +677,155 @@ function closeRoutePanel(){
   renderRouteMeta(null);
   showRouteLegend(false);
   clearRouteLine();
+}
+
+// --------------------------------------------------------------------------- //
+// 住宿区块(TASK-3b):openRoutePanel 时并行拉 /api/stays(不阻塞路线);
+// token 守卫与路线同套路:换 pin / 关面板后,在飞的住宿响应一律作废。
+// 冷坐标首查要过 Overpass + LLM 估价,可能 30-120s —— 给可见进度文案;
+// DB 即缓存,同坐标半径二查 source=db 秒回。失败只降级提示,不影响路线与地图。
+// --------------------------------------------------------------------------- //
+function staysCacheKey(place){return [num(place.lat).toFixed(7),num(place.lng).toFixed(7),STAYS_RADIUS_KM].join("|");}
+function setStayMsg(message,tone){
+  const box=$("stayMsg");
+  if(box){
+    box.textContent=message||"";
+    box.className="rp-msg"+((tone==="warn"||tone==="err")?(" "+tone):"");
+    box.style.display=message?"block":"none";
+  }
+  const retry=$("stayRetry");
+  if(retry) retry.style.display=(message&&tone==="err")?"inline-block":"none";
+}
+function stayFavItem(item){
+  // 已收藏判定键:与后端唯一键 (kind,ref_key,mode) 同口径;住宿用 kind=place + OSM 身份
+  // (ref_key 规则见后端 models.collection_ref_key:OSM 身份 "place:type/id";Stay 行必有 osm 身份)
+  return {kind:"place",ref_key:"place:"+String(item.osm_type).toLowerCase()+"/"+Number(item.osm_id),mode:""};
+}
+function stayFavButtonHtml(item,index){
+  const keys=currentFavKeys();
+  const faved=!!keys[favKey(stayFavItem(item))];
+  return '<div class="rp-fav"><button type="button" class="fav-btn js-stay-fav'+(faved?" faved":"")+'" '+
+    'data-i="'+Number(index)+'"'+(faved?" disabled":"")+
+    ' title="'+(faved?"这家住宿已在收藏里(幂等,重复收藏只刷新快照)":"把这家住宿存入收藏(POST /api/collections,kind=place)")+'">'+
+    (faved?"★ 已收藏":"☆ 收藏住宿")+"</button></div>";
+}
+function syncStayFavButtons(){
+  const keys=currentFavKeys();
+  const items=(state.stays.payload&&Array.isArray(state.stays.payload.items))?state.stays.payload.items:[];
+  document.querySelectorAll("#stayCards .js-stay-fav").forEach(button=>{
+    const item=items[Number(button.getAttribute("data-i"))];
+    if(!item) return;
+    const faved=!!keys[favKey(stayFavItem(item))];
+    button.classList.toggle("faved",faved);
+    button.disabled=faved;
+    button.textContent=faved?"★ 已收藏":"☆ 收藏住宿";
+  });
+}
+async function addFavStay(item,button){
+  if(button) button.disabled=true;
+  const payload={kind:"place",osm_type:item.osm_type,osm_id:item.osm_id,
+    to_lat:num(item.lat),to_lng:num(item.lng),
+    name:"🛏️ "+String(item.name||"(无名住宿)")+" · 住宿",
+    summary:{kind:"estimate",price_estimate:item.price_estimate||null,
+             stay_kind:item.kind||null,distance_km:item.distance_km}};
+  try{
+    const resp=await sendJSON("/api/collections",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    await refreshFavItems();   // 与收藏弹层、路线收藏按钮判定同源
+    const name=(resp.collection&&resp.collection.name)||"该住宿";
+    setStayMsg(resp.created?("已收藏住宿:「"+name+"」(可在「⭐ 我的收藏」查看/取消)")
+      :("这家住宿之前已收藏,快照已刷新:「"+name+"」"),"warn");
+  }catch(error){
+    setStayMsg("收藏住宿失败:"+((error&&error.message)||error)+"(不影响住宿查看)","err");
+  }finally{
+    syncStayFavButtons();
+  }
+}
+function stayCardHtml(item,index){
+  const meta=STAYS_KIND_META[item.kind]||{emoji:"🏨",label:item.kind||"住宿"};
+  const km=num(item.distance_km);
+  const price=item.price_estimate
+    ? '<span class="sc-price">'+esc(item.price_estimate)+"</span>"
+    : '<span class="sc-meta">暂无 AI 预估价(以下单平台实时价为准)</span>';
+  const intro=(item.intro&&String(item.intro).trim())
+    ? '<div class="sc-intro">'+esc(item.intro)+"</div>"
+    : '<div class="sc-intro empty">暂无简介</div>';
+  return '<div class="scard">'+
+    '<div class="sc-nm">'+meta.emoji+" "+esc(item.name||"(无名住宿)")+"</div>"+
+    '<div class="sc-badges"><span class="badge">'+esc(meta.label)+"</span>"+
+      '<span class="badge est">'+price+"</span>"+
+      '<span class="sc-est" title="价格是 LLM 依据名称/类型/OSM 标签估的参考价区间,不是报价">'+
+        esc(item.estimated||STAYS_EST_FALLBACK)+"</span></div>"+
+    '<div class="sc-meta">距目的地 '+esc(isFinite(km)?(km.toFixed(1)+" km"):"—")+
+      (item.currency?(" · "+esc(item.currency)):"")+"</div>"+
+    intro+
+    stayFavButtonHtml(item,index)+
+    "</div>";
+}
+function renderStayCards(result){
+  const box=$("stayCards");
+  const more=$("stayMore");
+  const items=(result&&Array.isArray(result.items))?result.items:[];
+  if(box) box.innerHTML=items.slice(0,STAYS_MAX_CARDS).map(stayCardHtml).join("");
+  if(more){
+    const hidden=items.length-STAYS_MAX_CARDS;
+    more.textContent=hidden>0?("仅显示最近的 "+STAYS_MAX_CARDS+" 家,共 "+items.length+" 家(其余可缩小分段后在列表模式查看)"):"";
+    more.style.display=hidden>0?"block":"none";
+  }
+}
+function applyStayData(result,place){
+  state.stays.loadedKey=staysCacheKey(place);
+  state.stays.payload=result;
+  $("stayTitle").textContent="🛏️ 周边住宿 · "+(place.name||"目的地")+" "+STAYS_RADIUS_KM+" km 内";
+  const items=(result&&Array.isArray(result.items))?result.items:[];
+  const sourceNote=(result&&result.source==="db")?"来自库缓存":("现场检索("+(result&&result.source||"overpass")+")");
+  $("staySub").textContent="共 "+((result&&result.count)||items.length)+" 家 · "+sourceNote+
+    " · 价格为 AI 预估参考价,不代订、不抓实时价";
+  if(!items.length){
+    renderStayCards([]);
+    setStayMsg("该目的地周边 "+STAYS_RADIUS_KM+" km 内暂时没有查到住宿(OSM 覆盖有限);可换个目的地或稍后重试。","warn");
+    return;
+  }
+  renderStayCards(result);
+  setStayMsg("");
+}
+async function loadStays(place,token){
+  const params=new URLSearchParams({lat:String(place.lat),lng:String(place.lng),
+    radius_km:String(STAYS_RADIUS_KM)});
+  try{
+    const result=await getJSON("/api/stays?"+params.toString());
+    if(token!==state.stays.token) return;   // 已换 pin / 已关面板:作废
+    applyStayData(result,place);
+  }catch(error){
+    if(token!==state.stays.token) return;
+    renderStayCards([]);
+    setStayMsg("住宿查询失败:"+((error&&error.message)||error)+"(公共 Overpass/LLM 可能繁忙,可点「重试」;路线与地图不受影响)","err");
+  }
+}
+// 打开住宿区块:已有同坐标缓存数据直接复用,否则先给进度文案再拉
+function openStaySection(place,token){
+  const section=$("staySection");
+  if(section) section.style.display="block";
+  $("stayTitle").textContent="🛏️ 周边住宿";
+  $("staySub").textContent="";
+  renderStayCards([]);
+  const more=$("stayMore");
+  if(more){more.textContent="";more.style.display="none";}
+  if(state.stays.loadedKey===staysCacheKey(place)&&state.stays.payload){
+    applyStayData(state.stays.payload,place);
+    return;
+  }
+  setStayMsg("正在检索周边住宿并做 AI 价格预估(库缓存命中约 1s;冷坐标首查要过 Overpass + LLM,可能 30-120s)…");
+  loadStays(place,token);
+}
+function closeStaySection(){
+  state.stays.token+=1;   // 作废在飞的住宿请求
+  state.stays.loadedKey=null;
+  state.stays.payload=null;
+  const section=$("staySection");
+  if(section) section.style.display="none";
+  renderStayCards([]);
+  setStayMsg("");
 }
 
 // 卡片选中与跳转都走事件委托(卡片/链接都是运行时 innerHTML 生成的)
@@ -649,6 +841,15 @@ function onDocumentClick(event){
       ?state.routePanel.data.routes:[];
     const route=routes.find(item=>item&&(item.mode||"")===mode);
     if(route&&!favButton.disabled) addFavRoute(route,favButton);
+    return;
+  }
+  // 收藏住宿按钮(TASK-3b):住宿卡片内,拦截避免误触路线卡片选中
+  const stayFavButton=target.closest("#stayCards .js-stay-fav");
+  if(stayFavButton){
+    event.stopPropagation();
+    const items=(state.stays.payload&&Array.isArray(state.stays.payload.items))?state.stays.payload.items:[];
+    const item=items[Number(stayFavButton.getAttribute("data-i"))];
+    if(item&&!stayFavButton.disabled) addFavStay(item,stayFavButton);
     return;
   }
   // 收藏弹层内的取消收藏按钮
@@ -993,6 +1194,7 @@ async function refreshFavItems(){
   state.fav.favedKeys=currentFavKeys();
   if(state.fav.open){renderFavItems();setFavErr("");}
   syncFavButtons();
+  syncStayFavButtons();   // 住宿卡片的「已收藏」态与收藏列表同源刷新(TASK-3b)
 }
 async function openFavPanel(){
   state.fav.open=true;
@@ -1035,6 +1237,12 @@ $("favPanel").addEventListener("click",event=>{
 $("routeRetry").addEventListener("click",()=>{
   const place=state.routePanel.place;
   if(place) openRoutePanel(place);   // 失败重试:缓存里没东西,会重新打一次 /api/routes
+});
+$("stayRetry").addEventListener("click",()=>{
+  const place=state.routePanel.place;
+  if(!place||!coordsReady(place)) return;
+  state.stays.token+=1;
+  openStaySection(place,state.stays.token);   // 住宿失败重试:清缓存重拉 /api/stays
 });
 document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);

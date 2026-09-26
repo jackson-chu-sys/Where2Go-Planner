@@ -385,7 +385,7 @@
 
 ## [TASK-5a] 行程方案后端:TripPlan 表 + 总账报价 + /api/trip-plans
 
-- 状态: pending
+- 状态: done
 - 背景: M4 第一步(**纯后端**,不动 index.html)。为 TASK-5b(统一收藏面板+行程方案前端)提供聚合 API。**本任务同时是 Codex 256K 窗口扩容的验证任务**(R8/R9 照旧执行)。
 - 目标: 新表 `TripPlan` 把已收藏的「目的地+路线+住宿」组合成方案,给出**大致总花费**(从 Collection 快照的"当时口径"计算,不重新调 /api/routes)。
 - **只读清单(只准读这 5 个,读完立即写码;AGENTS.md 先读)**: `backend/db/models.py`、`backend/db/repository.py`、`backend/app/api/collections.py`、`backend/services/stays.py`、`backend/test_collections.py`。禁止其他探索性 cat/grep,禁止跑全量 pytest 超过 2 次。
@@ -401,7 +401,13 @@
     - 校验口径照 collections.py:裸 Body、400 中文报错、引用不存在→400、响应带 note。本模块**不触网**。
   - `backend/test_trips.py`:全 mock ≥25 用例,覆盖:价文案解析(各种脏输入)、报价求和/上下限、引用被删的降级、upsert 幂等、API 校验、nights 边界;**既有测试零改动**。
 - 验收: `cd backend && ../.venv/bin/python -m pytest -q` 全绿(基线 **434 passed** 只增不减);不动 `app/static/` 与 `app/api/collections.py`;commit 消息带 TASK-5a。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-26 加跑夜班,Codex 执行,commit `da6eb7f`;**256K 窗口首战验证通过**)。
+  - `db/models.py` 新增 TripPlan 表(trip_plans;name 唯一 uq_trip_plan_name;route/stay_collection_ids JSON 数组默认空;created_at/updated_at 照 Collection 风格;三个引用列不建 FK,删收藏不连带删方案)。
+  - `services/trips.py`:parse_nightly_price(复用 stays.PRICE_RANGE_RE,认「约¥250-450/晚」「300-500元」「1,200~1,800」含全角逗号;脏输入/¥0/面议 →(None,None) 不猜数;上下限写反自动纠正)、quote_plan(交通=路线快照 cost_cny 求和缺项跳过;住宿=价下限均值×nights,有区间给上限档;missing 列已删除引用;kind=estimate+note;nights 越界 1..60 抛 ValueError)、upsert_trip_plan(按名幂等)、trip_plan_to_dict。住宿价优先收藏快照 summary.price_estimate,缺失时按 OSM 身份回退查 stays 表(只读库不触网)。
+  - `app/api/trips.py` + main.py 挂路由:POST /api/trip-plans(重名=刷新,响应含 quote)、GET ?limit=(新在前,带 quote+counts)、GET/DELETE /{id};裸 Body + 400 中文报错 + FieldInfo 直调兼容,口径照 collections.py。
+  - `backend/test_trips.py` 50 例全 mock(no_network autouse + 手拼 ASGI scope 走完整 HTTP 链)。执行器复跑 pytest backend/ = **495 passed**(445 基线零改动 + 50 新增,14.8s)。未动 app/static/ 与 collections.py。
+  - uvicorn :8000 已重启(旧进程无新路由);真机冒烟:GET 空列表 → POST 建「冒烟测试方案」返回 quote(kind=estimate)→ DELETE 成功 → total=0,测试数据已清理。
+  - **Codex 256K 窗口统计**:单次调用 ~26min(15:46-16:12 UTC),function_calls **54**,首轮写码(apply_patch models.py)启动后 **7.5min**(R8 12min 线内),tokens 用量 **259,571**(total_token_usage 3.57M 含 cache 重放,峰值上下文 ~110K/262K,**全程零 compact、零"读→忘→重读"回圈**——对比 9/23 TASK-3a 64K 窗口 274 次调用/37min 零产物熔断,扩容效果显著)。
 
 ---
 

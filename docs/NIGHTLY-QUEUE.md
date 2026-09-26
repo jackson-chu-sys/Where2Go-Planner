@@ -384,7 +384,7 @@
 
 ## [TASK-4a] 统一收藏面板 + 行程对比 + 总账
 
-- 状态: running
+- 状态: done
 - 目标: 依 docs/STAGE3-PLAN.md 第 2 节,把收藏统一成可对比的面板:汇总 目的地/路线/住宿;以简洁信息展示 路线时长、路线费用、住宿费用 供对比;支持把「目的地+路线+住宿」组合为一个**行程方案**并给出大致总花费。必要时加后端聚合 API。
 - 依赖: TASK-2c-fe / 3b。
 - 涉及: backend/app/static/index.html、backend/app/api/collections.py(如需聚合)
@@ -393,13 +393,28 @@
   2. 能创建行程方案(目的地+路线+住宿)并显示总花费
   3. 无 JS 报错;既有收藏功能不回归
   4. pytest backend/ 全绿(若动后端)
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-26 夜班,执行器直接手写,未派 Codex;commit `3ac8398`)。
+  - index.html(仅前端,零后端文件改动):「我的收藏」弹层按类型**分组渲染**(🚗 路线 / 📍 目的地 /
+    🛏️ 住宿;住宿=kind place 里的指纹判定:summary.stay_kind/price_estimate 或 🛏️ 名称前缀),
+    路线项含 时长/费用/里程/估算徽标,住宿项含 AI 预估价/距目的地/「AI 预估」强标注;
+    新增「🧳 组合行程方案」区块:三个下拉(目的地/路线/住宿)+ 晚数输入 → 实时算**大致总花费**
+    (交通=路线快照 cost_cny 单程、住宿=预估价区间中值×晚数,缺项明示「未计入」不编数字),
+    总账带估算口径说明;方案可保存(localStorage,上限20条)/删除。
+  - test_frontend_routes.py 追加 6 个静态断言(DOM/函数面/分组渲染/估算标注/事件接线/价格解析)。
+    pytest backend/ = **440 passed**(434 基线零改动,12.1s);node --check 内联 JS 语法通过。
+  - browser_exec 真实 QA(uvicorn :8000,StaticFiles 读盘无需重启):POST 三条测试收藏 →
+    开面板见三组各 1 项 → 选路线+目的地+住宿(2晚)→ 总账 ¥973(=173+400×2,口径吻合)→
+    保存方案见「已保存方案 1 个」→ 删方案回空 → UI 取消收藏三条 → 列表回空态、方案区隐藏 →
+    回归点 pin:路线卡片+「☆ 收藏路线」+住宿区块正常;全程 window error **0** 条;
+    测试数据已清理,collections 归 0。
+  - 备注:后端 collections.py 未动(GET 的 counts_by_kind 早已够用);行程方案存 localStorage
+    而非 DB——快照对比属展示层需求,避免为 4a 加表;若神朱要跨设备同步方案再立后端任务。
 
 ---
 
 ## [TASK-4b] 预订界面 + 跳转预订(deep-link 聚合)
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE3-PLAN.md 第 2 节,给最终选定的目的地提供「前往预订」入口:列出可用/已收藏的路线与住宿供勾选组合;点击跳转对应外部应用(住宿→携程/Booking/Airbnb;机票/火车票→12306/OTA;自驾→地图导航)。**仅 deep-link 跳转,不代订、不抓实时价**,页面含免责声明。
 - 依赖: TASK-4a。
 - 涉及: 仅 backend/app/static/index.html(如需后端加 deep-link 生成则加纯函数 + 单测)

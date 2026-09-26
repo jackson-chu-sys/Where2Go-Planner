@@ -1,5 +1,5 @@
 """SQLAlchemy 2.0 数据模型:目的地(Place)+ 抓取水位(SegmentFetch)
-+ 收藏(Collection / CollectionCat)+ 住宿(Stay)。
++ 收藏(Collection / CollectionCat)+ 住宿(Stay)+ 行程方案(TripPlan)。
 
 阶段 1a(TASK-1a)落这两张表,存储用 SQLite(见 02-项目计划与架构.md):
 
@@ -16,6 +16,9 @@
   行程的**落脚点**、不进需求四分类,展示要的是价格区间估算而不是分类标签;唯一键
   ``(osm_type, osm_id)``,同一家酒店从不同起点搜到只存一行,``price_estimate`` / ``intro``
   由 LLM 生成后**不再被重抓覆盖**(见 services.stays)。
+* :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
+  把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
+  报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
 
 去重口径(docs/STAGE1-PLAN.md 第 3 节):同一 OSM 实体在同一个城市库里只存一行,
 唯一键 ``(osm_type, osm_id, origin_city)``。环形分段互斥,所以 band 不进唯一键;
@@ -454,4 +457,49 @@ class Stay(Base):
         return (
             f"<Stay {self.osm_type}/{self.osm_id} {self.name!r} {self.kind} "
             f"{self.price_estimate or '未估价'}>"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 行程方案(TASK-5a,M4 第一步):TripPlan
+# --------------------------------------------------------------------------- #
+
+
+class TripPlan(Base):
+    """一份行程方案:把已收藏的「目的地 + 路线 + 住宿」组合起来,给出大致总花费。
+
+    三个引用列存的都是 :class:`Collection` 的主键,**故意不建外键**:收藏是快照、方案是
+    编排,用户在收藏面板里删掉一条收藏不该把方案连带删掉;报价时缺行按"已删除"降级处理
+    (见 :func:`services.trips.quote_plan` 的 ``missing``)。
+
+    总花费**不重新调 ``/api/routes``**,只按 ``Collection.summary`` 里"当时口径"的
+    ``cost_cny`` 与住宿价估算串相加,所以金额恒为**估算**(响应里 ``kind="estimate"`` +
+    ``note`` 双标注)。晚数(``nights``)是**报价时**的参数,不进表:同一份方案问"住 1 晚
+    多少钱""住 3 晚多少钱"都不该产生新行。
+
+    幂等:唯一键 ``name``(``uq_trip_plan_name``)—— 同名再次提交视为"刷新方案"
+    (更新引用与备注、顶 ``updated_at``),``id`` 与 ``created_at`` 保持第一次的值,
+    与 :class:`Collection` / :class:`CollectionCat` 的 upsert 口径一致。
+    """
+
+    __tablename__ = "trip_plans"
+    __table_args__ = (UniqueConstraint("name", name="uq_trip_plan_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False, index=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    place_collection_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    route_collection_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False, default=list)
+    stay_collection_ids: Mapped[list[int]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return (
+            f"<TripPlan {self.id} {self.name!r} "
+            f"路线{len(self.route_collection_ids or [])}段/住宿{len(self.stay_collection_ids or [])}处>"
         )

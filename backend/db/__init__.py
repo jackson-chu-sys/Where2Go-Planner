@@ -3,7 +3,7 @@
 分三个模块:
 
 * :mod:`db.models` —— ``Place`` / ``SegmentFetch`` / ``Collection`` / ``CollectionCat`` /
-  ``Stay`` 表定义;
+  ``Stay`` / ``TripPlan`` 表定义;
 * :mod:`db.base` —— 引擎、会话工厂、建表与 FastAPI 依赖;
 * :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询,
   并按分类/来源(OSM / 种子)计数;收藏的幂等 upsert、按类型过滤与分组维护)。
@@ -50,6 +50,7 @@ from .models import (
     Place,
     SegmentFetch,
     Stay,
+    TripPlan,
     clean_text,
     collection_kind,
     collection_ref_key,
@@ -122,6 +123,7 @@ __all__ = [
     "Collection",
     "CollectionCat",
     "Stay",
+    "TripPlan",
     "database_url",
     "get_engine",
     "get_session",

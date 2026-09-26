@@ -613,3 +613,41 @@ def test_plan_wired_events(html: str) -> None:
 def test_plan_stay_price_parser_midpoint(html: str) -> None:
     parse = html[html.index("function parseStayPrice"):html.index("function planOptionsHtml")]
     assert "match" in parse and "null" in parse, "预估价解析不出必须返回 null(不编数字)"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-4b:前往预订(deep-link 聚合,纯前端;只跳转、不代订、不抓实时价)
+# --------------------------------------------------------------------------- #
+def test_book_dom_and_functions(html: str) -> None:
+    assert 'id="favBookSection"' in html and 'id="favBookList"' in html
+    for fn in ("function renderBookSection(", "function bookLinksForRoute(",
+               "function bookLinksForStay(", "function splitRouteNames(",
+               "function cleanStayName("):
+        assert fn in html, f"缺少 {fn}"
+
+
+def test_book_section_has_disclaimer(html: str) -> None:
+    section = html[html.index('id="favBookSection"'):html.index("</main>")]
+    assert "不代订" in section and "实时" in section, "预订区块必须含免责声明"
+    js_part = html[html.index("function renderBookSection"):]
+    assert "BOOK_DISCLAIMER" in js_part
+
+
+def test_book_links_cover_required_channels(html: str) -> None:
+    route_fn = html[html.index("function bookLinksForRoute"):html.index("function bookLinksForStay")]
+    assert "kyfw.12306.cn" in route_fn, "铁路应跳 12306"
+    assert "flight.qunar.com" in route_fn, "飞机应跳 OTA 机票搜索"
+    assert "amap.com" in route_fn and "google.com/maps" in route_fn, "自驾应跳地图导航"
+    stay_fn = html[html.index("function bookLinksForStay"):html.index("function bookRowHtml")]
+    for host in ("ctrip.com", "booking.com", "airbnb.com"):
+        assert host in stay_fn, f"住宿应可跳 {host}"
+
+
+def test_book_links_open_new_page(html: str) -> None:
+    row = html[html.index("function bookRowHtml"):html.index("function renderBookSection")]
+    assert 'target="_blank"' in row and 'rel="noopener"' in row
+
+
+def test_book_section_refreshes_with_fav_list(html: str) -> None:
+    refresh = html[html.index("async function refreshFavItems"):html.index("async function openFavPanel")]
+    assert "renderBookSection()" in refresh, "收藏列表刷新应同步预订区块"

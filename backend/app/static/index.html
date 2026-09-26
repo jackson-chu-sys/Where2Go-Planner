@@ -127,6 +127,15 @@
   .fp-save-btn{margin-top:9px;padding:6px 13px;font-size:13px;background:#0f766e;color:#fff;border-radius:8px}
   .fp-save-btn:hover{background:#115e59}
   .fp-save-btn:disabled{opacity:.5;cursor:not-allowed}
+  /* 前往预订(TASK-4b):deep-link 聚合,只跳转不代订 */
+  .bk-row{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
+  .bk-nm{font-size:12px;font-weight:700;color:#374151}
+  .bk-links{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
+  .bk-links a{display:inline-block;background:#0f766e;color:#fff;font-size:12px;padding:4px 10px;
+              border-radius:7px;text-decoration:none}
+  .bk-links a:hover{background:#115e59}
+  .bk-links a.alt{background:#e5e7eb;color:#1f2937}
+  .bk-links a.alt:hover{background:#d1d5db}
   /* 住宿区块(TASK-3b):路线面板下方的周边住宿卡片 + AI 预估价强标注 */
   .stay-sec{margin-top:12px;border-top:2px solid #e5e7eb;padding-top:9px}
   .stay-hd{display:flex;align-items:center;gap:7px}
@@ -230,6 +239,13 @@
         <div class="fp-total" id="planTotal"></div>
         <button type="button" class="fp-save-btn" id="planSave" style="display:none">💾 保存为行程方案</button>
         <div class="fp-saved" id="planSaved"></div>
+      </div>
+      <!-- 前往预订(TASK-4b):把收藏的路线/住宿聚合成 deep-link 入口,只跳转、不代订、不抓实时价 -->
+      <div class="fp-plan" id="favBookSection" style="display:none">
+        <div class="fp-plan-ttl">🎫 前往预订</div>
+        <div class="fp-sub">从收藏挑好路线与住宿后,点下面的按钮去官方渠道下单。
+          <b>免责声明:价格仅供参考 · 本页不代订、不抓实时价,一切以官方/OTA 实时为准。</b></div>
+        <div id="favBookList"></div>
       </div>
     </div>
   </div>
@@ -1260,7 +1276,7 @@ async function refreshFavItems(){
   const data=await getJSON("/api/collections");
   state.fav.items=Array.isArray(data.collections)?data.collections:[];
   state.fav.favedKeys=currentFavKeys();
-  if(state.fav.open){renderFavItems();setFavErr("");}
+  if(state.fav.open){renderFavItems();renderBookSection();setFavErr("");}
   syncFavButtons();
   syncStayFavButtons();   // 住宿卡片的「已收藏」态与收藏列表同源刷新(TASK-3b)
 }
@@ -1398,6 +1414,80 @@ function savePlan(){
     created_at:new Date().toISOString().slice(0,16).replace("T"," ")});
   try{window.localStorage.setItem(PLAN_STORE_KEY,JSON.stringify(plans.slice(0,20)));}catch(error){/* 存不下就算了 */}
   renderSavedPlans();
+}
+
+// --------------------------------------------------------------------------- //
+// 前往预订(TASK-4b):把收藏的路线/住宿聚合成外部渠道 deep-link,只跳转、不代订、
+// 不抓实时价。链接全部前端拼(纯 URL 模板,与后端 services/routes.py 的 deep-link
+// 口径一致):自驾→高德/Google 地图导航;铁路→12306 官方查询;飞机→去哪儿机票搜索;
+// 住宿→携程/Booking/Airbnb 搜索(按名称);目的地→高德/Google 搜索。
+// --------------------------------------------------------------------------- //
+const BOOK_DISCLAIMER="价格仅供参考 · 不代订 · 以官方/OTA 实时为准";
+function todayCST(){
+  // 12306/OTA 的出发日:今天(本地即 CST 环境;跨时区最多差一天,用户在官方页可改)
+  return new Date().toISOString().slice(0,10);
+}
+function splitRouteNames(name){
+  // 收藏名形如「上海 → 杭州西湖 · 驾车」(default_collection_name 口径);拆出起终点地名
+  const base=String(name||"").split(" · ")[0];
+  const parts=base.split("→");
+  return {from:(parts[0]||"").trim(),to:(parts[1]||"").trim()};
+}
+function cleanStayName(name){
+  return String(name||"").replace(/^🛏️?\s*/,"").replace(/\s*·\s*住宿\s*$/,"").trim();
+}
+function bookLinksForRoute(item){
+  const nm=splitRouteNames(item.name);
+  const from=encodeURIComponent(nm.from),to=encodeURIComponent(nm.to);
+  const date=todayCST();
+  if(item.mode==="rail"){
+    return [{label:"🚄 12306 查票",cls:"",
+      url:"https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc&fs="+from+"&ts="+to+
+          "&date="+date+"&flag=N,N,Y"}];
+  }
+  if(item.mode==="flight"){
+    return [{label:"✈️ 去哪儿机票",cls:"",
+      url:"https://flight.qunar.com/site/oneway_list.htm?searchDepartureAirport="+from+
+          "&searchArrivalAirport="+to+"&searchDepartureTime="+date+
+          "&nextNDays=0&startSearch=true&from=flight_index"},
+      {label:"🚄 12306(比价)",cls:"alt",
+      url:"https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc&fs="+from+"&ts="+to+
+          "&date="+date+"&flag=N,N,Y"}];
+  }
+  // driving 及未知方式:地图导航
+  return [{label:"🚗 高德导航",cls:"",
+    url:"https://ditu.amap.com/dir?type=car&policy=1&from%5Bname%5D="+from+"&to%5Bname%5D="+to},
+    {label:"🌐 Google 地图",cls:"alt",
+    url:"https://www.google.com/maps/dir/"+from+"/"+to+"/?travelmode=driving"}];
+}
+function bookLinksForStay(item){
+  const q=encodeURIComponent(cleanStayName(item.name));
+  return [{label:"🏨 携程",cls:"",url:"https://so.ctrip.com/s?keyword="+q},
+    {label:"🏨 Booking",cls:"alt",url:"https://www.booking.com/searchresults.html?ss="+q},
+    {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+q+"/homes"}];
+}
+function bookRowHtml(title,links){
+  return '<div class="bk-row"><div class="bk-nm">'+esc(title)+"</div>"+
+    '<div class="bk-links">'+links.map(link=>
+      '<a href="'+esc(link.url)+'" target="_blank" rel="noopener" class="'+esc(link.cls)+'">'+
+      esc(link.label)+"</a>").join("")+"</div></div>";
+}
+function renderBookSection(){
+  const section=$("favBookSection"),box=$("favBookList");
+  if(!section||!box) return;
+  const routes=state.fav.items.filter(item=>favGroupOf(item)==="route");
+  const stays=state.fav.items.filter(item=>favGroupOf(item)==="stay");
+  if(!routes.length&&!stays.length){section.style.display="none";box.innerHTML="";return;}
+  let html="";
+  routes.forEach(item=>{html+=bookRowHtml("路线:"+String(item.name||"(无名)"),bookLinksForRoute(item));});
+  stays.forEach(item=>{
+    const price=item.summary?item.summary.price_estimate:"";
+    html+=bookRowHtml("住宿:"+cleanStayName(item.name)+
+      (price?("("+price+" · AI 预估)"):""),bookLinksForStay(item));
+  });
+  html+='<div class="fp-total-note">'+esc(BOOK_DISCLAIMER)+"</div>";
+  box.innerHTML=html;
+  section.style.display="block";
 }
 
 $("goCity").addEventListener("click",()=>searchCity($("city").value));

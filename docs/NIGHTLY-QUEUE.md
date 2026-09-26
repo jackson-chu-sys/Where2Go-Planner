@@ -9,6 +9,7 @@
 - **R8 写码截止线**:派给 Codex 的任务,启动后 **12 分钟内必须出现第一条写文件动作**(heredoc/tee/`open(...,'w')/patch),看 rollout jsonl 的 exec_command 即可判定。超时 → 立即 kill、按零产物记 needs_review,不许等到 30min 墙钟熔断才收(9/23 的 TASK-3a 就是 37min、274 次调用、零写入才死,后 25 分钟全是白烧)。
 - **R9 投喂式简报**:Codex 任务描述必须含「只读清单」(≤5 个确切文件路径,读完即开工,禁止浏览式探索仓库)+「落地契约」(新文件路径、精确签名/字段名/响应形状)。只写"见 docs/xxx 第 N 节"这类宽指引 = 必熔断。
 - **R10 二次熔断自动降级**:同一任务族 Codex 累计熔断 **2 次** → 第 2 次发生时不再 kill 后留案,当轮直接改由**执行器手写**;needs_review 只留给"手写也失败"或需要神朱拍板的口径问题。
+- **窗口扩容(2026-09-26 神朱拍板)**:`~/.codex/config.toml` 的 `model_context_window` 64K→**256K**、compact 线 48K→200K。复盘证实 qwen3.8-max 本体 1M 窗口,此前"读→压缩→重读"回圈是自设小窗口所致,**旧的 Codex 熔断史(含前端三连败)不再作为拒绝派发的依据**。验证路径:TASK-5a(后端,3a1/3a2 同款)先跑,稳定后 TASK-5b 重测前端;5b 若再熔断则按旧例转手写,不试第三次。
 
 ---
 
@@ -379,6 +380,39 @@
   - 备注:browser daemon 曾连挂 5 个会话(Runtime.evaluate timed out),根因是 16 天前的
     chrome-headless-shell 僵死;kill 后按 hermes-browser-cdp-setup skill 原参数重启
     (端口 9222,新 user-data-dir=/tmp/chrome-cdp-w2g3)即恢复。
+
+---
+
+## [TASK-5a] 行程方案后端:TripPlan 表 + 总账报价 + /api/trip-plans
+
+- 状态: pending
+- 背景: M4 第一步(**纯后端**,不动 index.html)。为 TASK-5b(统一收藏面板+行程方案前端)提供聚合 API。**本任务同时是 Codex 256K 窗口扩容的验证任务**(R8/R9 照旧执行)。
+- 目标: 新表 `TripPlan` 把已收藏的「目的地+路线+住宿」组合成方案,给出**大致总花费**(从 Collection 快照的"当时口径"计算,不重新调 /api/routes)。
+- **只读清单(只准读这 5 个,读完立即写码;AGENTS.md 先读)**: `backend/db/models.py`、`backend/db/repository.py`、`backend/app/api/collections.py`、`backend/services/stays.py`、`backend/test_collections.py`。禁止其他探索性 cat/grep,禁止跑全量 pytest 超过 2 次。
+- 落地契约(照此实现,不得自创字段/路由):
+  - `db/models.py` 追加 `TripPlan`:表名 `trip_plans`;列 `id, name(String255,非空,unique 约束 uq_trip_plan_name), note(Text,可空), place_collection_id(Integer,可空), route_collection_ids(JSON list,默认空), stay_collection_ids(JSON list,默认空), created_at/updated_at(照 Collection 风格 utcnow/onupdate)`。**引用的是 collections.id,不建 FK**(与收藏快照同口径:删收藏不连带删方案,报价时缺行按"已删除"处理)。
+  - 新建 `services/trips.py`:
+    - `def parse_nightly_price(price_estimate: Optional[str]) -> tuple[Optional[float], Optional[float]]` — 从「约¥250-450/晚」「¥300/晚」等文案解析区间下限/上限,解析失败返回 `(None,None)`(不猜数)。
+    - `def quote_plan(session: Session, place_ref, route_refs, stay_refs, *, nights: int = 1) -> dict` — 读 Collection 行快照:交通=`sum(summary.cost_cny)`(缺项跳过);住宿=各 stay 的价下限均值×nights(有上限再给上限档);输出 `{"total_cny_low","total_cny_high","transport_cny","stay_nights","per_stay":[{collection_id,name,price_estimate,low,high}],"missing":[已删除的id],"kind":"estimate","note":"按收藏快照的当时口径估算 · 仅供参考"}`;nights 越界(0<nights≤60)抛 ValueError。
+    - `def upsert_trip_plan(session, ...)` / `def trip_plan_to_dict(row, quote=None)`(repository 风格)。
+  - 新建 `app/api/trips.py` + `app/main.py` 挂 `include_router(trips.router, prefix="/api")`:
+    - `POST /api/trip-plans` 裸 JSON `{name, note?, place_collection_id?, route_collection_ids?, stay_collection_ids?, nights?}` → 建/按 name upsert,响应含 `quote`;重名=刷新(幂等,仿 collections)。
+    - `GET /api/trip-plans?limit=` 列表(新在前,每项带 quote 与 counts);`GET /api/trip-plans/{id}` 详情;**`DELETE /api/trip-plans/{id}`**。
+    - 校验口径照 collections.py:裸 Body、400 中文报错、引用不存在→400、响应带 note。本模块**不触网**。
+  - `backend/test_trips.py`:全 mock ≥25 用例,覆盖:价文案解析(各种脏输入)、报价求和/上下限、引用被删的降级、upsert 幂等、API 校验、nights 边界;**既有测试零改动**。
+- 验收: `cd backend && ../.venv/bin/python -m pytest -q` 全绿(基线 **434 passed** 只增不减);不动 `app/static/` 与 `app/api/collections.py`;commit 消息带 TASK-5a。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-5b] 统一收藏面板 + 行程方案 UI(前端重测 Codex)
+
+- 状态: pending(依赖 5a done)
+- 背景: **前端任务重测 Codex**(256K 窗口下重验 9/12、9/19、9/23 的旧熔断结论;熔断则当轮转执行器手写,不试第三次——本次是第 1 次机会)。
+- 目标: index.html 收藏弹层升级:①按 目的地/路线/住宿 分组展示(现有分组基础上加对比字段:路线时长/费用、住宿价);②新建「行程方案」tab:勾选已收藏的 目的地+路线+住宿 → POST /api/trip-plans(nights 输入)→ 卡片显示总花费区间与构成;③方案可删。免责口径沿用。
+- 涉及: 仅 `backend/app/static/index.html` + `backend/test_frontend_routes.py` 静态断言(照 TASK-3b 追加模式)。
+- 验收: 1) 面板分组含对比字段 2) 能建方案看总价 3) 0 JS 报错、既有收藏/住宿/路线功能不回归 4) pytest 全绿(基线含 5a 增量)5) browser_exec QA 全流程;若派 Codex:R8 写码截止线**放宽到 20 分钟**(前端文件 26K tokens,读入属正常动作;仍零写入即 kill)。
+- 结果: (待夜班回填)
 
 ---
 

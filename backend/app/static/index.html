@@ -114,11 +114,8 @@
   .fp-plan-ttl{font-weight:700;font-size:14px}
   .fp-plan-row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
   .fp-plan-row label{font-size:12px;color:#374151;min-width:52px}
-  .fp-plan-row select,.fp-plan-row input{flex:1;min-width:120px;padding:5px 8px;font-size:12px;
+  .fp-plan-row input{flex:1;min-width:120px;padding:5px 8px;font-size:12px;
     border:1px solid #d1d5db;border-radius:7px;background:#fff}
-  .fp-total{margin-top:10px;background:#f0fdfa;border:1px solid #99f6e4;border-radius:10px;
-            padding:9px 11px;font-size:13px;display:none}
-  .fp-total b{color:#0f766e;font-size:16px}
   .fp-total-note{color:#92400e;font-size:11px;margin-top:4px}
   .fp-saved{margin-top:10px}
   .fp-saved-item{border:1px dashed #99f6e4;background:#fff;border-radius:9px;padding:7px 9px;
@@ -127,6 +124,29 @@
   .fp-save-btn{margin-top:9px;padding:6px 13px;font-size:13px;background:#0f766e;color:#fff;border-radius:8px}
   .fp-save-btn:hover{background:#115e59}
   .fp-save-btn:disabled{opacity:.5;cursor:not-allowed}
+  /* 行程方案(TASK-5b):tab 切换 + 勾选式组合 + 后端 quote 卡片 */
+  .fp-tabs{display:flex;gap:6px;margin-top:11px;border-bottom:1px solid #e5e7eb}
+  .fp-tab{background:#f3f4f6;color:#374151;border-radius:8px 8px 0 0;padding:7px 13px;font-size:13px}
+  .fp-tab:hover{background:#e5e7eb}
+  .fp-tab.sel{background:#0f766e;color:#fff;font-weight:700}
+  .fp-pick{display:flex;gap:8px;align-items:flex-start;margin:7px 0 0;padding:7px 9px;
+           border:1px solid #e5e7eb;border-radius:9px;background:#fff;cursor:pointer;font-weight:400}
+  .fp-pick:hover{border-color:#5eead4;background:#f0fdfa}
+  .fp-pick.on{border-color:#0f766e;background:#f0fdfa}
+  .fp-pick input{width:auto;flex:0 0 auto;margin:3px 0 0}
+  .fp-pick-bd{display:block;flex:1;min-width:0}
+  .fp-pick-nm{display:block;font-size:13px;font-weight:700;color:#1f2937}
+  .fp-pick-meta{display:block;color:#6b7280;font-size:11px;margin-top:2px}
+  .fp-pick-sum{margin-top:9px;font-size:12px;color:#374151}
+  .fp-quote{margin-top:10px;border:1px solid #99f6e4;background:#f0fdfa;border-radius:10px;padding:9px 11px}
+  .fp-quote-ttl{font-size:13px;color:#374151}
+  .fp-quote-ttl b{color:#0f766e;font-size:17px}
+  .fp-quote-row{font-size:12px;color:#374151;margin-top:5px}
+  .fp-quote-row b{color:#0f766e}
+  .fp-quote-miss{font-size:11px;color:#92400e;background:#fef3c7;border-radius:7px;padding:5px 7px;margin-top:6px}
+  .fp-recalc{margin-top:7px;margin-right:7px;padding:4px 11px;font-size:12px;background:#e0f2fe;color:#075985;border-radius:7px}
+  .fp-recalc:hover{background:#bae6fd}
+  .fp-recalc:disabled{opacity:.5;cursor:wait}
   /* 前往预订(TASK-4b):deep-link 聚合,只跳转不代订 */
   .bk-row{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
   .bk-nm{font-size:12px;font-weight:700;color:#374151}
@@ -157,7 +177,7 @@
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段4a · 收藏对比 + 行程方案总账)</span></h1>
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段5b · 收藏对比 + 行程方案入库)</span></h1>
   <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
@@ -179,7 +199,7 @@
         <div class="inline">
           <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass 四分类并集">重新抓取</button>
           <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
-          <button id="openFav" class="secondary" title="查看/管理收藏的路线与目的地(POST/GET/DELETE /api/collections)">⭐ 我的收藏</button>
+          <button id="openFav" class="secondary" title="收藏对比 + 勾选组合行程方案(POST/GET/DELETE /api/collections、/api/trip-plans)">⭐ 我的收藏</button>
         </div></div>
     </div>
     <div class="status" id="status">初始化…</div>
@@ -223,29 +243,52 @@
         <div class="rp-ttl" id="favPanelTitle">⭐ 我的收藏</div>
         <button type="button" id="favPanelClose" class="rp-x" title="关闭收藏列表">✕</button>
       </div>
-      <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
-      <div id="favPanelErr" class="fp-err" style="display:none"></div>
-      <div id="favPanelList"></div>
-      <!-- 行程方案(TASK-4a):把「目的地 + 路线 + 住宿」组合成一个方案,算大致总花费 -->
-      <div class="fp-plan" id="favPlanSection" style="display:none">
-        <div class="fp-plan-ttl">🧳 组合行程方案</div>
-        <div class="fp-sub">从收藏里各选一项,合计大致总花费(全部为估算口径,以官方实时价为准)。</div>
-        <div class="fp-plan-row"><label for="planDest">目的地</label>
-          <select id="planDest"><option value="">(不选)</option></select></div>
-        <div class="fp-plan-row"><label for="planRoute">路线</label>
-          <select id="planRoute"><option value="">(不选)</option></select></div>
-        <div class="fp-plan-row"><label for="planStay">住宿</label>
-          <select id="planStay"><option value="">(不选)</option></select></div>
-        <div class="fp-total" id="planTotal"></div>
-        <button type="button" class="fp-save-btn" id="planSave" style="display:none">💾 保存为行程方案</button>
-        <div class="fp-saved" id="planSaved"></div>
+      <!-- tab(TASK-5b):「我的收藏」对比 / 「行程方案」组合(后端持久化),互斥显示 -->
+      <div class="fp-tabs" role="tablist" aria-label="收藏与行程方案">
+        <button type="button" id="favTabFav" class="fp-tab sel" role="tab" aria-selected="true"
+                aria-controls="favPaneFav" title="按类型分组看收藏快照(路线时长/费用、住宿预估价)">⭐ 我的收藏</button>
+        <button type="button" id="favTabPlan" class="fp-tab" role="tab" aria-selected="false"
+                aria-controls="favPanePlan"
+                title="勾选收藏组合成方案(POST/GET/DELETE /api/trip-plans,后端持久化)">🧳 行程方案</button>
       </div>
-      <!-- 前往预订(TASK-4b):把收藏的路线/住宿聚合成 deep-link 入口,只跳转、不代订、不抓实时价 -->
-      <div class="fp-plan" id="favBookSection" style="display:none">
-        <div class="fp-plan-ttl">🎫 前往预订</div>
-        <div class="fp-sub">从收藏挑好路线与住宿后,点下面的按钮去官方渠道下单。
-          <b>免责声明:价格仅供参考 · 本页不代订、不抓实时价,一切以官方/OTA 实时为准。</b></div>
-        <div id="favBookList"></div>
+      <div id="favPaneFav" role="tabpanel" aria-labelledby="favTabFav">
+        <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
+        <div id="favPanelErr" class="fp-err" style="display:none"></div>
+        <div id="favPanelList"></div>
+        <!-- 前往预订(TASK-4b):把收藏的路线/住宿聚合成 deep-link 入口,只跳转、不代订、不抓实时价 -->
+        <div class="fp-plan" id="favBookSection" style="display:none">
+          <div class="fp-plan-ttl">🎫 前往预订</div>
+          <div class="fp-sub">从收藏挑好路线与住宿后,点下面的按钮去官方渠道下单。
+            <b>免责声明:价格仅供参考 · 本页不代订、不抓实时价,一切以官方/OTA 实时为准。</b></div>
+          <div id="favBookList"></div>
+        </div>
+      </div>
+      <!-- 行程方案(TASK-5b):勾选收藏 + 晚数 → POST /api/trip-plans(重名=刷新幂等)
+           → 卡片展示后端 quote(总花费区间 / 交通 / 每处住宿 / 已删除引用);列表来自 GET,可 DELETE -->
+      <div id="favPanePlan" role="tabpanel" aria-labelledby="favTabPlan" style="display:none">
+        <div class="fp-plan" id="favPlanSection">
+          <div class="fp-plan-ttl">🧳 组合行程方案</div>
+          <div class="fp-sub">勾选已收藏的目的地 / 路线 / 住宿(路线与住宿可多选),填晚数后保存到后端;
+            <b>同名方案再次保存 = 刷新引用(幂等)</b>。金额一律由后端按收藏快照估算返回,前端不自己拼数字。</div>
+          <div id="planErr" class="fp-err" style="display:none"></div>
+          <div class="fp-plan-row"><label for="planName">方案名</label>
+            <input id="planName" maxlength="80" autocomplete="off"
+                   placeholder="必填,如:上海→杭州 周末 2 晚(重名=刷新同一份)"></div>
+          <div class="fp-plan-row"><label for="planNights">住几晚</label>
+            <input id="planNights" type="number" min="1" max="60" step="1" value="1"
+                   title="晚数只是报价参数、不进库:1~60 晚,与后端 MIN_NIGHTS/MAX_NIGHTS 同口径"></div>
+          <div class="fp-plan-row"><label for="planNote">备注</label>
+            <input id="planNote" maxlength="200" autocomplete="off" placeholder="可选:同行人 / 预算 / 提醒"></div>
+          <div id="planPicker"></div>
+          <div class="fp-pick-sum" id="planSummary"></div>
+          <button type="button" class="fp-save-btn" id="planSave" disabled>💾 保存方案(POST /api/trip-plans)</button>
+          <div id="planQuote" style="display:none"></div>
+        </div>
+        <div class="fp-saved" id="planSaved">
+          <div class="fp-grp-ttl">已保存方案<span class="fp-grp-cnt" id="planCount"></span></div>
+          <div id="planList"></div>
+          <div class="fp-total-note" id="planApiNote"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -258,7 +301,9 @@
   路线:驾车时长/里程来自 OSRM 真实路网(费用为估算),铁路/飞机为经验估算,
   一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价 ·
   住宿:OSM tourism 检索目的地周边落脚点,价格与简介为 AI 预估参考价
-  (强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」),不代订、不抓 OTA 实时价
+  (强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」),不代订、不抓 OTA 实时价 ·
+  行程方案:勾选收藏组合后存进后端(SQLite),总花费由后端按收藏快照的「当时口径」估算
+  (quote.kind=estimate + note 双标注),仅供参考、不代订不抓实时价
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -300,7 +345,8 @@ const STAYS_EST_FALLBACK="AI 预估 · 仅供参考 · 以 OTA 实时为准";   
 const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
              places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0},
              stays:{token:0,loadedKey:null,payload:null},
-             fav:{open:false,items:[],busy:false,favedKeys:{}}};
+             fav:{open:false,items:[],busy:false,favedKeys:{}},
+             tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false}};
 let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
 
 function esc(value){
@@ -1238,12 +1284,10 @@ function renderFavItems(){
   if(!box) return;
   if(!state.fav.items.length){
     box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin → 路线面板里点「☆ 收藏路线」/「☆ 收藏住宿」。</div>';
-    $("favPlanSection").style.display="none";
     return;
   }
   // 按类型分组(TASK-4a):路线 / 目的地 / 住宿。住宿是 kind=place + 🛏️ 前缀/addFavStay 的 summary 指纹
-  const groups={legs:[],place:[],stay:[]};
-  state.fav.items.forEach(item=>{const g=favGroupOf(item);groups[g==="route"?"legs":g].push(item);});
+  const groups=favGroups();
   const titles={legs:"🚗 路线收藏",place:"📍 目的地收藏",stay:"🛏️ 住宿收藏"};
   let html="";
   ["legs","place","stay"].forEach(key=>{
@@ -1254,7 +1298,12 @@ function renderFavItems(){
       rows.map(favItemHtml).join("")+"</div>";
   });
   box.innerHTML=html;
-  syncPlanControls();
+}
+// 收藏按类型分组(收藏面板与行程方案勾选面共用同一套分组口径)
+function favGroups(){
+  const groups={legs:[],place:[],stay:[]};
+  state.fav.items.forEach(item=>{const g=favGroupOf(item);groups[g==="route"?"legs":g].push(item);});
+  return groups;
 }
 // 收藏分组判定:route → 路线;place 里带住宿指纹(名称 🛏️ 前缀或 summary.stay_kind/price_estimate)→ 住宿;其余 → 目的地
 function favGroupOf(item){
@@ -1276,7 +1325,11 @@ async function refreshFavItems(){
   const data=await getJSON("/api/collections");
   state.fav.items=Array.isArray(data.collections)?data.collections:[];
   state.fav.favedKeys=currentFavKeys();
-  if(state.fav.open){renderFavItems();renderBookSection();setFavErr("");}
+  if(state.fav.open){
+    renderFavItems();renderBookSection();setFavErr("");
+    renderPlanPicker();                                  // 勾选面与收藏同源(TASK-5b)
+    if(state.tripPlan.tab==="plan") loadTripPlans();     // 删收藏会让方案 quote 出现 missing,顺手刷一次
+  }
   syncFavButtons();
   syncStayFavButtons();   // 住宿卡片的「已收藏」态与收藏列表同源刷新(TASK-3b)
 }
@@ -1306,114 +1359,320 @@ async function deleteFav(id){
 }
 
 // --------------------------------------------------------------------------- //
-// 行程方案(TASK-4a):从收藏里选「目的地 + 路线 + 住宿」组合成方案,算大致总花费。
-// 费用全是快照估算:路线 = summary.cost_cny(单程);住宿 = AI 预估价区间取中值 × 晚数。
-// 方案存 localStorage(纯前端,不动后端);总账带「估算」标注,不代订不抓实时价。
+// 行程方案(TASK-5b,M4):勾选收藏 → POST /api/trip-plans(**后端持久化**,重名 = 刷新幂等)
+// → 卡片展示后端返回的 quote:总花费区间 total_cny_low ~ total_cny_high、构成
+// (transport_cny / per_stay 逐处 / missing「已删除」提示)、kind + note 估算标注。
+// 金额一律由后端算(交通 = 各路线收藏快照 cost_cny 之和;住宿 = 价下限均值 × 晚数),
+// 前端不自己解析预估价、不再把方案存在浏览器本地 —— 单一事实源在后端 SQLite。
+// 列表 GET /api/trip-plans(新的在前)、删除 DELETE /api/trip-plans/{id};失败一律落
+// #planErr 文案(后端 400 的中文报错原样透出),不 alert、不抛 JS 错。
 // --------------------------------------------------------------------------- //
-const PLAN_STORE_KEY="w2g_trip_plans";
-const PLAN_NIGHTS_DEFAULT=1;
-function parseStayPrice(text){
-  // "约¥250-450/晚" → 区间中值;解析不出返回 null(不编数字)
-  const m=String(text||"").match(/(\d+)\s*[-~—]\s*(\d+)/);
-  if(m) return (Number(m[1])+Number(m[2]))/2;
-  const single=String(text||"").match(/(\d+)/);
-  return single?Number(single[1]):null;
+const PLAN_NIGHTS_MIN=1;      // 与后端 services.trips.MIN_NIGHTS 同口径
+const PLAN_NIGHTS_MAX=60;     // 与后端 services.trips.MAX_NIGHTS 同口径
+const PLAN_NIGHTS_DEFAULT=1;  // 与后端 services.trips.DEFAULT_NIGHTS 同口径
+const PLAN_LIST_LIMIT=50;     // GET /api/trip-plans?limit=(后端上限 200,面板取最近 50 份够用)
+const PLAN_QUOTE_NOTE_FALLBACK="按收藏快照的当时口径估算 · 仅供参考";   // 后端 quote.note 缺失时兜底
+const PLAN_SAVE_LABEL="💾 保存方案(POST /api/trip-plans)";
+// 勾选分组 → 后端请求体字段:place 是单值 id,legs/stay 是整数数组(字段名与 app/api/trips.py 一致)
+const PLAN_PICK_GROUPS=[
+  {key:"place",field:"place_collection_id",multi:false,title:"📍 去哪儿(目的地 · 单选)"},
+  {key:"legs",field:"route_collection_ids",multi:true,title:"🚗 怎么去(路线 · 可多段)"},
+  {key:"stay",field:"stay_collection_ids",multi:true,title:"🛏️ 住哪儿(住宿 · 可多处)"}
+];
+function planNameText(){return String($("planName")?$("planName").value:"").trim();}
+function planNoteText(){return String($("planNote")?$("planNote").value:"").trim();}
+// 晚数:只认 1~60(后端 resolve_nights 同口径),空值/坏值退回默认 1;晚数不进库,只是报价参数
+function planNights(){
+  const input=$("planNights");
+  const value=Math.round(num(input?input.value:PLAN_NIGHTS_DEFAULT));
+  if(!isFinite(value)) return PLAN_NIGHTS_DEFAULT;
+  return Math.max(PLAN_NIGHTS_MIN,Math.min(PLAN_NIGHTS_MAX,value));
 }
-function planOptionsHtml(rows,selected){
-  return '<option value="">(不选)</option>'+rows.map(item=>
-    '<option value="'+Number(item.id)+'"'+(Number(selected)===Number(item.id)?" selected":"")+">"+
-    esc(item.name||"(无名)")+"</option>").join("");
+function planPickedIds(){
+  const picked={place:[],legs:[],stay:[]};
+  document.querySelectorAll("#planPicker .js-plan-pick:checked").forEach(box=>{
+    const group=box.getAttribute("data-group"),id=Number(box.getAttribute("data-id"));
+    if(!picked[group]||!isFinite(id)||id<=0||picked[group].indexOf(id)>=0) return;
+    picked[group].push(id);
+  });
+  return picked;
 }
-function syncPlanControls(){
-  const section=$("favPlanSection");
-  if(!section) return;
-  const groups={legs:[],place:[],stay:[]};
-  state.fav.items.forEach(item=>{const g=favGroupOf(item);groups[g==="route"?"legs":g].push(item);});
-  const total=groups.legs.length+groups.place.length+groups.stay.length;
-  section.style.display=total?"block":"none";
-  if(!total) return;
-  const keep={dest:$("planDest").value,route:$("planRoute").value,stay:$("planStay").value};
-  $("planDest").innerHTML=planOptionsHtml(groups.place,keep.dest);
-  $("planRoute").innerHTML=planOptionsHtml(groups.legs,keep.route);
-  $("planStay").innerHTML=planOptionsHtml(groups.stay,keep.stay);
-  if(!$("planNights")){
-    const row=document.createElement("div");
-    row.className="fp-plan-row";
-    row.innerHTML='<label for="planNights">住几晚</label>'+
-      '<input id="planNights" type="number" min="1" max="30" step="1" value="'+PLAN_NIGHTS_DEFAULT+'">';
-    $("planStay").closest(".fp-plan-row").after(row);
-    $("planNights").addEventListener("change",updatePlanTotal);
+// 某一组勾了几个(中括号取值:分组键是数据,不写死成属性名)
+function pickedCount(picked,key){return (picked[key]||[]).length;}
+function planPickedTotal(){
+  const picked=state.tripPlan.picked||{place:[],legs:[],stay:[]};
+  return PLAN_PICK_GROUPS.reduce((sum,group)=>sum+pickedCount(picked,group.key),0);
+}
+// 勾选行:名称 + 对比字段(路线时长/费用/里程、住宿预估价),勾过的重渲染后仍保持勾选
+function planPickRowHtml(item,group){
+  const summary=item.summary||{};
+  const id=Number(item.id);
+  const picked=(state.tripPlan.picked[group.key]||[]).indexOf(id)>=0;
+  const meta=(group.key==="stay")
+    ? ("预估价 "+esc(summary.price_estimate||"暂无 AI 预估价")+" · "+esc(STAYS_EST_FALLBACK))
+    : ((group.key==="legs")
+      ? ("时长 "+esc(fmtDuration(summary.duration_min))+" · 费用 "+esc(fmtCost(summary.cost_cny))+
+         " · 里程 "+esc(fmtKm(summary.distance_km)))
+      : "目的地收藏 · 不计费用,只标记「去哪儿」");
+  return '<label class="fp-pick'+(picked?" on":"")+'">'+
+    '<input type="checkbox" class="js-plan-pick" data-group="'+group.key+'" data-id="'+id+'"'+
+      (picked?" checked":"")+' title="'+
+      (group.multi?"勾选后计入方案(可多选)":"去哪儿只能挂一个:后端 place_collection_id 是单值")+'">'+
+    '<span class="fp-pick-bd"><span class="fp-pick-nm">'+esc(item.name||"(无名)")+"</span>"+
+    '<span class="fp-pick-meta">'+meta+"</span></span></label>";
+}
+function renderPlanPicker(){
+  const box=$("planPicker");
+  if(!box) return;
+  if(!state.fav.items.length){
+    box.innerHTML='<div class="fp-empty">还没有收藏可组合:先在「⭐ 我的收藏」tab 里收藏路线与住宿。</div>';
+  }else{
+    const groups=favGroups();
+    box.innerHTML=PLAN_PICK_GROUPS.map(group=>{
+      const rows=groups[group.key]||[];
+      if(!rows.length) return "";
+      return '<div class="fp-grp"><div class="fp-grp-ttl">'+group.title+
+        '<span class="fp-grp-cnt">'+rows.length+" 项</span></div>"+
+        rows.map(item=>planPickRowHtml(item,group)).join("")+"</div>";
+    }).join("");
   }
-  updatePlanTotal();
-  renderSavedPlans();
+  syncPlanPicked();
 }
-function planSelection(){
-  const byId={};
-  state.fav.items.forEach(item=>{byId[Number(item.id)]=item;});
-  return {dest:byId[Number($("planDest").value)]||null,
-          leg:byId[Number($("planRoute").value)]||null,
-          stay:byId[Number($("planStay").value)]||null,
-          nights:Math.max(1,Math.min(30,Math.round(num($("planNights")?$("planNights").value:PLAN_NIGHTS_DEFAULT))||PLAN_NIGHTS_DEFAULT))};
+// 勾选态收进 state(重渲染不丢)+ 汇总文案 + 保存按钮可用性
+function syncPlanPicked(){
+  state.tripPlan.picked=planPickedIds();
+  document.querySelectorAll("#planPicker .fp-pick").forEach(label=>{
+    const box=label.querySelector(".js-plan-pick");
+    label.classList.toggle("on",!!(box&&box.checked));
+  });
+  const summary=$("planSummary");
+  if(summary) summary.textContent=planSummaryText(state.tripPlan.picked);
+  setPlanBusy(state.tripPlan.busy);
 }
-function updatePlanTotal(){
-  const box=$("planTotal"),saveBtn=$("planSave");
+function planSummaryText(picked){
+  const place=pickedCount(picked,"place"),legs=pickedCount(picked,"legs"),stays=pickedCount(picked,"stay");
+  if(!place&&!legs&&!stays){
+    return "还没有勾选:在上面列表里勾一下(路线可多段、住宿可多处,目的地单选)。";
+  }
+  return "已选:📍 "+place+" 个目的地 · 🚗 "+legs+" 段路线 · 🛏️ "+stays+
+    " 处住宿 · 住 "+planNights()+" 晚(金额由后端按收藏快照估算)";
+}
+// 目的地是单值:勾一个就把同组其它勾去掉(比"静默只取第一个"诚实)
+function onPlanPickChange(event){
+  const box=event.target;
+  if(!box||!box.classList||!box.classList.contains("js-plan-pick")) return;
+  if(box.getAttribute("data-group")==="place"&&box.checked){
+    document.querySelectorAll('#planPicker .js-plan-pick[data-group="place"]').forEach(other=>{
+      if(other!==box) other.checked=false;
+    });
+  }
+  syncPlanPicked();
+}
+function setPlanErr(message){
+  const box=$("planErr");
   if(!box) return;
-  const sel=planSelection();
-  if(!sel.dest&&!sel.leg&&!sel.stay){box.style.display="none";saveBtn.style.display="none";return;}
-  const routeCost=num(sel.leg&&sel.leg.summary?sel.leg.summary.cost_cny:NaN);
-  const nightPrice=sel.stay?parseStayPrice(sel.stay.summary?sel.stay.summary.price_estimate:null):null;
-  const stayCost=(nightPrice!==null)?nightPrice*sel.nights:null;
-  const parts=[];
-  if(sel.dest) parts.push("📍 "+esc(sel.dest.name||"目的地"));
-  if(sel.leg) parts.push((ROUTE_MODE_EMOJI[sel.leg.mode]||"")+" 交通 "+
-    esc(isFinite(routeCost)?fmtCost(routeCost):"费用未知")+"(单程·估算)");
-  if(sel.stay) parts.push("🛏️ 住宿 "+esc(nightPrice!==null?(fmtCost(nightPrice)+"/晚×"+sel.nights+"晚"):"预估价缺失"));
-  const totalKnown=isFinite(routeCost)?routeCost:0;
-  const total=totalKnown+(stayCost||0);
-  const missing=[];
-  if(sel.leg&&!isFinite(routeCost)) missing.push("路线费用");
-  if(sel.stay&&nightPrice===null) missing.push("住宿预估价");
-  box.innerHTML='<div>大致总花费:<b>'+(sel.leg||sel.stay?fmtCost(total):"—")+"</b>"+
-    (missing.length?('(缺 '+missing.join("、")+",未计入)"):"")+"</div>"+
-    "<div>"+parts.join(" · ")+"</div>"+
-    '<div class="fp-total-note">估算口径:交通=收藏快照的路线费用(单程,往返请自行×2);'+
-    "住宿=AI 预估价区间中值×晚数。仅供参考,以官方/OTA 实时价为准。</div>";
+  box.textContent=message||"";
+  box.style.display=message?"block":"none";
+}
+function setPlanBusy(busy){
+  state.tripPlan.busy=!!busy;
+  const button=$("planSave");
+  if(!button) return;
+  button.disabled=state.tripPlan.busy||!planPickedTotal();
+  button.textContent=state.tripPlan.busy?"⏳ 正在写入后端…":PLAN_SAVE_LABEL;
+}
+// 金额区间:上限缺失或与下限相同就只显示一个数;认不出来显示 —(不编数字)
+function moneyRange(low,high){
+  const first=num(low),second=num(high);
+  if(!isFinite(first)) return "—";
+  return (isFinite(second)&&second>first)?(fmtCost(first)+" ~ "+fmtCost(second)):fmtCost(first);
+}
+function planPerStayHtml(stay){
+  const counted=isFinite(num(stay.low))
+    ? (" → 计入 <b>"+moneyRange(stay.low,stay.high)+"</b>/晚")
+    : "(未计入总价)";
+  // 收藏名自带 🛏️ 前缀,复用前往预订那套清洗,免得渲染成「🛏️ 🛏️ xxx」
+  const name=cleanStayName(stay.name)||("收藏 #"+Number(stay.collection_id));
+  return '<div class="fp-quote-row">🛏️ '+esc(name)+
+    " · "+esc(stay.price_estimate||"暂无报价")+counted+"</div>";
+}
+// quote 卡片:总花费区间 + 构成 + 每处住宿 + 已删除引用 + 后端 note(原样展示,不改写口径)
+function planQuoteHtml(quote,plan){
+  if(!quote) return "";
+  const counts=(plan&&plan.counts)||{};
+  const perStay=Array.isArray(quote.per_stay)?quote.per_stay:[];
+  const missing=Array.isArray(quote.missing)?quote.missing:[];
+  const badge=KIND_BADGE[quote.kind]||KIND_BADGE.estimate;
+  return '<div class="fp-quote">'+
+    '<div class="fp-quote-ttl">大致总花费:<b>'+moneyRange(quote.total_cny_low,quote.total_cny_high)+
+      '</b> <span class="badge '+badge.cls+'">'+esc(badge.text)+"</span>"+
+      ((plan&&plan.name)?(" · "+esc(plan.name)):"")+"</div>"+
+    '<div class="fp-quote-row">构成:🚗 交通 <b>'+fmtCost(quote.transport_cny)+
+      "</b>(各路线收藏快照 cost_cny 之和,单程)· 🛏️ 住宿按 <b>"+
+      Number(quote.stay_nights||PLAN_NIGHTS_DEFAULT)+"</b> 晚 · 共 "+
+      Number(counts.routes||0)+" 段路线 / "+Number(counts.stays||0)+" 处住宿</div>"+
+    perStay.map(planPerStayHtml).join("")+
+    (missing.length
+      ? ('<div class="fp-quote-miss">⚠️ 引用的收藏已删除 '+missing.length+" 条(未计入报价):"+
+         missing.map(id=>"#"+Number(id)).join("、")+" —— 方案本身照旧保留。</div>")
+      : "")+
+    '<div class="fp-total-note">'+esc(quote.note||PLAN_QUOTE_NOTE_FALLBACK)+
+      "(quote.kind="+esc(quote.kind||"estimate")+")</div>"+
+    "</div>";
+}
+function renderPlanQuote(plan,quote,refreshed){
+  const box=$("planQuote");
+  if(!box) return;
+  if(!quote){box.innerHTML="";box.style.display="none";return;}
+  box.innerHTML=(refreshed
+    ? '<div class="fp-quote-row">ℹ️ 已有同名方案 → 按幂等口径刷新了引用(id 与创建时间不变)。</div>'
+    : '<div class="fp-quote-row">✅ 方案已存进后端(SQLite),换设备/重开页面还在。</div>')+
+    planQuoteHtml(quote,plan);
   box.style.display="block";
-  saveBtn.style.display=(sel.dest||sel.leg||sel.stay)?"inline-block":"none";
 }
-function loadSavedPlans(){
+// 请求体:{name, note?, place_collection_id?, route_collection_ids?, stay_collection_ids?, nights?}
+function planPayload(){
+  const picked=planPickedIds();
+  const body={name:planNameText(),nights:planNights()};
+  const note=planNoteText();
+  if(note) body.note=note;
+  PLAN_PICK_GROUPS.forEach(group=>{
+    const ids=picked[group.key]||[];
+    if(!ids.length) return;
+    body[group.field]=group.multi?ids:ids[0];
+  });
+  return body;
+}
+async function postTripPlan(body){
+  return sendJSON("/api/trip-plans",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+}
+async function savePlan(){
+  const body=planPayload();
+  if(!body.name){
+    setPlanErr("缺少方案名:后端要求 name 非空(同名再次提交 = 刷新同一份方案)。");
+    return;
+  }
+  setPlanBusy(true);setPlanErr("");
   try{
-    const raw=window.localStorage.getItem(PLAN_STORE_KEY);
-    const list=raw?JSON.parse(raw):[];
-    return Array.isArray(list)?list:[];
-  }catch(error){return [];}
+    const result=await postTripPlan(body);
+    renderPlanQuote(result.trip_plan,result.quote,result.created===false);
+    await loadTripPlans();
+  }catch(error){
+    setPlanErr("保存方案失败:"+((error&&error.message)||error));   // 400 的中文报错原样透出
+  }finally{
+    setPlanBusy(false);
+  }
 }
-function renderSavedPlans(){
-  const box=$("planSaved");
+async function loadTripPlans(){
+  const box=$("planList");
+  if(box&&!state.tripPlan.items.length){
+    box.innerHTML='<div class="fp-empty">正在读取方案(GET /api/trip-plans)…</div>';
+  }
+  try{
+    const result=await getJSON("/api/trip-plans?limit="+PLAN_LIST_LIMIT);
+    state.tripPlan.items=Array.isArray(result.trip_plans)?result.trip_plans:[];
+    state.tripPlan.note=(typeof result.note==="string")?result.note:"";
+    setPlanErr("");
+  }catch(error){
+    state.tripPlan.items=[];
+    state.tripPlan.note="";
+    setPlanErr("方案列表读取失败:"+((error&&error.message)||error));
+  }
+  renderTripPlans();
+}
+function tripPlanCardHtml(plan){
+  const counts=plan.counts||{};
+  const quote=plan.quote||null;
+  const badge=quote?(KIND_BADGE[quote.kind]||KIND_BADGE.estimate):KIND_BADGE.estimate;
+  const missing=(quote&&Array.isArray(quote.missing))?quote.missing:[];
+  return '<div class="fp-saved-item" data-id="'+Number(plan.id)+'">'+
+    "<b>"+esc(plan.name||"(未命名方案)")+"</b>"+
+    (quote
+      ? ('<div class="fp-quote-row">总花费 <b>'+moneyRange(quote.total_cny_low,quote.total_cny_high)+
+         '</b> <span class="badge '+badge.cls+'">'+esc(badge.text)+"</span> · 🚗 交通 "+
+         fmtCost(quote.transport_cny)+" · 🛏️ 住宿按 "+
+         Number(quote.stay_nights||PLAN_NIGHTS_DEFAULT)+" 晚</div>")
+      : '<div class="fp-quote-row">暂无报价(后端没给 quote)</div>')+
+    '<div class="fp-quote-row">📍 '+Number(counts.place||0)+" 个目的地 · 🚗 "+
+      Number(counts.routes||0)+" 段路线 · 🛏️ "+Number(counts.stays||0)+" 处住宿"+
+      (plan.note?(" · 备注:"+esc(plan.note)):"")+"</div>"+
+    (missing.length
+      ? ('<div class="fp-quote-miss">⚠️ '+missing.length+" 条引用的收藏已删除(未计入):"+
+         missing.map(id=>"#"+Number(id)).join("、")+"</div>")
+      : "")+
+    ((plan.updated_at)?'<div class="fp-time">更新于 '+esc(fmtGeneratedAt(plan.updated_at))+"</div>":"")+
+    '<button type="button" class="fp-recalc js-plan-recalc" data-id="'+Number(plan.id)+
+      '" title="用当前晚数再 POST 一次(重名 = 刷新),拿一份新 quote">🔁 按 '+planNights()+
+      " 晚重算</button>"+
+    '<button type="button" class="fp-del js-plan-del" data-id="'+Number(plan.id)+
+      '" title="DELETE /api/trip-plans/'+Number(plan.id)+'(只删方案,收藏不动)">删除方案</button>'+
+    "</div>";
+}
+function renderTripPlans(){
+  const box=$("planList");
   if(!box) return;
-  const plans=loadSavedPlans();
+  const plans=state.tripPlan.items;
+  const count=$("planCount");
+  if(count) count.textContent=plans.length?(plans.length+" 份 · 新的在前"):"";
   box.innerHTML=plans.length
-    ? '<div class="fp-grp-ttl">已保存方案<span class="fp-grp-cnt">'+plans.length+" 个</span></div>"+
-      plans.map((plan,i)=>'<div class="fp-saved-item"><b>'+esc(plan.title||"行程方案")+"</b>"+
-        ' · 总花费 <b>'+esc(plan.total_cny!==null&&plan.total_cny!==undefined?fmtCost(plan.total_cny):"—")+"</b>"+
-        " · "+esc(plan.created_at||"")+
-        '<button type="button" class="fp-del js-plan-del" data-i="'+i+'" style="margin-left:8px">删除</button></div>').join("")
-    : "";
+    ? plans.map(tripPlanCardHtml).join("")
+    : '<div class="fp-empty">还没有保存过方案:上面勾选收藏 + 填方案名 → 「'+esc(PLAN_SAVE_LABEL)+'」。</div>';
+  const note=$("planApiNote");
+  if(note) note.textContent=state.tripPlan.note||"";   // 后端口径说明原样展示
 }
-function savePlan(){
-  const sel=planSelection();
-  const names=[sel.dest&&sel.dest.name,sel.leg&&sel.leg.name,sel.stay&&sel.stay.name].filter(Boolean);
-  if(!names.length) return;
-  const routeCost=num(sel.leg&&sel.leg.summary?sel.leg.summary.cost_cny:NaN);
-  const nightPrice=sel.stay?parseStayPrice(sel.stay.summary?sel.stay.summary.price_estimate:null):null;
-  const total=(isFinite(routeCost)?routeCost:0)+((nightPrice!==null)?nightPrice*sel.nights:0);
-  const plans=loadSavedPlans();
-  plans.unshift({title:names.join(" + "),total_cny:total,
-    dest_id:sel.dest?Number(sel.dest.id):null,route_id:sel.leg?Number(sel.leg.id):null,
-    stay_id:sel.stay?Number(sel.stay.id):null,nights:sel.nights,
-    created_at:new Date().toISOString().slice(0,16).replace("T"," ")});
-  try{window.localStorage.setItem(PLAN_STORE_KEY,JSON.stringify(plans.slice(0,20)));}catch(error){/* 存不下就算了 */}
-  renderSavedPlans();
+async function deleteTripPlan(id){
+  setPlanErr("");
+  try{
+    await sendJSON("/api/trip-plans/"+Number(id),{method:"DELETE"});
+    await loadTripPlans();
+  }catch(error){
+    setPlanErr("删除方案失败:"+((error&&error.message)||error));
+  }
+}
+// 按当前晚数重算:同一份方案再 POST 一次(唯一键是方案名 → 后端刷新引用并返回原行)
+async function recalcTripPlan(id){
+  const plan=state.tripPlan.items.filter(item=>Number(item.id)===Number(id))[0];
+  if(!plan) return;
+  const body={name:plan.name,nights:planNights()};
+  if(plan.note) body.note=plan.note;
+  if(plan.place_collection_id) body.place_collection_id=plan.place_collection_id;
+  if((plan.route_collection_ids||[]).length) body.route_collection_ids=plan.route_collection_ids;
+  if((plan.stay_collection_ids||[]).length) body.stay_collection_ids=plan.stay_collection_ids;
+  setPlanBusy(true);setPlanErr("");
+  try{
+    const result=await postTripPlan(body);
+    renderPlanQuote(result.trip_plan,result.quote,result.created===false);
+    await loadTripPlans();
+  }catch(error){
+    setPlanErr("按晚数重算失败:"+((error&&error.message)||error));
+  }finally{
+    setPlanBusy(false);
+  }
+}
+function onPlanListClick(event){
+  const target=event.target;
+  if(!target||!target.closest) return;
+  const del=target.closest(".js-plan-del");
+  if(del){deleteTripPlan(del.getAttribute("data-id"));return;}
+  const recalc=target.closest(".js-plan-recalc");
+  if(recalc) recalcTripPlan(recalc.getAttribute("data-id"));
+}
+// tab 切换:两个 pane 互斥显示;切到「行程方案」时刷一次列表(后端已按新的在前排序)
+function switchFavTab(which){
+  state.tripPlan.tab=(which==="plan")?"plan":"fav";
+  const onPlan=(state.tripPlan.tab==="plan");
+  const panes={fav:$("favPaneFav"),plan:$("favPanePlan")};
+  const tabs={fav:$("favTabFav"),plan:$("favTabPlan")};
+  ["fav","plan"].forEach(key=>{
+    const active=((key==="plan")===onPlan);
+    if(panes[key]) panes[key].style.display=active?"block":"none";
+    if(tabs[key]){
+      tabs[key].classList.toggle("sel",active);
+      tabs[key].setAttribute("aria-selected",active?"true":"false");
+    }
+  });
+  if(onPlan){renderPlanPicker();loadTripPlans();}
 }
 
 // --------------------------------------------------------------------------- //
@@ -1503,17 +1762,14 @@ $("favPanelClose").addEventListener("click",closeFavPanel);
 $("favPanel").addEventListener("click",event=>{
   if(event.target===$("favPanel")) closeFavPanel();   // 点遮罩空白处关闭
 });
-// 行程方案(TASK-4a):三个下拉任一变化都重算总账;保存按钮写 localStorage
-["planDest","planRoute","planStay"].forEach(id=>$(id).addEventListener("change",updatePlanTotal));
+// 行程方案(TASK-5b):tab 切换 / 勾选 / 晚数 → 保存(POST)、列表(GET)、删除(DELETE)全走后端
+$("favTabFav").addEventListener("click",()=>switchFavTab("fav"));
+$("favTabPlan").addEventListener("click",()=>switchFavTab("plan"));
 $("planSave").addEventListener("click",savePlan);
-$("planSaved").addEventListener("click",event=>{
-  const button=event.target.closest(".js-plan-del");
-  if(!button) return;
-  const plans=loadSavedPlans();
-  plans.splice(Number(button.getAttribute("data-i")),1);
-  try{window.localStorage.setItem(PLAN_STORE_KEY,JSON.stringify(plans));}catch(error){/* 忽略 */}
-  renderSavedPlans();
-});
+$("planPicker").addEventListener("change",onPlanPickChange);
+$("planNights").addEventListener("change",()=>{syncPlanPicked();renderTripPlans();});
+$("planName").addEventListener("input",()=>setPlanErr(""));
+$("planList").addEventListener("click",onPlanListClick);
 $("routeRetry").addEventListener("click",()=>{
   const place=state.routePanel.place;
   if(place) openRoutePanel(place);   // 失败重试:缓存里没东西,会重新打一次 /api/routes

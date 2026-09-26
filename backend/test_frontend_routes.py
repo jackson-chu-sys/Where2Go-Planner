@@ -36,9 +36,13 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+from app.api import collections as collections_api  # noqa: E402
 from app.api import routes as routes_api  # noqa: E402
+from app.api import trips as trips_api  # noqa: E402
 from app.main import STATIC, app as fastapi_app  # noqa: E402
+from db.base import init_db, make_engine, session_factory  # noqa: E402
 from services import routes as route_service  # noqa: E402
+from services import trips as trip_service  # noqa: E402
 
 INDEX_HTML = STATIC / "index.html"
 # 路线面板那一段 JS 的切片边界(前面是 popup/identity,后面是 drawPins)
@@ -579,11 +583,9 @@ def test_stays_contract_matches_api_item_shape(html: str) -> None:
 # TASK-4a:统一收藏面板(类型分组)+ 行程方案组合与总账(纯前端,不动后端)
 # --------------------------------------------------------------------------- #
 def test_fav_grouping_dom_and_functions(html: str) -> None:
-    assert 'id="favPlanSection"' in html and 'id="planDest"' in html
-    assert 'id="planRoute"' in html and 'id="planStay"' in html
-    assert 'id="planTotal"' in html and 'id="planSave"' in html and 'id="planSaved"' in html
-    for fn in ("function favGroupOf(", "function syncPlanControls(", "function updatePlanTotal(",
-               "function parseStayPrice(", "function savePlan(", "function renderSavedPlans("):
+    assert 'id="favPaneFav"' in html and 'id="favPanelList"' in html
+    for fn in ("function favGroupOf(", "function favGroups(", "function renderFavItems(",
+               "function favItemHtml("):
         assert fn in html, f"缺少 {fn}"
 
 
@@ -598,21 +600,8 @@ def test_fav_group_of_stay_fingerprint(html: str) -> None:
     assert '"route"' in group and "stay_kind" in group and "price_estimate" in group
 
 
-def test_plan_total_uses_estimate_labels(html: str) -> None:
-    total = html[html.index("function updatePlanTotal"):html.index("function loadSavedPlans")]
-    assert "cost_cny" in total and "price_estimate" in total, "总账应取路线费用快照+住宿预估价"
-    assert "估算" in total and "仅供参考" in total, "总账必须带估算口径标注"
-
-
-def test_plan_wired_events(html: str) -> None:
-    assert '["planDest","planRoute","planStay"].forEach' in html
-    assert '$("planSave").addEventListener("click",savePlan)' in html
-    assert "js-plan-del" in html, "已保存方案应可删除"
-
-
-def test_plan_stay_price_parser_midpoint(html: str) -> None:
-    parse = html[html.index("function parseStayPrice"):html.index("function planOptionsHtml")]
-    assert "match" in parse and "null" in parse, "预估价解析不出必须返回 null(不编数字)"
+# 方案组合与总账自 TASK-5b 起改为**后端持久化**(/api/trip-plans):localStorage 双轨、
+# 三下拉单选与前端自算总账一并下线,对应断言迁到下面的「TASK-5b」小节。
 
 
 # --------------------------------------------------------------------------- #
@@ -651,3 +640,265 @@ def test_book_links_open_new_page(html: str) -> None:
 def test_book_section_refreshes_with_fav_list(html: str) -> None:
     refresh = html[html.index("async function refreshFavItems"):html.index("async function openFavPanel")]
     assert "renderBookSection()" in refresh, "收藏列表刷新应同步预订区块"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-5b:收藏面板「行程方案」tab —— 勾选收藏(checkbox 多选)→ POST /api/trip-plans
+#          (后端持久化,重名 = 刷新幂等)→ 卡片展示后端 quote(总花费区间 + 构成 +
+#          missing 已删除提示 + note 口径);列表 GET(新的在前)、删除 DELETE。
+#          原 TASK-4a 的 localStorage 方案机制已下线(单一事实源在后端),三例迁到本节。
+# --------------------------------------------------------------------------- #
+
+PLAN_SECTION_START = "行程方案(TASK-5b,M4)"
+PLAN_SECTION_END = "// 前往预订(TASK-4b)"
+
+# 方案 tab 必须有的 DOM id:两个 tab 钮 + 两个 pane + 表单 + 勾选面 + quote + 列表
+PLAN_DOM_IDS = [
+    "favTabFav", "favTabPlan", "favPaneFav", "favPanePlan", "favPlanSection", "planErr",
+    "planName", "planNights", "planNote", "planPicker", "planSummary", "planSave",
+    "planQuote", "planSaved", "planCount", "planList", "planApiNote",
+]
+PLAN_FUNCTIONS = [
+    "switchFavTab", "renderPlanPicker", "planPickRowHtml", "syncPlanPicked", "planPickedIds",
+    "planPickedTotal", "planSummaryText", "onPlanPickChange", "planPayload", "planNights",
+    "postTripPlan", "savePlan", "loadTripPlans", "tripPlanCardHtml", "renderTripPlans",
+    "deleteTripPlan", "recalcTripPlan", "onPlanListClick", "planQuoteHtml", "renderPlanQuote",
+    "planPerStayHtml", "moneyRange", "setPlanErr", "setPlanBusy", "pickedCount",
+]
+# 后端 quote_plan() 的出参键:前端要逐字段消费(总花费区间 + 构成 + 估算标注)
+QUOTE_FIELDS = ["total_cny_low", "total_cny_high", "transport_cny", "stay_nights",
+                "per_stay", "missing", "kind", "note"]
+PER_STAY_FIELDS = ["collection_id", "name", "price_estimate", "low", "high"]
+# POST /api/trip-plans 的请求体键(裸 JSON;字段名以 app/api/trips.py 为准)
+PLAN_REQUEST_FIELDS = ["name", "note", "place_collection_id", "route_collection_ids",
+                       "stay_collection_ids", "nights"]
+
+
+def plan_section(html: str) -> str:
+    """切出「行程方案(TASK-5b)」那一段 JS(契约断言只在这一段里找字段引用)。"""
+    start = html.index(PLAN_SECTION_START)
+    end = html.index(PLAN_SECTION_END, start)
+    return html[start:end]
+
+
+@pytest.fixture()
+def plan_session(tmp_path: Path):
+    """独立临时 SQLite 库:真跑 collections / trip-plans 端点函数,不触网、不碰应用库。"""
+    engine = make_engine(f"sqlite:///{tmp_path / 'frontend_plans.db'}")
+    init_db(engine)
+    current = session_factory(engine)()
+    try:
+        yield current
+    finally:
+        current.close()
+        engine.dispose()
+
+
+@pytest.fixture()
+def saved_plan(plan_session) -> dict[str, Any]:
+    """造三类收藏(目的地 / 路线 / 住宿)并 POST 一份 2 晚方案,拿到真实响应。"""
+    place = collections_api.create_collection(session=plan_session, payload={
+        "kind": "place", "osm_type": "node", "osm_id": 7000001, "name": "杭州西湖",
+        "to_lat": 30.2500, "to_lng": 120.1600,
+    })["collection"]
+    leg = collections_api.create_collection(session=plan_session, payload={
+        "kind": "route", "mode": "driving", "from_name": "上海", "to_name": "杭州西湖",
+        "from_lat": 31.2304, "from_lng": 121.4737, "to_lat": 30.2500, "to_lng": 120.1600,
+        "summary": {"duration_min": 105.0, "cost_cny": 320.5, "distance_km": 175.2,
+                    "kind": "real"},
+    })["collection"]
+    stay = collections_api.create_collection(session=plan_session, payload={
+        "kind": "place", "osm_type": "way", "osm_id": 7000002, "name": "🛏️ 西湖边客栈 · 住宿",
+        "to_lat": 30.2510, "to_lng": 120.1610,
+        "summary": {"stay_kind": "guest_house", "price_estimate": "约¥250-450/晚",
+                    "distance_km": 1.2},
+    })["collection"]
+    response = trips_api.create_trip_plan(session=plan_session, payload={
+        "name": "周末去杭州", "note": "两人自驾", "nights": 2,
+        "place_collection_id": place["id"], "route_collection_ids": [leg["id"]],
+        "stay_collection_ids": [stay["id"]],
+    })
+    response["stay_id"] = stay["id"]
+    return response
+
+
+def test_plan_tab_dom_ids_present(html: str) -> None:
+    for element_id in PLAN_DOM_IDS:
+        assert f'id="{element_id}"' in html, f"缺少行程方案 tab 的 DOM id:{element_id}"
+    assert re.search(r'<div id="favPanePlan"[^>]*style="display:none"', html), \
+        "方案 pane 默认隐藏(与收藏 pane 互斥)"
+    assert re.search(r'#favPaneFav|id="favPaneFav"', html), "收藏 pane 是默认显示的那个"
+    for tab_id in ("favTabFav", "favTabPlan"):
+        assert re.search(rf'<button type="button" id="{tab_id}"[^>]*role="tab"', html), \
+            f"{tab_id} 应是 role=tab 的按钮"
+
+
+def test_plan_tab_functions_present(html: str) -> None:
+    section = plan_section(html)
+    for name in PLAN_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少方案 JS 函数:{name}"
+    # 勾选面与收藏面板共用同一套分组口径(favGroups 定义在收藏段,方案段调用)
+    assert re.search(r"function\s+favGroups\s*\(", html), "缺少收藏分组函数 favGroups"
+    assert "favGroups()" in section, "方案勾选面应复用收藏分组,而不是另立一套"
+
+
+def test_plan_tab_switch_is_wired_and_mutually_exclusive(html: str) -> None:
+    assert '$("favTabFav").addEventListener("click",()=>switchFavTab("fav"))' in html
+    assert '$("favTabPlan").addEventListener("click",()=>switchFavTab("plan"))' in html
+    switch = html[html.index("function switchFavTab"):html.index('$("goCity").addEventListener')]
+    assert 'panes[key].style.display=active?"block":"none"' in switch, "两个 pane 必须互斥显示"
+    assert 'tabs[key].classList.toggle("sel",active)' in switch, "选中 tab 要有视觉态"
+    assert 'setAttribute("aria-selected"' in switch, "tab 要同步 aria-selected"
+    assert "renderPlanPicker();loadTripPlans();" in switch, "切到方案 tab 应渲染勾选面并拉一次列表"
+
+
+def test_plan_picker_uses_checkboxes_instead_of_selects(html: str) -> None:
+    row = plan_section(html)
+    row = row[row.index("function planPickRowHtml"):row.index("function renderPlanPicker")]
+    assert 'type="checkbox"' in row and "js-plan-pick" in row, "勾选用 checkbox(不再用下拉单选)"
+    assert 'data-group="' in row and 'data-id="' in row, "勾选行要带分组与收藏 id"
+    # 对比字段齐全:路线时长/费用/里程、住宿预估价(要求①)
+    for token in ("fmtDuration(summary.duration_min)", "fmtCost(summary.cost_cny)",
+                  "fmtKm(summary.distance_km)", "summary.price_estimate"):
+        assert token in row, f"勾选行缺少对比字段 {token}"
+    # 旧的三下拉 + localStorage 双轨必须彻底下线(要求⑤)
+    for gone in ("planDest", "planRoute", "planStay", "PLAN_STORE_KEY", "w2g_trip_plans",
+                 "loadSavedPlans", "renderSavedPlans", "parseStayPrice", "localStorage"):
+        assert gone not in html, f"旧 localStorage 方案机制应已移除:{gone}"
+
+
+def test_plan_picker_place_is_single_choice(html: str) -> None:
+    section = plan_section(html)
+    change = section[section.index("function onPlanPickChange"):section.index("function setPlanErr")]
+    assert 'data-group="place"' in section, "目的地分组要能在 DOM 里认出来"
+    assert "place_collection_id" in section and 'multi:false' in section, \
+        "后端 place_collection_id 是单值,UI 要标成单选"
+    assert "other.checked=false" in change, "勾一个目的地应取消同组其它勾选(不静默丢弃)"
+    assert '$("planPicker").addEventListener("change",onPlanPickChange)' in html, "勾选走事件委托"
+
+
+def test_plan_calls_trip_plans_crud(html: str) -> None:
+    section = plan_section(html)
+    assert 'sendJSON("/api/trip-plans",{method:"POST"' in section, "保存方案应 POST /api/trip-plans"
+    assert 'getJSON("/api/trip-plans?limit="' in section, "方案列表应 GET /api/trip-plans"
+    assert 'sendJSON("/api/trip-plans/"+Number(id),{method:"DELETE"})' in section, \
+        "删除方案应 DELETE /api/trip-plans/{id}"
+    assert 'headers:{"Content-Type":"application/json"}' in section, "POST 要声明 JSON 请求体"
+    assert "JSON.stringify(body)" in section, "请求体应序列化成 JSON(后端收裸 JSON 对象)"
+
+
+def test_plan_payload_fields_match_backend(html: str) -> None:
+    section = plan_section(html)
+    payload = section[section.index("function planPayload"):section.index("async function postTripPlan")]
+    assert "name:planNameText()" in payload and "nights:planNights()" in payload, \
+        "请求体要带方案名与晚数"
+    assert "if(note) body.note=note;" in payload, "备注可选:给了才带上"
+    assert "body[group.field]=group.multi?ids:ids[0];" in payload, \
+        "单值 place 传 id、多值 route/stay 传整数数组"
+    groups = section[section.index("const PLAN_PICK_GROUPS"):section.index("function planNameText")]
+    for field in PLAN_REQUEST_FIELDS:
+        assert field in groups or field in payload, f"请求体缺少字段 {field}"
+    for field in ("place_collection_id", "route_collection_ids", "stay_collection_ids"):
+        assert f'field:"{field}"' in groups, f"勾选分组应映射到后端字段 {field}"
+    used_body = referenced_fields(section, "body")
+    assert used_body <= set(PLAN_REQUEST_FIELDS), \
+        f"请求体出现后端不认的字段:{sorted(used_body - set(PLAN_REQUEST_FIELDS))}"
+
+
+def test_plan_nights_range_matches_backend(html: str) -> None:
+    assert js_constant(html, "PLAN_NIGHTS_MIN") == trip_service.MIN_NIGHTS, "晚数下限要与后端一致"
+    assert js_constant(html, "PLAN_NIGHTS_MAX") == trip_service.MAX_NIGHTS, "晚数上限要与后端一致"
+    assert js_constant(html, "PLAN_NIGHTS_DEFAULT") == trip_service.DEFAULT_NIGHTS, "默认晚数要一致"
+    assert re.search(r'<input id="planNights" type="number" min="1" max="60"', html), \
+        "晚数输入框要限 1~60(与后端 resolve_nights 同口径)"
+    nights = plan_section(html)
+    nights = nights[nights.index("function planNights"):nights.index("function planPickedIds")]
+    assert "Math.max(PLAN_NIGHTS_MIN,Math.min(PLAN_NIGHTS_MAX,value))" in nights, "越界晚数要夹回区间"
+    assert "PLAN_NIGHTS_DEFAULT" in nights, "空值/坏值退回默认晚数(不让后端 400)"
+
+
+def test_plan_quote_fields_are_rendered(html: str) -> None:
+    section = plan_section(html)
+    used_quote = referenced_fields(section, "quote")
+    for field in QUOTE_FIELDS:
+        assert field in used_quote, f"前端没有消费 quote.{field}"
+    assert "moneyRange(quote.total_cny_low,quote.total_cny_high)" in section, \
+        "卡片要显示总花费区间 total_cny_low ~ total_cny_high"
+    assert "fmtCost(quote.transport_cny)" in section, "要显示交通费构成"
+    assert "KIND_BADGE[quote.kind]" in section, "估算徽标要按后端 kind 取文案"
+    assert "quote.missing" in section and "已删除" in section, "missing(引用已删除)要有可见提示"
+    assert "per_stay" in section and "planPerStayHtml" in section, "per_stay 要逐处展开"
+
+
+def test_plan_quote_note_is_backend_verbatim(html: str) -> None:
+    section = plan_section(html)
+    assert "esc(quote.note||PLAN_QUOTE_NOTE_FALLBACK)" in section, "quote.note 原样展示(不改写口径)"
+    assert "state.tripPlan.note" in section and '$("planApiNote")' in section, \
+        "列表响应的 note(口径说明)也要展示"
+    fallback = re.search(r'const PLAN_QUOTE_NOTE_FALLBACK="([^"]+)"', html)
+    assert fallback, "应有 quote.note 缺失时的兜底文案常量"
+    assert fallback.group(1) == trip_service.QUOTE_NOTE, "兜底文案要与后端 QUOTE_NOTE 一字不差"
+    assert "仅供参考" in html and "估算" in section, "免责/估算口径必须在方案区块可见"
+
+
+def test_plan_list_delete_and_recalc_are_delegated(html: str) -> None:
+    section = plan_section(html)
+    click = section[section.index("function onPlanListClick"):section.index("function switchFavTab")]
+    assert "js-plan-del" in click and "deleteTripPlan(" in click, "删除按钮要走事件委托"
+    assert "js-plan-recalc" in click and "recalcTripPlan(" in click, "按晚数重算按钮要走事件委托"
+    assert '$("planList").addEventListener("click",onPlanListClick)' in html
+    assert "result.trip_plans" in section, "列表应读响应的 trip_plans 数组(后端已新的在前)"
+    assert "新的在前" in html, "列表要说明排序口径"
+    assert "plan.updated_at" in section, "方案卡片要显示更新时间(幂等刷新才看得出来)"
+
+
+def test_plan_tab_quote_contract_matches_backend(html: str, saved_plan: dict[str, Any]) -> None:
+    """真跑一遍后端:前端在方案段里引用的每个字段都要在真实响应里存在。"""
+    section = plan_section(html)
+    quote = saved_plan["quote"]
+    plan = saved_plan["trip_plan"]
+    assert set(QUOTE_FIELDS) <= set(quote), f"后端 quote 缺字段:{quote}"
+    assert not (referenced_fields(section, "quote") - set(quote)), \
+        f"前端读了 quote 里没有的字段:{sorted(referenced_fields(section, 'quote') - set(quote))}"
+
+    assert plan["counts"] == {"place": 1, "routes": 1, "stays": 1}
+    assert not (referenced_fields(section, "plan") - set(plan)), \
+        f"前端读了 trip_plan 里没有的字段:{sorted(referenced_fields(section, 'plan') - set(plan))}"
+    assert not (referenced_fields(section, "counts") - set(plan["counts"])), "counts 字段对不上"
+
+    per_stay = quote["per_stay"]
+    assert per_stay and set(PER_STAY_FIELDS) <= set(per_stay[0]), f"per_stay 形状不对:{per_stay}"
+    assert not (referenced_fields(section, "stay") - set(per_stay[0])), \
+        f"前端读了 per_stay 里没有的字段:{sorted(referenced_fields(section, 'stay') - set(per_stay[0]))}"
+    # 2 晚:住宿区间 = 均价下限/上限 × 2,交通 = 收藏快照 cost_cny 之和
+    assert quote["stay_nights"] == 2 and quote["transport_cny"] == 320.5
+    assert quote["total_cny_low"] == 820.5 and quote["total_cny_high"] == 1220.5
+    assert quote["kind"] == trip_service.QUOTE_KIND and quote["note"] == trip_service.QUOTE_NOTE
+    assert quote["missing"] == []
+
+
+def test_plan_envelope_and_missing_refs_match_backend(html: str, plan_session, saved_plan: dict[str, Any]) -> None:
+    """POST/GET 的信封键与「引用被删 → missing」降级口径都要被前端覆盖。"""
+    section = plan_section(html)
+    listed = trips_api.list_trip_plans(limit="50", session=plan_session)
+    envelope = set(saved_plan) | set(listed)
+    used_result = referenced_fields(section, "result")
+    assert not (used_result - envelope), f"前端读了响应信封里没有的键:{sorted(used_result - envelope)}"
+    assert listed["count"] == 1 and listed["trip_plans"][0]["id"] == saved_plan["trip_plan"]["id"]
+
+    # 删掉被引用的住宿收藏:方案不连带删,报价把它列进 missing(前端要有「已删除」提示)
+    assert collections_api.delete_collection(str(saved_plan["stay_id"]), session=plan_session)["deleted"]
+    detail = trips_api.get_trip_plan(str(saved_plan["trip_plan"]["id"]), session=plan_session)
+    assert detail["quote"]["missing"] == [saved_plan["stay_id"]], "缺行应按已删除列进 missing"
+    assert detail["quote"]["per_stay"] == []
+    assert "已删除" in section and "missing" in section, "前端要展示 missing 的已删除提示"
+    assert 'missing.map(id=>"#"+Number(id)).join("、")' in section, "missing 要逐个 id 展示"
+
+
+def test_plan_save_surfaces_idempotent_refresh(html: str) -> None:
+    section = plan_section(html)
+    assert "result.created===false" in section, "要区分新建/刷新(后端重名幂等)"
+    assert "刷新" in section and "幂等" in section, "刷新态要有可见说明"
+    assert "缺少方案名" in section, "方案名为空要就地给中文提示(不打无谓的 400)"
+    assert "setPlanErr" in section and "error.message" in section, "失败要落后端中文报错文案"
+    assert "disabled" in section, "保存中/没勾选时按钮要禁用"

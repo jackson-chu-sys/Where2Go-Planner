@@ -384,7 +384,7 @@
 
 ## [TASK-4a] 统一收藏面板 + 行程对比 + 总账
 
-- 状态: pending
+- 状态: running
 - 目标: 依 docs/STAGE3-PLAN.md 第 2 节,把收藏统一成可对比的面板:汇总 目的地/路线/住宿;以简洁信息展示 路线时长、路线费用、住宿费用 供对比;支持把「目的地+路线+住宿」组合为一个**行程方案**并给出大致总花费。必要时加后端聚合 API。
 - 依赖: TASK-2c-fe / 3b。
 - 涉及: backend/app/static/index.html、backend/app/api/collections.py(如需聚合)

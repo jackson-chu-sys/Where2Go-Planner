@@ -414,7 +414,7 @@
 
 ## [TASK-4b] 预订界面 + 跳转预订(deep-link 聚合)
 
-- 状态: running
+- 状态: done
 - 目标: 依 docs/STAGE3-PLAN.md 第 2 节,给最终选定的目的地提供「前往预订」入口:列出可用/已收藏的路线与住宿供勾选组合;点击跳转对应外部应用(住宿→携程/Booking/Airbnb;机票/火车票→12306/OTA;自驾→地图导航)。**仅 deep-link 跳转,不代订、不抓实时价**,页面含免责声明。
 - 依赖: TASK-4a。
 - 涉及: 仅 backend/app/static/index.html(如需后端加 deep-link 生成则加纯函数 + 单测)
@@ -423,7 +423,22 @@
   2. 跳转按钮 URL 正确、新页打开(携程/12306/地图等)
   3. 页面明确免责(价格仅供参考 · 不代订)
   4. 无 JS 报错;browser QA 通过
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-26 夜班,执行器直接手写,未派 Codex;commit `4f00e14` 附近,见 git log)。
+  - index.html(仅前端,零后端改动):收藏弹层新增「🎫 前往预订」区块,列出收藏的路线与住宿:
+    铁路→12306 查票(fs/ts/date,站名口径与后端 rail_12306_url 一致);飞机→去哪儿机票搜索
+    (+12306 比价备选);自驾→高德导航 + Google 地图;住宿→携程/Booking/Airbnb 按名称搜索
+    (标题带 AI 预估价快照)。全部 `<a target="_blank" rel="noopener">`,URL 前端拼、中文百分号编码。
+    区块头 + 列表尾双重免责:「价格仅供参考 · 不代订 · 以官方/OTA 实时为准」;无路线/住宿收藏时整块隐藏。
+    renderBookSection 挂在 refreshFavItems,收藏增删后同步刷新。
+  - test_frontend_routes.py 追加 5 个静态断言(DOM/函数面/免责文案/渠道覆盖 12306+去哪儿+高德+Google+
+    携程+Booking+Airbnb/新页打开/与收藏刷新联动)。pytest backend/ = **445 passed**(440 基线零改动,12.8s);
+    node --check 内联 JS 语法通过。
+  - browser_exec 真实 QA(uvicorn :8000):curl POST 三条测试收藏(驾车/铁路/住宿)→ 开面板见
+    「前往预订」3 行、6 个链接 URL 全部正确(12306 带 fs=上海&ts=杭州西湖&date=今天;高德 from/to;
+    携程/Booking/Airbnb keyword=西湖国宾馆)、target=_blank rel=noopener 齐、免责声明在 →
+    全程 window error **0** 条;测试收藏已 DELETE 清理归 0。
+  - 备注:出发日取浏览器本地「今天」(环境即 CST),用户在官方页可自行改;deep-link 全走各官网
+    搜索页,不抓价不代订,与 ADR-004/007 口径一致。M4 至此(4a 对比总账 + 4b 预订跳转)收口。
 
 ---
 

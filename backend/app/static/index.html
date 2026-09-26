@@ -105,6 +105,28 @@
   .fp-del:hover{background:#fecaca}
   .fp-empty{color:#9ca3af;font-size:13px;margin-top:12px;font-style:italic}
   .fp-err{color:#b91c1c;background:#fee2e2;font-size:13px;margin-top:9px;padding:8px 10px;border-radius:8px}
+  /* 统一收藏面板(TASK-4a):类型分组 + 行程方案组合与总账 */
+  .fp-grp{margin-top:12px}
+  .fp-grp-ttl{font-weight:700;font-size:13px;color:#0f766e;border-bottom:1px solid #e5e7eb;
+              padding-bottom:4px;display:flex;gap:6px;align-items:center}
+  .fp-grp-cnt{font-weight:400;color:#9ca3af;font-size:12px}
+  .fp-plan{margin-top:14px;border-top:2px solid #e5e7eb;padding-top:10px}
+  .fp-plan-ttl{font-weight:700;font-size:14px}
+  .fp-plan-row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  .fp-plan-row label{font-size:12px;color:#374151;min-width:52px}
+  .fp-plan-row select,.fp-plan-row input{flex:1;min-width:120px;padding:5px 8px;font-size:12px;
+    border:1px solid #d1d5db;border-radius:7px;background:#fff}
+  .fp-total{margin-top:10px;background:#f0fdfa;border:1px solid #99f6e4;border-radius:10px;
+            padding:9px 11px;font-size:13px;display:none}
+  .fp-total b{color:#0f766e;font-size:16px}
+  .fp-total-note{color:#92400e;font-size:11px;margin-top:4px}
+  .fp-saved{margin-top:10px}
+  .fp-saved-item{border:1px dashed #99f6e4;background:#fff;border-radius:9px;padding:7px 9px;
+                 margin-top:7px;font-size:12px;color:#374151}
+  .fp-saved-item b{color:#0f766e}
+  .fp-save-btn{margin-top:9px;padding:6px 13px;font-size:13px;background:#0f766e;color:#fff;border-radius:8px}
+  .fp-save-btn:hover{background:#115e59}
+  .fp-save-btn:disabled{opacity:.5;cursor:not-allowed}
   /* 住宿区块(TASK-3b):路线面板下方的周边住宿卡片 + AI 预估价强标注 */
   .stay-sec{margin-top:12px;border-top:2px solid #e5e7eb;padding-top:9px}
   .stay-hd{display:flex;align-items:center;gap:7px}
@@ -126,7 +148,7 @@
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段3b · 路线 + 周边住宿 AI 预估价)</span></h1>
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段4a · 收藏对比 + 行程方案总账)</span></h1>
   <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
@@ -195,6 +217,20 @@
       <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
       <div id="favPanelErr" class="fp-err" style="display:none"></div>
       <div id="favPanelList"></div>
+      <!-- 行程方案(TASK-4a):把「目的地 + 路线 + 住宿」组合成一个方案,算大致总花费 -->
+      <div class="fp-plan" id="favPlanSection" style="display:none">
+        <div class="fp-plan-ttl">🧳 组合行程方案</div>
+        <div class="fp-sub">从收藏里各选一项,合计大致总花费(全部为估算口径,以官方实时价为准)。</div>
+        <div class="fp-plan-row"><label for="planDest">目的地</label>
+          <select id="planDest"><option value="">(不选)</option></select></div>
+        <div class="fp-plan-row"><label for="planRoute">路线</label>
+          <select id="planRoute"><option value="">(不选)</option></select></div>
+        <div class="fp-plan-row"><label for="planStay">住宿</label>
+          <select id="planStay"><option value="">(不选)</option></select></div>
+        <div class="fp-total" id="planTotal"></div>
+        <button type="button" class="fp-save-btn" id="planSave" style="display:none">💾 保存为行程方案</button>
+        <div class="fp-saved" id="planSaved"></div>
+      </div>
     </div>
   </div>
 </main>
@@ -1155,19 +1191,27 @@ async function addFavRoute(route,button){
 }
 function favItemHtml(item){
   const summary=item.summary||{};
+  const isStay=favGroupOf(item)==="stay";
   const kindBadge=(item.kind==="route")
     ? '<span class="badge real">路线</span>'
-    : '<span class="badge est">目的地</span>';
+    : (isStay?'<span class="badge est">住宿</span>':'<span class="badge est">目的地</span>');
   const modeLabel=item.mode?(ROUTE_MODE_EMOJI[item.mode]||"")+" "+
     (ROUTE_MODE_LABEL[item.mode]||item.mode):"";
+  const stayLabel=(isStay&&summary.stay_kind)?(STAYS_KIND_META[summary.stay_kind]||{}).label||summary.stay_kind:"";
+  const meta=isStay
+    ? '<div class="fp-meta">预估价 <b>'+esc(summary.price_estimate||"暂无 AI 预估价")+"</b>"+
+      (isFinite(num(summary.distance_km))?(" · 距目的地 <b>"+num(summary.distance_km).toFixed(1)+" km</b>"):"")+
+      '<span class="sc-est">'+esc(STAYS_EST_FALLBACK)+"</span></div>"
+    : '<div class="fp-meta">时长 <b>'+esc(fmtDuration(summary.duration_min))+"</b> · 费用 <b>"+
+      esc(fmtCost(summary.cost_cny))+"</b> · 里程 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+
+      (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
+        esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>";
   return '<div class="fp-item" data-id="'+Number(item.id)+'">'+
     '<div class="fp-nm">'+esc(item.name||"(无名)")+"</div>"+
     '<div class="fp-badges">'+kindBadge+(modeLabel?'<span class="badge">'+esc(modeLabel)+"</span>":"")+
+    (stayLabel?'<span class="badge">'+esc(stayLabel)+"</span>":"")+
     (item.cat_name?'<span class="badge deg">'+esc(item.cat_name)+"</span>":"")+"</div>"+
-    '<div class="fp-meta">时长 <b>'+esc(fmtDuration(summary.duration_min))+"</b> · 费用 <b>"+
-      esc(fmtCost(summary.cost_cny))+"</b> · 里程 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+
-      (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
-        esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>"+
+    meta+
     (item.created_at?'<div class="fp-time">收藏于 '+esc(fmtGeneratedAt(item.created_at))+"</div>":"")+
     '<button type="button" class="fp-del js-fav-del" data-id="'+Number(item.id)+
       '" title="DELETE /api/collections/'+Number(item.id)+'">取消收藏</button>'+
@@ -1177,10 +1221,34 @@ function renderFavItems(){
   const box=$("favPanelList");
   if(!box) return;
   if(!state.fav.items.length){
-    box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin → 路线面板里点「☆ 收藏路线」。</div>';
+    box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin → 路线面板里点「☆ 收藏路线」/「☆ 收藏住宿」。</div>';
+    $("favPlanSection").style.display="none";
     return;
   }
-  box.innerHTML=state.fav.items.map(favItemHtml).join("");
+  // 按类型分组(TASK-4a):路线 / 目的地 / 住宿。住宿是 kind=place + 🛏️ 前缀/addFavStay 的 summary 指纹
+  const groups={legs:[],place:[],stay:[]};
+  state.fav.items.forEach(item=>{const g=favGroupOf(item);groups[g==="route"?"legs":g].push(item);});
+  const titles={legs:"🚗 路线收藏",place:"📍 目的地收藏",stay:"🛏️ 住宿收藏"};
+  let html="";
+  ["legs","place","stay"].forEach(key=>{
+    const rows=groups[key];
+    if(!rows.length) return;
+    html+='<div class="fp-grp"><div class="fp-grp-ttl">'+titles[key]+
+      '<span class="fp-grp-cnt">'+rows.length+" 项</span></div>"+
+      rows.map(favItemHtml).join("")+"</div>";
+  });
+  box.innerHTML=html;
+  syncPlanControls();
+}
+// 收藏分组判定:route → 路线;place 里带住宿指纹(名称 🛏️ 前缀或 summary.stay_kind/price_estimate)→ 住宿;其余 → 目的地
+function favGroupOf(item){
+  if(item.kind==="route") return "route";
+  const summary=item.summary||{};
+  const name=String(item.name||"");
+  if(summary.stay_kind!==undefined&&summary.stay_kind!==null) return "stay";
+  if(summary.price_estimate) return "stay";
+  if(name.indexOf("🛏️")===0||name.indexOf("🛏")>=0) return "stay";
+  return "place";
 }
 function setFavErr(message){
   const box=$("favPanelErr");
@@ -1221,6 +1289,117 @@ async function deleteFav(id){
   }
 }
 
+// --------------------------------------------------------------------------- //
+// 行程方案(TASK-4a):从收藏里选「目的地 + 路线 + 住宿」组合成方案,算大致总花费。
+// 费用全是快照估算:路线 = summary.cost_cny(单程);住宿 = AI 预估价区间取中值 × 晚数。
+// 方案存 localStorage(纯前端,不动后端);总账带「估算」标注,不代订不抓实时价。
+// --------------------------------------------------------------------------- //
+const PLAN_STORE_KEY="w2g_trip_plans";
+const PLAN_NIGHTS_DEFAULT=1;
+function parseStayPrice(text){
+  // "约¥250-450/晚" → 区间中值;解析不出返回 null(不编数字)
+  const m=String(text||"").match(/(\d+)\s*[-~—]\s*(\d+)/);
+  if(m) return (Number(m[1])+Number(m[2]))/2;
+  const single=String(text||"").match(/(\d+)/);
+  return single?Number(single[1]):null;
+}
+function planOptionsHtml(rows,selected){
+  return '<option value="">(不选)</option>'+rows.map(item=>
+    '<option value="'+Number(item.id)+'"'+(Number(selected)===Number(item.id)?" selected":"")+">"+
+    esc(item.name||"(无名)")+"</option>").join("");
+}
+function syncPlanControls(){
+  const section=$("favPlanSection");
+  if(!section) return;
+  const groups={legs:[],place:[],stay:[]};
+  state.fav.items.forEach(item=>{const g=favGroupOf(item);groups[g==="route"?"legs":g].push(item);});
+  const total=groups.legs.length+groups.place.length+groups.stay.length;
+  section.style.display=total?"block":"none";
+  if(!total) return;
+  const keep={dest:$("planDest").value,route:$("planRoute").value,stay:$("planStay").value};
+  $("planDest").innerHTML=planOptionsHtml(groups.place,keep.dest);
+  $("planRoute").innerHTML=planOptionsHtml(groups.legs,keep.route);
+  $("planStay").innerHTML=planOptionsHtml(groups.stay,keep.stay);
+  if(!$("planNights")){
+    const row=document.createElement("div");
+    row.className="fp-plan-row";
+    row.innerHTML='<label for="planNights">住几晚</label>'+
+      '<input id="planNights" type="number" min="1" max="30" step="1" value="'+PLAN_NIGHTS_DEFAULT+'">';
+    $("planStay").closest(".fp-plan-row").after(row);
+    $("planNights").addEventListener("change",updatePlanTotal);
+  }
+  updatePlanTotal();
+  renderSavedPlans();
+}
+function planSelection(){
+  const byId={};
+  state.fav.items.forEach(item=>{byId[Number(item.id)]=item;});
+  return {dest:byId[Number($("planDest").value)]||null,
+          leg:byId[Number($("planRoute").value)]||null,
+          stay:byId[Number($("planStay").value)]||null,
+          nights:Math.max(1,Math.min(30,Math.round(num($("planNights")?$("planNights").value:PLAN_NIGHTS_DEFAULT))||PLAN_NIGHTS_DEFAULT))};
+}
+function updatePlanTotal(){
+  const box=$("planTotal"),saveBtn=$("planSave");
+  if(!box) return;
+  const sel=planSelection();
+  if(!sel.dest&&!sel.leg&&!sel.stay){box.style.display="none";saveBtn.style.display="none";return;}
+  const routeCost=num(sel.leg&&sel.leg.summary?sel.leg.summary.cost_cny:NaN);
+  const nightPrice=sel.stay?parseStayPrice(sel.stay.summary?sel.stay.summary.price_estimate:null):null;
+  const stayCost=(nightPrice!==null)?nightPrice*sel.nights:null;
+  const parts=[];
+  if(sel.dest) parts.push("📍 "+esc(sel.dest.name||"目的地"));
+  if(sel.leg) parts.push((ROUTE_MODE_EMOJI[sel.leg.mode]||"")+" 交通 "+
+    esc(isFinite(routeCost)?fmtCost(routeCost):"费用未知")+"(单程·估算)");
+  if(sel.stay) parts.push("🛏️ 住宿 "+esc(nightPrice!==null?(fmtCost(nightPrice)+"/晚×"+sel.nights+"晚"):"预估价缺失"));
+  const totalKnown=isFinite(routeCost)?routeCost:0;
+  const total=totalKnown+(stayCost||0);
+  const missing=[];
+  if(sel.leg&&!isFinite(routeCost)) missing.push("路线费用");
+  if(sel.stay&&nightPrice===null) missing.push("住宿预估价");
+  box.innerHTML='<div>大致总花费:<b>'+(sel.leg||sel.stay?fmtCost(total):"—")+"</b>"+
+    (missing.length?('(缺 '+missing.join("、")+",未计入)"):"")+"</div>"+
+    "<div>"+parts.join(" · ")+"</div>"+
+    '<div class="fp-total-note">估算口径:交通=收藏快照的路线费用(单程,往返请自行×2);'+
+    "住宿=AI 预估价区间中值×晚数。仅供参考,以官方/OTA 实时价为准。</div>";
+  box.style.display="block";
+  saveBtn.style.display=(sel.dest||sel.leg||sel.stay)?"inline-block":"none";
+}
+function loadSavedPlans(){
+  try{
+    const raw=window.localStorage.getItem(PLAN_STORE_KEY);
+    const list=raw?JSON.parse(raw):[];
+    return Array.isArray(list)?list:[];
+  }catch(error){return [];}
+}
+function renderSavedPlans(){
+  const box=$("planSaved");
+  if(!box) return;
+  const plans=loadSavedPlans();
+  box.innerHTML=plans.length
+    ? '<div class="fp-grp-ttl">已保存方案<span class="fp-grp-cnt">'+plans.length+" 个</span></div>"+
+      plans.map((plan,i)=>'<div class="fp-saved-item"><b>'+esc(plan.title||"行程方案")+"</b>"+
+        ' · 总花费 <b>'+esc(plan.total_cny!==null&&plan.total_cny!==undefined?fmtCost(plan.total_cny):"—")+"</b>"+
+        " · "+esc(plan.created_at||"")+
+        '<button type="button" class="fp-del js-plan-del" data-i="'+i+'" style="margin-left:8px">删除</button></div>').join("")
+    : "";
+}
+function savePlan(){
+  const sel=planSelection();
+  const names=[sel.dest&&sel.dest.name,sel.leg&&sel.leg.name,sel.stay&&sel.stay.name].filter(Boolean);
+  if(!names.length) return;
+  const routeCost=num(sel.leg&&sel.leg.summary?sel.leg.summary.cost_cny:NaN);
+  const nightPrice=sel.stay?parseStayPrice(sel.stay.summary?sel.stay.summary.price_estimate:null):null;
+  const total=(isFinite(routeCost)?routeCost:0)+((nightPrice!==null)?nightPrice*sel.nights:0);
+  const plans=loadSavedPlans();
+  plans.unshift({title:names.join(" + "),total_cny:total,
+    dest_id:sel.dest?Number(sel.dest.id):null,route_id:sel.leg?Number(sel.leg.id):null,
+    stay_id:sel.stay?Number(sel.stay.id):null,nights:sel.nights,
+    created_at:new Date().toISOString().slice(0,16).replace("T"," ")});
+  try{window.localStorage.setItem(PLAN_STORE_KEY,JSON.stringify(plans.slice(0,20)));}catch(error){/* 存不下就算了 */}
+  renderSavedPlans();
+}
+
 $("goCity").addEventListener("click",()=>searchCity($("city").value));
 $("locate").addEventListener("click",locateMe);
 $("city").addEventListener("keydown",event=>{if(event.key==="Enter") searchCity($("city").value);});
@@ -1233,6 +1412,17 @@ $("openFav").addEventListener("click",openFavPanel);
 $("favPanelClose").addEventListener("click",closeFavPanel);
 $("favPanel").addEventListener("click",event=>{
   if(event.target===$("favPanel")) closeFavPanel();   // 点遮罩空白处关闭
+});
+// 行程方案(TASK-4a):三个下拉任一变化都重算总账;保存按钮写 localStorage
+["planDest","planRoute","planStay"].forEach(id=>$(id).addEventListener("change",updatePlanTotal));
+$("planSave").addEventListener("click",savePlan);
+$("planSaved").addEventListener("click",event=>{
+  const button=event.target.closest(".js-plan-del");
+  if(!button) return;
+  const plans=loadSavedPlans();
+  plans.splice(Number(button.getAttribute("data-i")),1);
+  try{window.localStorage.setItem(PLAN_STORE_KEY,JSON.stringify(plans));}catch(error){/* 忽略 */}
+  renderSavedPlans();
 });
 $("routeRetry").addEventListener("click",()=>{
   const place=state.routePanel.place;

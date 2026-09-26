@@ -573,3 +573,43 @@ def test_stays_contract_matches_api_item_shape(html: str) -> None:
     allowed = set(ITEM_KEYS) | {"estimated", "kind"}
     unknown = {name for name in referenced if name not in allowed}
     assert not unknown, f"前端引用了 /api/stays 不存在的字段:{sorted(unknown)}"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-4a:统一收藏面板(类型分组)+ 行程方案组合与总账(纯前端,不动后端)
+# --------------------------------------------------------------------------- #
+def test_fav_grouping_dom_and_functions(html: str) -> None:
+    assert 'id="favPlanSection"' in html and 'id="planDest"' in html
+    assert 'id="planRoute"' in html and 'id="planStay"' in html
+    assert 'id="planTotal"' in html and 'id="planSave"' in html and 'id="planSaved"' in html
+    for fn in ("function favGroupOf(", "function syncPlanControls(", "function updatePlanTotal(",
+               "function parseStayPrice(", "function savePlan(", "function renderSavedPlans("):
+        assert fn in html, f"缺少 {fn}"
+
+
+def test_fav_list_grouped_by_type(html: str) -> None:
+    render = html[html.index("function renderFavItems"):html.index("function setFavErr")]
+    assert "favGroupOf" in render and "fp-grp" in render, "收藏列表应按类型分组渲染"
+    assert "路线收藏" in render and "目的地收藏" in render and "住宿收藏" in render
+
+
+def test_fav_group_of_stay_fingerprint(html: str) -> None:
+    group = html[html.index("function favGroupOf"):html.index("function setFavErr")]
+    assert '"route"' in group and "stay_kind" in group and "price_estimate" in group
+
+
+def test_plan_total_uses_estimate_labels(html: str) -> None:
+    total = html[html.index("function updatePlanTotal"):html.index("function loadSavedPlans")]
+    assert "cost_cny" in total and "price_estimate" in total, "总账应取路线费用快照+住宿预估价"
+    assert "估算" in total and "仅供参考" in total, "总账必须带估算口径标注"
+
+
+def test_plan_wired_events(html: str) -> None:
+    assert '["planDest","planRoute","planStay"].forEach' in html
+    assert '$("planSave").addEventListener("click",savePlan)' in html
+    assert "js-plan-del" in html, "已保存方案应可删除"
+
+
+def test_plan_stay_price_parser_midpoint(html: str) -> None:
+    parse = html[html.index("function parseStayPrice"):html.index("function planOptionsHtml")]
+    assert "match" in parse and "null" in parse, "预估价解析不出必须返回 null(不编数字)"

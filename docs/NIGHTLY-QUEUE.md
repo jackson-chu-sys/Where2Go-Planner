@@ -413,12 +413,17 @@
 
 ## [TASK-5b] 统一收藏面板 + 行程方案 UI(前端重测 Codex)
 
-- 状态: pending(依赖 5a done)
+- 状态: done
 - 背景: **前端任务重测 Codex**(256K 窗口下重验 9/12、9/19、9/23 的旧熔断结论;熔断则当轮转执行器手写,不试第三次——本次是第 1 次机会)。
 - 目标: index.html 收藏弹层升级:①按 目的地/路线/住宿 分组展示(现有分组基础上加对比字段:路线时长/费用、住宿价);②新建「行程方案」tab:勾选已收藏的 目的地+路线+住宿 → POST /api/trip-plans(nights 输入)→ 卡片显示总花费区间与构成;③方案可删。免责口径沿用。
 - 涉及: 仅 `backend/app/static/index.html` + `backend/test_frontend_routes.py` 静态断言(照 TASK-3b 追加模式)。
 - 验收: 1) 面板分组含对比字段 2) 能建方案看总价 3) 0 JS 报错、既有收藏/住宿/路线功能不回归 4) pytest 全绿(基线含 5a 增量)5) browser_exec QA 全流程;若派 Codex:R8 写码截止线**放宽到 20 分钟**(前端文件 26K tokens,读入属正常动作;仍零写入即 kill)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-26 加跑夜班,Codex 执行,commit `5ed6a99`;**前端任务 256K 窗口重测通过——9/12、9/19、9/23 的旧前端熔断结论正式作废**)。
+  - index.html(+542/-163,仅前端,后端 Python 零改动):收藏弹层 **tab 化**(⭐我的收藏 / 🧳行程方案 互斥);分组保留对比字段(路线时长/费用/里程、住宿预估价);组合由三下拉单选改 **checkbox 多选**(路线/住宿多选、目的地单选互斥,与后端 place_collection_id 单值口径一致);方案名/晚数(min1 max60 与后端 MIN/MAX_NIGHTS 同口径夹取)/备注 → POST /api/trip-plans;quote 卡片渲染后端返回(total_cny_low~high、transport_cny、per_stay 逐处、missing 黄条、note 原样透出、幂等刷新提示);列表 GET ?limit=50 + DELETE + 「🔁 按 N 晚重算」;错误落 #planErr 不 alert;**localStorage 双轨彻底下线**(w2g_trip_plans/parseStayPrice/前端自算总账全移除)。
+  - test_frontend_routes.py(+291):TASK-5b 段静态断言(DOM/函数面/POST-GET-DELETE/payload 字段与 trips.py 一字对齐/nights 区间/quote 字段消费/免责文案/tab 互斥)+ **2 例真跑后端**(临时 SQLite 不触网:前端字段引用不越界且金额算对、删收藏后 missing 降级);4a 时代 localStorage 断言随机制迁移下线。执行器复跑 pytest backend/ = **506 passed**(495 基线零改动 + 11 净增,17.0s);node --check 通过。
+  - browser_exec 真实 QA(uvicorn :8000;daemon 又超时,按 3b 同款修法 kill 旧 chrome 重启 CDP 9222 即恢复):curl 备 3 条收藏(驾车/铁路/住宿)→ 开面板见分组+对比字段 → 行程方案 tab 勾选 3 项 → 填名+2晚 → 保存 → quote ¥1063~1463(=263+400×2~600×2 口径吻合)→「按 3 晚重算」幂等刷新 ¥1463~2063、id 不变 → 删除方案回空态 → 回归:点 pin 出 popup+路线面板正常;全程 window error **0** 条;测试收藏/方案已全部清理(collections=0,trip_plans=0)。
+  - **Codex 256K 窗口统计(前端首战)**:单次调用 ~29min(16:14-16:43 UTC,40min 止损线内),function_calls **55**,首轮写码启动后 **~12min**(R8 放宽线 20min 内),tokens 用量 **224,413**(峰值上下文 ~141K/262K,**零 compact、零重读回圈**;对比旧 64K 窗口前端三连败,同一任务族一次过且自带端到端冒烟)。
+  - 备注:M4 行程方案至此**后端持久化**收口(5a 表+API+报价 / 5b UI);4a 的 localStorage 方案机制已由 5b 取代。
 
 ---
 

@@ -13,7 +13,7 @@ Python 3.13 + FastAPI + SQLAlchemy 2.0 + SQLite。venv 在仓库根 `.venv/`。
 - `backend/services/place_loader.py` — Overpass→环内收敛→归类→upsert 的完整套路(新数据层照抄它的结构);`place_identity()` 定义幂等身份。
 - `backend/services/bands.py` — 环形分段与 `filter_to_band`(haversine 复核)。
 - `backend/app/api/*.py` — 路由风格统一:**裸 JSON + 400 中文报错**(不用 pydantic Body 模型,避免 422);`_optional_text()` 处理单测直调时的 FieldInfo;响应都带 `note` 口径说明。`app/main.py` include_router 挂 `/api`。
-- `backend/app/static/index.html` — 单页 Leaflet(改它不需要重启 uvicorn;**近千行,前端改动不要派 Codex,由执行器手写**)。
+- `backend/app/static/index.html` — 单页 Leaflet(改它不需要重启 uvicorn;~1550 行/26K tokens,256K 窗口下 Codex 可胜任——9/26 TASK-5b 前端首战通过;更大范围重构仍建议评估峰值上下文)。
 
 ## 写码硬约定
 - 全部外部调用(OSRM/Nominatim/Overpass/LLM/requests)必须可在测试里被替换;测试把 `requests.Session.request` 换成抛错来兜底(no_network autouse fixture 见 conftest.py / test_classify.py)。

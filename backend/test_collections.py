@@ -741,10 +741,15 @@ def test_api_create_collection_payload_shape(session) -> None:
     assert REQUIRED_DICT_KEYS <= set(collection)
     assert collection["ref_key"] == ROUTE_REF
     assert collection["name"] == "上海 → 崇明 · 驾车", "API 层应把方式标签补进默认标题"
-    assert collection["summary"] == {
+    summary = dict(collection["summary"])
+    # 功能4(2026-09-27):路线收藏自动挂到目的地,父级写进 summary(不新增物理列)
+    parent = summary.pop("parent", None)
+    assert summary == {
         "mode": "driving", "duration_min": 94, "cost_cny": 88, "distance_km": 122.4,
         "kind": "real", "degraded": False,
     }, f"geometry 不该入库,实际:{collection['summary']}"
+    assert parent == {"kind": "place", "ref_key": "place:node/7", "name": "崇明"}, \
+        "路线收藏的父级 = 目的地 ref_key(与目的地收藏同口径)"
     assert collection["from_name"] == "上海" and collection["to_name"] == "崇明"
     assert collection["created_at"] and collection["updated_at"]
 

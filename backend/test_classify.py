@@ -560,12 +560,12 @@ def test_loader_fetches_every_band_as_a_ring_difference() -> None:
     assert place_loader.RING_REQUEST_TIMEOUT > place_loader.GROUP_REQUEST_TIMEOUT, "差集更慢,超时放宽一档"
 
     client = FakeOverpassClient()
-    band = DISTANCE_BANDS[1]
+    band = next(item for item in DISTANCE_BANDS if item["low"] > 0)
     place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
     assert len(client.calls) == 1, "四分类并集只发一次 Overpass 请求"
     call = client.calls[0]
     assert call["radius_m"] == band_radius_m(band), "外圈仍是分段**上限半径**"
-    assert call["inner_radius_m"] == band_inner_radius_m(band) == 100_000, "内圈 = 分段下限(配额只花在环内)"
+    assert call["inner_radius_m"] == band_inner_radius_m(band) == band["low"] * 1000, "内圈 = 分段下限(配额只花在环内)"
     assert call["groups"] == classify.search_groups(), "一次查完四分类 tag 并集"
     assert call["with_id"] is True, "带 OSM 身份才能按 (type, id) 去重"
     assert call["query_timeout"] == place_loader.RING_QUERY_TIMEOUT
@@ -573,14 +573,19 @@ def test_loader_fetches_every_band_as_a_ring_difference() -> None:
 
 
 def test_loader_ring_covers_every_band_with_positive_lower_bound() -> None:
-    """四个分段下限都 > 0,所以全部都走环形差集(远环稀少 bug 的根因就在这里)。"""
+    """下限 > 0 的分段全部走环形差集(远环稀少 bug 的根因就在这里);0_50 例外(见下一例)。"""
     client = FakeOverpassClient()
     for band in DISTANCE_BANDS:
         place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
     assert [call["inner_radius_m"] for call in client.calls] == [
         band_inner_radius_m(band) for band in DISTANCE_BANDS
     ]
-    assert all(call["inner_radius_m"] > 0 for call in client.calls)
+    assert all(
+        call["inner_radius_m"] > 0
+        for call, band in zip(client.calls, DISTANCE_BANDS)
+        if band["low"] > 0
+    )
+    assert [call["inner_radius_m"] for call, band in zip(client.calls, DISTANCE_BANDS) if band["low"] == 0] == [0.0]
     assert [call["radius_m"] for call in client.calls] == [band_radius_m(band) for band in DISTANCE_BANDS]
 
 
@@ -836,7 +841,7 @@ def test_poc_discover_no_longer_lists_one_place_under_two_categories(monkeypatch
     monkeypatch.setattr(discover_api, "ds_nearby", lambda *args, **kwargs: [dict(twin)])
 
     origin = {"city": "上海", "name": "上海市", **SHANGHAI}
-    band = DISTANCE_BANDS[0]
+    band = DISTANCE_BANDS[1]
     nature = discover_api._find_places(origin, band, discover_api.CATEGORIES["自然风光"])
     attraction = discover_api._find_places(origin, band, discover_api.CATEGORIES["旅游景点"])
     assert [row["name"] for row in nature] == ["双子峰"]
@@ -877,7 +882,7 @@ def test_api_fill_intros_endpoint_uses_cache(session, fake_llm) -> None:
         places_api.fill_intros(origin="  ", band=None, category=None, limit=None, session=session)
     assert caught.value.status_code == 400 and "起点城市不能为空" in str(caught.value.detail)
     with pytest.raises(HTTPException) as caught:
-        places_api.fill_intros(origin="上海", band="0_50", category=None, limit=None, session=session)
+        places_api.fill_intros(origin="上海", band="10_20", category=None, limit=None, session=session)
     assert caught.value.status_code == 400 and "未知距离分段" in str(caught.value.detail)
     with pytest.raises(HTTPException) as caught:
         places_api.fill_intros(origin="上海", band=None, category="美食", limit=None, session=session)

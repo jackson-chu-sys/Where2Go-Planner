@@ -221,7 +221,7 @@ class LLMClient:
         self.timeout = DEFAULT_TIMEOUT_S if timeout is None else float(timeout)
         self.max_tokens = max(16, int(max_tokens))
         self.temperature = float(temperature)
-        self._session = session if session is not None else build_session(USER_AGENT)
+        self._session = session if session is not None else build_session(USER_AGENT, source="llm")
 
     @property
     def enabled(self) -> bool:

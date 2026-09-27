@@ -88,7 +88,7 @@ class NominatimClient:
         self.user_agent = user_agent
         self.min_interval = max(0.0, float(min_interval))
         self.accept_language = accept_language
-        self._session = session if session is not None else build_session(self.user_agent)
+        self._session = session if session is not None else build_session(self.user_agent or USER_AGENT, source="nominatim")
         self._clock = clock
         self._sleep = sleep
         self._lock = threading.Lock()

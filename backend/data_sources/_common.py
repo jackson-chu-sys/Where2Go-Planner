@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Mapping, Optional
 
@@ -21,6 +22,58 @@ USER_AGENT: str = "Where2Go-POC/0.1 (dev)"
 DEFAULT_TIMEOUT: float = 15.0
 MAX_TIMEOUT: float = 20.0
 SNIPPET_LEN: int = 240
+
+# --------------------------------------------------------------------------- #
+# 代理口径(2026-09-27 实测后新增)
+# --------------------------------------------------------------------------- #
+# 背景:数据源层用 requests.Session,默认读环境变量里的 HTTP_PROXY/HTTPS_PROXY。
+# 本机(绿联 NAS 容器)配了全局代理 http://192.168.1.210:7892,三个数据源的网络
+# 可达性却**不一致**(2026-09-27 实测):
+#   * Overpass:走代理 HTTP 504(10.2s)/读超时(37s);**直连 2.4s 正常**
+#     —— 抓取慢(BUG-1)/住宿查不到(BUG-5)的主因之一
+#   * OSRM:走代理 2.7s、直连 0.7s(都能通,直连更快)
+#   * Nominatim:**直连连接失败**(15s),必须走代理(1.4s)
+# 所以"一刀切走代理/一刀切不走代理"都不对。这里按**数据源**决定代理口径,可用
+# ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:OVERPASS / OSRM / NOMINATIM / LLM):
+#   * ``off``  → 强制直连(忽略环境变量里的全局代理)
+#   * ``env``  → 沿用环境变量(HTTP_PROXY/HTTPS_PROXY/NO_PROXY,requests 默认行为)
+#   * 其他值   → 当作该数据源专用代理 URL(如 ``http://192.168.1.210:7892``)
+PROXY_OFF: str = "off"
+PROXY_ENV: str = "env"
+ENV_PROXY_PREFIX: str = "WHERE2GO_PROXY_"
+DEFAULT_SOURCE_PROXY: dict[str, str] = {
+    "overpass": PROXY_OFF,   # 实测走代理 504/超时,直连才通
+    "osrm": PROXY_OFF,       # 直连更快(0.7s vs 2.7s),且目标站点不受限
+    "nominatim": PROXY_ENV,  # 实测直连不通,必须走代理
+    "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
+}
+
+
+def proxy_mode(source: Optional[str]) -> str:
+    """某数据源的代理口径:``WHERE2GO_PROXY_<源>`` 优先,否则用默认表;未知源 = ``env``。"""
+    if not source:
+        return PROXY_ENV
+    key = ENV_PROXY_PREFIX + str(source).strip().upper()
+    given = (os.environ.get(key) or "").strip()
+    if given:
+        return given
+    return DEFAULT_SOURCE_PROXY.get(str(source).strip().lower(), PROXY_ENV)
+
+
+def apply_proxy_policy(session: Any, source: Optional[str]) -> Optional[dict[str, str]]:
+    """把某数据源的代理口径应用到 session;返回实际生效的代理(``{}`` = 直连,``None`` = 沿用环境变量)。"""
+    mode = proxy_mode(source)
+    if mode == PROXY_ENV:
+        session.trust_env = True
+        session.proxies = {}
+        return None
+    session.trust_env = False
+    if mode == PROXY_OFF:
+        session.proxies = {}
+        return {}
+    proxies = {"http": mode, "https": mode}
+    session.proxies = proxies
+    return proxies
 
 
 class DataSourceError(RuntimeError):
@@ -36,10 +89,17 @@ class TransientDataSourceError(DataSourceError):
     """临时性失败(可重试 / 可换端点):超时、连接失败、限流、5xx、非 JSON 的繁忙错误页。"""
 
 
-def build_session(user_agent: str = USER_AGENT) -> requests.Session:
-    """创建带统一 User-Agent 与 JSON Accept 头的 :class:`requests.Session`。"""
+def build_session(user_agent: str = USER_AGENT, *, source: Optional[str] = None) -> requests.Session:
+    """创建带统一 User-Agent 与 JSON Accept 头的 :class:`requests.Session`。
+
+    ``source`` 给定时按 :func:`apply_proxy_policy` 应用该数据源的代理口径
+    (``overpass`` / ``osrm`` / ``nominatim`` / ``llm``);不传 = 维持 requests 默认
+    (读环境变量代理),现有调用与单测行为不变。
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": user_agent, "Accept": "application/json"})
+    if source:
+        apply_proxy_policy(session, source)
     return session
 
 

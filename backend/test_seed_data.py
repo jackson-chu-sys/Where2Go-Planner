@@ -543,7 +543,7 @@ def test_record_seed_segment_marks_seed_only_watermark(session) -> None:
     assert record.place_count == 0
     overview = repo.segment_overview(session, origin_city="上海")
     assert [(row["band"], row["source"]) for row in overview] == [(BAND, "seed")]
-    assert set(band_keys()) == {"50_100", "100_200", "200_300", "300_500"}
+    assert set(band_keys()) == {"0_50", "50_100", "100_200", "200_300", "300_500"}
 
 
 # --------------------------------------------------------------------------- #

@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -503,3 +504,76 @@ class TripPlan(Base):
             f"<TripPlan {self.id} {self.name!r} "
             f"路线{len(self.route_collection_ids or [])}段/住宿{len(self.stay_collection_ids or [])}处>"
         )
+
+
+# --------------------------------------------------------------------------- #
+# AI 推荐(神朱 2026-09-27 功能2)与目的地长介绍(功能3)
+# --------------------------------------------------------------------------- #
+
+SIGNATURE_LEN = 40
+PROVIDER_LEN = 64
+BASIS_LEN = 32
+ALL_CATEGORIES = ""  # 推荐/介绍的 category 维度:空串 = 不限分类(与 API 的 category 留空同口径)
+
+
+class PlaceRecommendation(Base):
+    """某 (起点城市, band, 分类) 下 AI 推荐的 3~5 个"最值得去"目的地。
+
+    为什么单独一张表:推荐是**整段的派生结果**(不是某个 Place 的属性),而且要把
+    "这一结果基于哪一批候选算出来的"一起存下来 —— ``signature`` 是候选集合的指纹
+    (:func:`services.recommend.candidate_signature`),分段重新抓取 / 候选变化后指纹
+    跟着变,自然算出新的一行(旧行留着可追溯),同指纹重复请求直接命中缓存、不再烧 token。
+
+    ``items`` 是 JSON 列表 ``[{"place_id", "rank", "reason"}, ...]``(按 rank 升序);
+    ``provider`` 记 LLM 供应商标识(未配置 key 降级时为空),``degraded=True`` 表示这次
+    是**没有 AI 参与**的兜底结果(按距离取前 N 条),前端据此标注"AI 推荐"还是"按距离推荐"。
+    """
+
+    __tablename__ = "place_recommendations"
+    __table_args__ = (
+        UniqueConstraint("origin_city", "band", "category", "signature", name="uq_reco_segment_sig"),
+        Index("ix_reco_lookup", "origin_city", "band", "category"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    origin_city: Mapped[str] = mapped_column(String(CITY_LEN), nullable=False, index=True)
+    band: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    category: Mapped[str] = mapped_column(String(32), nullable=False, default=ALL_CATEGORIES, index=True)
+    signature: Mapped[str] = mapped_column(String(SIGNATURE_LEN), nullable=False)
+    items: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    provider: Mapped[str] = mapped_column(String(PROVIDER_LEN), nullable=False, default="")
+    basis: Mapped[str] = mapped_column(String(BASIS_LEN), nullable=False, default="")
+    degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<PlaceRecommendation {self.origin_city}/{self.band}/{self.category or '全部'} {len(self.items or [])}条>"
+
+
+class PlaceDetail(Base):
+    """目的地的「2~3 句重点介绍」:列表模式用的长文案,与 :attr:`Place.intro` 并存。
+
+    分工:``Place.intro`` 是弹窗里的一句话简介(短、恒在);``PlaceDetail.text`` 是列表里
+    的 2~3 句重点介绍(长、按需生成)。两者都**按 POI 缓存**(DB 即缓存),生成失败
+    降级为不写行、下次可重试 —— 不阻塞列表渲染。
+    """
+
+    __tablename__ = "place_details"
+    __table_args__ = (UniqueConstraint("place_id", name="uq_place_detail"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    place_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(PROVIDER_LEN), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<PlaceDetail place={self.place_id} {len(self.text or '')}字>"

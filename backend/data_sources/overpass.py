@@ -537,7 +537,7 @@ class OverpassClient:
         self.retries = max(1, int(retries))
         self.retry_backoff_s = max(0.0, float(retry_backoff_s))
         self.used_endpoint: Optional[str] = None
-        self._session = session if session is not None else build_session(self.user_agent)
+        self._session = session if session is not None else build_session(self.user_agent, source="overpass")
         self._sleep = sleep
 
     @property

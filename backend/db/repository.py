@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 from data_sources import haversine_km
 
 from .models import (
+    ALL_CATEGORIES,
     CAT_MANUAL,
     CAT_NAME_LEN,
     COLLECTION_CAT_SOURCES,
@@ -49,6 +50,8 @@ from .models import (
     Collection,
     CollectionCat,
     Place,
+    PlaceDetail,
+    PlaceRecommendation,
     SegmentFetch,
     clean_text,
     collection_kind,
@@ -750,3 +753,191 @@ def delete_collection_cat(session: Session, *, cat_id: Any) -> bool:
     session.delete(cat)
     session.flush()
     return True
+
+
+# --------------------------------------------------------------------------- #
+# AI 推荐(功能2)与目的地长介绍(功能3)
+# --------------------------------------------------------------------------- #
+
+
+def recommendation_to_dict(row: PlaceRecommendation) -> dict[str, Any]:
+    """推荐行 → API/前端形状(``items`` 原样透出,附供应商与降级标记与生成时间)。"""
+    return {
+        "origin_city": row.origin_city,
+        "band": row.band,
+        "category": row.category or None,
+        "signature": row.signature,
+        "items": list(row.items or []),
+        "provider": row.provider or None,
+        "basis": row.basis or None,
+        "degraded": bool(row.degraded),
+        "generated_at": iso_utc(row.updated_at or row.created_at),
+    }
+
+
+def get_recommendation(
+    session: Session,
+    *,
+    origin_city: str,
+    band: str,
+    category: Optional[str] = None,
+    signature: str,
+) -> Optional[PlaceRecommendation]:
+    """按 (城市, band, 分类, 候选指纹) 取一条推荐缓存;没有返回 ``None``。"""
+    stmt = select(PlaceRecommendation).where(
+        PlaceRecommendation.origin_city == _clean_city(origin_city),
+        PlaceRecommendation.band == str(band),
+        PlaceRecommendation.category == (str(category).strip() if category else ALL_CATEGORIES),
+        PlaceRecommendation.signature == str(signature),
+    )
+    return session.scalars(stmt).first()
+
+
+def upsert_recommendation(
+    session: Session,
+    *,
+    origin_city: str,
+    band: str,
+    category: Optional[str] = None,
+    signature: str,
+    items: Iterable[Mapping[str, Any]],
+    provider: Optional[str] = None,
+    basis: Optional[str] = None,
+    degraded: bool = False,
+) -> tuple[PlaceRecommendation, bool]:
+    """写入/刷新一条推荐缓存(唯一键 = 城市 + band + 分类 + 候选指纹)。
+
+    返回 ``(行, created)``:同指纹再次写入只刷新 ``items`` 与时间戳(幂等),
+    ``id`` 与 ``created_at`` 保持第一次的值。
+    """
+    wanted_category = str(category).strip() if category else ALL_CATEGORIES
+    row = get_recommendation(
+        session, origin_city=origin_city, band=band, category=category, signature=signature
+    )
+    payload = [
+        {
+            "place_id": int(item["place_id"]),
+            "rank": int(item.get("rank") or index + 1),
+            "reason": clean_text(item.get("reason")) or "",
+        }
+        for index, item in enumerate(items or [])
+        if item.get("place_id") is not None
+    ]
+    if row is None:
+        row = PlaceRecommendation(
+            origin_city=_clean_city(origin_city),
+            band=str(band),
+            category=wanted_category,
+            signature=str(signature),
+            items=payload,
+            provider=clean_text(provider, limit=64) or "",
+            basis=clean_text(basis, limit=32) or "",
+            degraded=bool(degraded),
+        )
+        session.add(row)
+        session.flush()
+        return row, True
+    row.items = payload
+    row.provider = clean_text(provider, limit=64) or ""
+    row.basis = clean_text(basis, limit=32) or ""
+    row.degraded = bool(degraded)
+    session.flush()
+    return row, False
+
+
+def detail_map(session: Session, place_ids: Iterable[Any]) -> dict[int, str]:
+    """按 place_id 取长介绍文本(只返回已有文本的行;缺的键不出现)。"""
+    wanted = [int(item) for item in place_ids if item is not None]
+    if not wanted:
+        return {}
+    rows = session.scalars(
+        select(PlaceDetail).where(PlaceDetail.place_id.in_(wanted))
+    )
+    return {row.place_id: row.text for row in rows if (row.text or "").strip()}
+
+
+def count_places_missing_detail(
+    session: Session,
+    *,
+    origin_city: Optional[str] = None,
+    band: Optional[str] = None,
+    category: Optional[str] = None,
+) -> int:
+    """还没有长介绍的 POI 条数(列表模式的"待生成"计数)。"""
+    stmt = (
+        select(func.count(Place.id))
+        .select_from(Place)
+        .outerjoin(PlaceDetail, PlaceDetail.place_id == Place.id)
+        .where(PlaceDetail.id.is_(None))
+    )
+    if origin_city:
+        stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
+    if band:
+        stmt = stmt.where(Place.band == str(band))
+    if category:
+        stmt = stmt.where(Place.category == str(category))
+    return int(session.scalar(stmt) or 0)
+
+
+def select_places_missing_detail(
+    session: Session,
+    *,
+    origin_city: Optional[str] = None,
+    band: Optional[str] = None,
+    category: Optional[str] = None,
+    only_ids: Optional[Iterable[Any]] = None,
+    limit: Optional[int] = None,
+) -> list[Place]:
+    """取还没有长介绍的 ``Place`` ORM 行(排序:城市 → band → 距离无关的 id 稳定序)。
+
+    ``only_ids`` 给定就只在这些 id 里挑(前端"先生成推荐条 + 可见条"用);
+    已经在 ``place_details`` 里的行不会被重复取出来(DB 即缓存)。
+    """
+    wanted = [int(item) for item in (only_ids or []) if item is not None]
+    if only_ids is not None and not wanted:
+        return []
+    stmt = (
+        select(Place)
+        .outerjoin(PlaceDetail, PlaceDetail.place_id == Place.id)
+        .where(PlaceDetail.id.is_(None))
+    )
+    if origin_city:
+        stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
+    if band:
+        stmt = stmt.where(Place.band == str(band))
+    if category:
+        stmt = stmt.where(Place.category == str(category))
+    if wanted:
+        stmt = stmt.where(Place.id.in_(wanted))
+    stmt = stmt.order_by(Place.origin_city, Place.band, Place.id)
+    if limit:
+        stmt = stmt.limit(max(1, int(limit)))
+    return list(session.scalars(stmt))
+
+
+def upsert_details(
+    session: Session, rows: Iterable[Mapping[str, Any]], *, provider: Optional[str] = None
+) -> int:
+    """按 ``place_id`` upsert 长介绍,返回**新写入**条数(已存在的行只刷新文本)。"""
+    written = 0
+    for item in rows or []:
+        place_id = item.get("place_id")
+        text = clean_text(item.get("text"))
+        if place_id is None or not text:
+            continue
+        row = session.scalars(
+            select(PlaceDetail).where(PlaceDetail.place_id == int(place_id))
+        ).first()
+        if row is None:
+            session.add(
+                PlaceDetail(
+                    place_id=int(place_id),
+                    text=str(text),
+                    provider=clean_text(provider, limit=64) or "",
+                )
+            )
+            written += 1
+        else:
+            row.text = str(text)
+        session.flush()
+    return written

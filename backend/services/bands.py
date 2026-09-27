@@ -1,10 +1,13 @@
-"""环形距离分段:50-100 / 100-200 / 200-300 / 300-500 km(互斥、不含城区)。
+"""环形距离分段:0-50 / 50-100 / 100-200 / 200-300 / 300-500 km。
 
 抓取口径(docs/STAGE1-PLAN.md 第 3 节):入库批量路径按分段查 Overpass **环形差集**
 (上限圆 - 下限圆,TASK-1d,见 :func:`band_inner_radius_m`),每组配额只花在环内;
 再用大圆距离(haversine)在本地复核收敛到 ``[low, high)``。POC 的交互路径
 ``app/api/discover.py`` 仍是单圆上限半径 + 本地收敛,两条路径共用这一套分段定义,
 所以分段只在这里出一份。
+
+``0_50``(神朱 2026-09-27 要求重新添加)是唯一 ``low == 0`` 的分段:**含城市内部**,
+环形差集退化成单圆 ``around``(见 :func:`band_inner_radius_m` 的 0 分支)。
 """
 
 from __future__ import annotations
@@ -15,6 +18,10 @@ from typing import Any, Optional
 from data_sources import haversine_km
 
 DISTANCE_BANDS: list[dict[str, Any]] = [
+    # 0-50 km:神朱 2026-09-27 要求"重新添加"。与其余四档口径不同 —— **含城市内部**
+    # (low=0 时 band_inner_radius_m 给 0,Overpass 退化成单圆 around 查询),
+    # 前端下拉/图例/范围圈都从 /api/places/meta 读,这里加一条即全链路生效。
+    {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50},
     {"key": "50_100", "label": "50-100 km", "low": 50, "high": 100},
     {"key": "100_200", "label": "100-200 km", "low": 100, "high": 200},
     {"key": "200_300", "label": "200-300 km", "low": 200, "high": 300},

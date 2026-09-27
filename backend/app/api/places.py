@@ -32,8 +32,10 @@ from sqlalchemy.orm import Session
 from data_sources import DataSourceError
 from db import repository as repo
 from db.base import get_session
+from services import details as detail_service
 from services import intro as intro_service
 from services import place_loader
+from services import recommend as recommend_service
 from services import seed_data
 from services.bands import DISTANCE_BANDS, band_keys, find_band
 from services.classify import (
@@ -65,6 +67,17 @@ REVERSE_NOTE = (
     "范围圈始终以传入的 GPS 坐标为圆心,不用行政区中心。"
     "反查失败/限流时 resolved=false,起点名降级为『我的位置(纬度,经度)』——"
     "仍是 HTTP 200,前端照常画环查库,不报错。"
+)
+RECOMMEND_NOTE = (
+    "AI 推荐只读**已入库**的目的地(不触网抓取):按当前 (城市, band, 分类) 的候选"
+    "让 LLM 挑 3~5 个最值得去的,附推荐理由;结果按候选指纹落库缓存,同分段重复查询不重复调 LLM。"
+    "LLM 未配置 key 或调用失败时降级为『按距离取前 N 条』(degraded=true、basis=distance),不报错。"
+    "推荐依据 = LLM 知识 + 候选的真实名称/分类/距离/OSM 标签(basis=llm+osm_tags),不额外联网抓资料。"
+)
+DETAILS_NOTE = (
+    "长介绍(列表用 2~3 句)按 POI 缓存:只给**还没有**长介绍的 POI 调 LLM,"
+    "单次最多 limit 条(前端分批懒加载);失败降级为不写行、下次可重试,"
+    "reason 区分 no_key / all_failed / ok,便于前端给出可操作提示。"
 )
 
 
@@ -201,8 +214,127 @@ def list_places(
         "intro_pending": repo.count_places(
             session, origin_city=city, band=band_def["key"], missing_intro=True
         ),
+        "detail_pending": repo.count_places_missing_detail(
+            session, origin_city=city, band=band_def["key"], category=wanted_category
+        ),
         "elapsed_s": round(time.monotonic() - started, 2),
         "note": PLACES_NOTE,
+    }
+
+
+def _require_segment(session: Session, city: str, band: str, category: Optional[str]) -> dict[str, Any]:
+    """校验 band/category 并返回分段定义(推荐/长介绍两个只读端点共用)。"""
+    band_def = find_band(band)
+    if band_def is None:
+        raise HTTPException(400, f"未知距离分段:{band}(可选:{'、'.join(band_keys())})")
+    if category and not is_known_category(category):
+        raise HTTPException(400, f"未知分类:{category}(可选:{'、'.join(category_keys())})")
+    return band_def
+
+
+def _segment_origin(session: Session, city: str, band_key: str) -> dict[str, Any]:
+    """取该 (城市, band) 入库时记下的起点(库里没有水位时坐标为空,距离一律 None)。"""
+    record = repo.get_segment(session, origin_city=city, band=band_key)
+    if record is None:
+        return {"lat": None, "lng": None, "name": city}
+    return {"lat": record.origin_lat, "lng": record.origin_lng, "name": record.origin_name or city}
+
+
+@router.get("/places/recommend")
+def recommend_places(
+    origin: str = Query(..., min_length=1, description="起点城市名,如:上海"),
+    band: str = Query(..., description="距离分段 key:0_50 / 50_100 / ..."),
+    category: Optional[str] = Query(None, description="分类过滤,留空 = 该段全部"),
+    count: Optional[int] = Query(None, ge=0, description="推荐条数(默认 5,收敛到 3~5)"),
+    refresh: bool = Query(False, description="true = 忽略推荐缓存重新调 LLM"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """AI 推荐当前分段最值得去的 3~5 个目的地(只读库,不触网抓取;结果按候选指纹缓存)。"""
+    city = _clean(origin)
+    if not city:
+        raise HTTPException(400, "起点城市不能为空")
+    wanted_category = _clean(category)
+    band_def = _require_segment(session, city, band, wanted_category)
+
+    started = time.monotonic()
+    seed_origin = _segment_origin(session, city, band_def["key"])
+    places = repo.list_places(
+        session,
+        origin_city=city,
+        band=band_def["key"],
+        category=wanted_category,
+        origin_lat=seed_origin["lat"],
+        origin_lng=seed_origin["lng"],
+    )
+    outcome = recommend_service.recommend_places(
+        session,
+        origin_city=city,
+        band=band_def["key"],
+        category=wanted_category,
+        places=places,
+        count=(recommend_service.DEFAULT_COUNT if count is None else count),
+        origin_name=seed_origin["name"],
+        band_label=band_def["label"],
+        refresh=refresh,
+    )
+    detail_texts = repo.detail_map(session, [item["id"] for item in outcome["items"]])
+    for item in outcome["items"]:
+        item["detail"] = detail_texts.get(int(item["id"]))
+    return {
+        "origin_city": city,
+        "band": {"key": band_def["key"], "label": band_def["label"],
+                 "low_km": band_def["low"], "high_km": band_def["high"]},
+        "category": wanted_category,
+        "count": len(outcome["items"]),
+        **{key: value for key, value in outcome.items() if key != "items"},
+        "items": outcome["items"],
+        "detail_pending": repo.count_places_missing_detail(
+            session, origin_city=city, band=band_def["key"], category=wanted_category
+        ),
+        "elapsed_s": round(time.monotonic() - started, 2),
+        "note": RECOMMEND_NOTE,
+    }
+
+
+@router.get("/places/details")
+def fill_details(
+    origin: str = Query(..., min_length=1, description="起点城市名,如:上海"),
+    band: str = Query(..., description="距离分段 key"),
+    category: Optional[str] = Query(None, description="分类过滤,留空 = 该段全部"),
+    limit: Optional[int] = Query(None, ge=0, description=f"本次最多生成几条(默认 {detail_service.DEFAULT_BATCH},0/留空 = 默认)"),
+    place_ids: Optional[str] = Query(None, description="只给这些 id 生成(逗号分隔,前端「可见条优先」用)"),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """给还没有长介绍的目的地补 2~3 句重点介绍(按 POI 缓存;前端分批懒加载)。"""
+    city = _clean(origin)
+    if not city:
+        raise HTTPException(400, "起点城市不能为空")
+    wanted_category = _clean(category)
+    band_def = _require_segment(session, city, band, wanted_category)
+
+    wanted_ids = [
+        int(chunk) for chunk in (place_ids or "").replace("，", ",").split(",")
+        if chunk.strip().lstrip("-").isdigit()
+    ]
+    batch = detail_service.DEFAULT_BATCH if not limit else min(int(limit), detail_service.MAX_BATCH)
+    started = time.monotonic()
+    stats = detail_service.fill_missing_details(
+        session,
+        origin_city=city,
+        band=band_def["key"],
+        category=wanted_category,
+        limit=batch,
+        only_ids=wanted_ids or None,
+    )
+    texts = repo.detail_map(session, stats.get("filled_ids") or wanted_ids)
+    return {
+        "origin_city": city,
+        "band": band_def["key"],
+        "category": wanted_category,
+        "items": [{"place_id": int(pid), "text": text} for pid, text in sorted(texts.items())],
+        **{key: value for key, value in stats.items() if key != "filled_ids"},
+        "elapsed_s": round(time.monotonic() - started, 2),
+        "note": DETAILS_NOTE,
     }
 
 

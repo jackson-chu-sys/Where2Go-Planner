@@ -158,7 +158,7 @@ class OsrmClient:
         self.endpoint = resolved.rstrip("/")
         self.timeout = normalize_timeout(timeout)
         self.user_agent = user_agent or USER_AGENT
-        self._session = session if session is not None else build_session(self.user_agent)
+        self._session = session if session is not None else build_session(self.user_agent, source="osrm")
 
     def route(
         self,

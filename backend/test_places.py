@@ -335,7 +335,7 @@ def test_seed_place_without_osm_id_gets_stable_identity(session) -> None:
 
 def test_loader_rejects_bad_band_and_city(session) -> None:
     with pytest.raises(ValueError, match="未知距离分段"):
-        place_loader.load_segment(session, city="上海", band="0_50", fetcher=ExplodingFetcher())
+        place_loader.load_segment(session, city="上海", band="0_10", fetcher=ExplodingFetcher())
     with pytest.raises(ValueError, match="起点城市不能为空"):
         place_loader.load_segment(session, city="  ", band="50_100", fetcher=ExplodingFetcher())
     with pytest.raises(ValueError, match="成对"):
@@ -348,11 +348,11 @@ def test_loader_rejects_bad_band_and_city(session) -> None:
 
 
 def test_filter_to_band_keeps_only_ring_and_sorts_by_distance() -> None:
-    band = DISTANCE_BANDS[0]
+    band = next(item for item in DISTANCE_BANDS if item["low"] > 0)
     kept = filter_to_band(SAMPLE_CANDIDATES, SHANGHAI["lat"], SHANGHAI["lng"], band)
     assert [row["name"] for row in kept] == ["远山", "古镇"]
     assert all(in_band(row["distance_km"], band) for row in kept)
-    assert band_radius_m(band) == 100_000.0
+    assert band_radius_m(band) == band["high"] * 1000
     assert in_band(50, band) and not in_band(100, band), "环为 [low, high),互斥"
 
 
@@ -429,7 +429,7 @@ def test_api_places_filters_by_category_and_band(session, offline_sources) -> No
 
 def test_api_places_rejects_bad_input(session, offline_sources) -> None:
     expect_http_error(
-        lambda: places_api.list_places(origin="上海", band="0_50", category=None, lat=None, lng=None,
+        lambda: places_api.list_places(origin="上海", band="0_10", category=None, lat=None, lng=None,
                                        refresh=False, session=session),
         400, "未知距离分段", "50_100",
     )
@@ -464,7 +464,7 @@ def test_api_places_reports_upstream_failure_in_chinese(session, monkeypatch) ->
 def test_api_geocode_returns_origin_and_cached_segments(session, offline_sources) -> None:
     payload = places_api.geocode_city(city="上海", session=session)
     assert payload["origin"] == {"city": "上海", "name": "上海市, 中国", **SHANGHAI}
-    assert [band["key"] for band in payload["bands"]] == ["50_100", "100_200", "200_300", "300_500"]
+    assert [band["key"] for band in payload["bands"]] == ["0_50", "50_100", "100_200", "200_300", "300_500"]
     assert payload["segments"] == []
 
     places_api.list_places(origin="上海", band="50_100", category=None, lat=None, lng=None,
@@ -477,7 +477,7 @@ def test_api_geocode_returns_origin_and_cached_segments(session, offline_sources
 
 def test_api_places_meta_exposes_bands_and_categories() -> None:
     meta = places_api.places_meta()
-    assert [band["key"] for band in meta["bands"]] == ["50_100", "100_200", "200_300", "300_500"]
+    assert [band["key"] for band in meta["bands"]] == ["0_50", "50_100", "100_200", "200_300", "300_500"]
     assert all({"low", "high", "label", "key"} <= set(band) for band in meta["bands"])
     keys = [item["key"] for item in meta["categories"]]
     assert keys[:4] == ["自然风光", "小城人文美食", "滑雪场", "运动"]

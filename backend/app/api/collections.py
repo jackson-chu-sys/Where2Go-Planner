@@ -38,6 +38,9 @@ from services import routes as route_service
 router = APIRouter()
 
 MAX_PAGE = 200  # 单次列表上限:前端传更大的 limit 也按这个截断,免得一次把整库拉走
+# 父级标注(功能4):写在 summary 里的键名 —— 收藏是快照,父级也是快照的一部分,
+# 不新增物理列就不需要迁移,旧数据没有这个键时前端按"未归类"显示。
+PARENT_KEY = "parent"
 
 COLLECTIONS_NOTE = (
     "收藏存的是快照:收藏那一刻的方式/时长/费用/里程(即 /api/routes 的返回,geometry 不入库),"
@@ -116,15 +119,69 @@ def _resolve_mode(kind: str, raw_mode: Any) -> str:
 
 
 def _summary_of(payload: Mapping[str, Any], *, mode: str) -> dict[str, Any]:
-    """快照摘要归一:只收 JSON 对象,规范键由 :func:`db.repository.collection_summary` 补齐。"""
+    """快照摘要归一:只收 JSON 对象,规范键由 :func:`db.repository.collection_summary` 补齐。
+
+    额外收一个 ``parent``(功能4「路线/住宿收藏挂到目的地下」):调用方给了就规范化后
+    一起写进 ``summary``(**不新增物理列**,summary 本就是自由 JSON 快照,回读原样返回);
+    没给且是路线收藏时,用目的地 OSM 身份/坐标**自动派生**一个父级(见 :func:`_auto_parent`)。
+    """
     raw = payload.get("summary")
     if raw is None:
-        return repo.collection_summary(None, mode=mode)
-    if not isinstance(raw, Mapping):
+        summary = repo.collection_summary(None, mode=mode)
+    elif not isinstance(raw, Mapping):
         raise HTTPException(
             400, f"参数 summary 必须是 JSON 对象,收到:{type(raw).__name__}"
         )
-    return repo.collection_summary(raw, mode=mode)
+    else:
+        summary = repo.collection_summary(raw, mode=mode)
+    parent = _parent_of(payload) or _auto_parent(payload)
+    if parent:
+        summary[PARENT_KEY] = parent
+    return summary
+
+
+def _parent_of(payload: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """显式父级(``payload["parent"]``)归一:必须是对象且带 ``ref_key``,否则 **400**。"""
+    raw = payload.get(PARENT_KEY)
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise HTTPException(400, f"参数 parent 必须是 JSON 对象,收到:{type(raw).__name__}")
+    ref_key = models.clean_text(raw.get("ref_key"), limit=models.REF_KEY_LEN)
+    if not ref_key:
+        raise HTTPException(400, "参数 parent 缺少必要字段:ref_key")
+    return {
+        "kind": models.clean_text(raw.get("kind"), limit=16) or models.KIND_PLACE,
+        "ref_key": ref_key,
+        "name": models.clean_text(raw.get("name"), limit=models.POINT_NAME_LEN) or "",
+    }
+
+
+def _auto_parent(payload: Mapping[str, Any]) -> Optional[dict[str, str]]:
+    """**路线**收藏的父级 = 目的地(用它的 OSM 身份,退化到坐标定点串;与 ref_key 同口径)。
+
+    只对 ``kind=route`` 派生:目的地收藏本身就是那个节点(``parent`` 会等于自己,没意义);
+    住宿收藏的父级由前端在收藏时显式给出(它知道自己在哪个目的地面板里被收藏的)。
+    与目的地收藏的 ``ref_key`` 完全一致(``place:<osm_type>/<osm_id>`` 或 ``place:<lat,lng>``),
+    前端把两级拼在一起时不需要额外映射表。缺目的地引用时返回 ``None``(不报错)。
+    """
+    if models.collection_kind(payload.get("kind")) != models.KIND_ROUTE:
+        return None
+    try:
+        ref_key = models.collection_ref_key(
+            kind=models.KIND_PLACE,
+            osm_type=payload.get("osm_type"),
+            osm_id=payload.get("osm_id"),
+            to_lat=payload.get("to_lat"),
+            to_lng=payload.get("to_lng"),
+        )
+    except ValueError:
+        return None
+    return {
+        "kind": models.KIND_PLACE,
+        "ref_key": ref_key,
+        "name": models.clean_text(payload.get("to_name"), limit=models.POINT_NAME_LEN) or "",
+    }
 
 
 def _display_name(payload: Mapping[str, Any], *, kind: str, mode: str) -> Optional[str]:

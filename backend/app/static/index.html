@@ -45,7 +45,8 @@
   .pop .src{color:#0f766e;font-size:11px;margin-top:7px}
   .pop .src b{color:#0f766e}
   .pop .blurb{color:#6b7280;font-size:12px;margin-top:5px}
-  .pop .acts{margin-top:9px}
+  .pop .acts{margin-top:9px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pop .acts .pop-go{flex:1 1 auto}
   .pop-go{width:100%;padding:7px 10px;font-size:13px}
   /* 路线面板(TASK-2b):浮在地图右上角的侧栏;窄屏降级成地图下方的普通卡片 */
   #mapWrap{position:relative}
@@ -169,6 +170,29 @@
   .sc-intro.empty{color:#9ca3af;font-style:italic}
   .sc-est{color:#92400e;background:#fef3c7;font-size:10px;padding:1px 6px;border-radius:8px}
   .stay-more{color:#6b7280;font-size:11px;margin-top:7px}
+  /* AI 推荐 + 地图下方列表(TASK-FE 功能2/3):推荐 pin 更大更醒目,列表里推荐条置顶 */
+  .pin.reco{width:34px;height:34px;border:3px solid #f59e0b;box-shadow:0 2px 9px rgba(0,0,0,.5)}
+  .pin.reco span{font-size:15px}
+  .pl-row{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:8px;background:#fff}
+  .pl-row.reco{border-color:#fcd34d;background:#fffbeb}
+  .pl-top{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  .pl-nm{font-weight:700;font-size:14px}
+  .pl-km{color:#6b7280;font-size:12px}
+  .pl-reason{color:#92400e;font-size:12px;margin-top:5px}
+  .pl-detail{color:#1f2937;font-size:13px;line-height:1.55;margin-top:6px}
+  .pl-detail.empty{color:#9ca3af;font-style:italic}
+  .pl-gen{margin-left:8px;padding:3px 10px;font-size:12px;background:#e0f2fe;color:#075985;border-radius:7px}
+  .pl-gen:hover{background:#bae6fd}
+  .pl-acts{margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pl-acts .pop-go{width:auto;flex:0 0 auto;padding:6px 11px;font-size:12px}
+  .pl-more{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:9px}
+  .pl-more button{padding:6px 12px;font-size:13px}
+  /* 收藏面板两层(TASK-FE 功能4):目的地为父节点,路线/住宿缩进挂在下面 */
+  .fp-node{margin-top:10px}
+  .fp-kids{margin:2px 0 0 14px;border-left:3px solid #99f6e4;padding-left:9px}
+  .fp-kid-ttl{font-size:12px;font-weight:700;color:#0f766e;margin-top:8px}
+  .fp-kids .fp-item{border-style:dashed;background:#fcfefd}
+  .fp-orphan-note{color:#9ca3af;font-size:11px;margin-top:4px}
   @media (max-width:680px){
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
@@ -177,8 +201,9 @@
 </head>
 <body>
 <header>
-  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段5b · 收藏对比 + 行程方案入库)</span></h1>
-  <p>起点城市 / 我的位置 + 环形距离分段 → 地图渲染已入库目的地 · 点 pin 出驾车/铁路/飞机路线对比 ·
+  <h1>🧭 Where2Go · 目的地地图 <span style="font-weight:400;font-size:13px">(阶段5c · AI 推荐上地图 + 列表长介绍 + 两层收藏)</span></h1>
+  <p>起点城市 / 我的位置 + 距离分段(含 0-50 km 市区/近郊)→ 地图默认只画 AI 推荐的 3~5 个目的地 ·
+     地图下方列表推荐置顶、长介绍分批懒加载 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
 <main>
@@ -206,6 +231,22 @@
     <div class="legend" id="legend"></div>
     <div class="note" id="note" style="display:none"></div>
     <div class="err" id="err" style="display:none"></div>
+  </div>
+  <!-- AI 推荐与地图显示范围(TASK-FE 功能2):默认只把 AI 推荐的 3~5 个目的地画到地图上,
+       免得针太密;推荐读 /api/places/recommend(只读库、按候选指纹缓存),失败只降级提示不弹框。 -->
+  <div class="card">
+    <div class="row">
+      <div class="field"><label for="pinScope">地图显示范围</label>
+        <select id="pinScope"
+                title="默认只画 AI 推荐的 3~5 个目的地(大号描边 pin + 名称标签);切「全部」画该分段所有已入库目的地(范围圈不变)">
+          <option value="reco" selected>仅 AI 推荐(3~5 个)</option>
+          <option value="all">全部目的地(可能很密)</option>
+        </select></div>
+      <div class="field" style="flex:0 0 auto"><label for="recoRefresh">AI 推荐</label>
+        <button type="button" id="recoRefresh" class="secondary"
+                title="忽略推荐缓存,重新调一次 LLM 换一批(GET /api/places/recommend&refresh=true)">🔁 换一批 / 重新推荐</button></div>
+    </div>
+    <div class="rp-msg" id="recoMsg" style="display:none"></div>
   </div>
   <div id="mapWrap">
     <div id="map"></div>
@@ -235,6 +276,21 @@
         <div class="stay-more" id="stayMore" style="display:none"></div>
       </div>
     </aside>
+  </div>
+  <!-- 地图下方列表(TASK-FE 功能3):AI 推荐置顶(推荐理由 + 2~3 句长介绍),其余按距起点由近到远;
+       长介绍走 /api/places/details 分批懒加载(每批 10 条、推荐条优先),先出骨架不阻塞首屏。 -->
+  <div class="card" id="placeList">
+    <div class="rp-head">
+      <div class="rp-ttl" id="placeListTitle">📋 目的地列表(AI 推荐置顶)</div>
+    </div>
+    <div class="rp-sub" id="placeListSub">先渲染名称 / 分类 / 距起点,2~3 句长介绍随后分批补上。</div>
+    <div class="pl-more">
+      <button type="button" id="detailMore" class="secondary" disabled
+              title="分批调 GET /api/places/details 补 2~3 句重点介绍(每批 10 条,推荐条优先;生成中再点一下 = 暂停自动续批)">继续生成介绍</button>
+      <span class="fp-sub">长介绍由 LLM 按 POI 生成并缓存在库里,只补还没有的;失败会给可操作的中文提示。</span>
+    </div>
+    <div class="rp-msg" id="placeListMsg" style="display:none"></div>
+    <div id="placeListBody"></div>
   </div>
   <!-- 我的收藏弹层(TASK-2c-fe):对接 /api/collections;收藏按钮在路线卡片内,取消收藏在列表项内 -->
   <div id="favPanel" role="dialog" aria-modal="true" aria-labelledby="favPanelTitle">
@@ -303,7 +359,11 @@
   住宿:OSM tourism 检索目的地周边落脚点,价格与简介为 AI 预估参考价
   (强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」),不代订、不抓 OTA 实时价 ·
   行程方案:勾选收藏组合后存进后端(SQLite),总花费由后端按收藏快照的「当时口径」估算
-  (quote.kind=estimate + note 双标注),仅供参考、不代订不抓实时价
+  (quote.kind=estimate + note 双标注),仅供参考、不代订不抓实时价 ·
+  AI 推荐:地图默认只画后端推荐的 3~5 个目的地(可切「全部目的地」),LLM 没 key / 调用失败时
+  降级为「按距离推荐」并在页面上标明原因 · 长介绍:地图下方列表分批懒加载(每批 10 条、推荐条优先),
+  按 POI 缓存在库里、只补还没有的 · 收藏两层:目的地为父节点,它的路线与住宿收藏挂在下面
+  (旧收藏没有父级标注时落「未归类」,一条不丢)
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -346,6 +406,11 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
              places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0},
              stays:{token:0,loadedKey:null,payload:null},
              fav:{open:false,items:[],busy:false,favedKeys:{}},
+             // 功能2/3:地图显示范围(默认只画 AI 推荐)+ 推荐与长介绍的异步态(token 守卫可作废)
+             pinScope:"reco",
+             reco:{payload:null,items:[],details:{},pending:0,loading:false,failed:false,
+                   busy:false,auto:true,token:0,detailToken:0},
+             list:{reco:0,other:0},
              tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false}};
 let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
 
@@ -395,8 +460,10 @@ function renderBandOptions(){
   $("band").innerHTML=state.meta.bands.map(band=>{
     const count=state.cached[band.key];
     const suffix=(count===undefined)?"(未入库,首次需抓取)":("(已入库 "+count+" 条)");
+    // 功能1:分段一律来自 /api/places/meta(不硬编码 key);下限为 0 的那档含市区/近郊
+    const scope=Number(band.low)===0?" · 含市区/近郊":"";
     const selected=band.key===state.band?" selected":"";
-    return '<option value="'+esc(band.key)+'"'+selected+'>'+esc(band.label)+" "+esc(suffix)+"</option>";
+    return '<option value="'+esc(band.key)+'"'+selected+'>'+esc(band.label+scope)+" "+esc(suffix)+"</option>";
   }).join("");
 }
 
@@ -460,7 +527,8 @@ function popupHtml(place,index){
     '<div class="kv">距起点直线 <b>'+distance+"</b> · 分段 "+esc(bandLabel)+"</div>"+
     (meta.blurb?'<div class="blurb">'+esc(meta.blurb)+"</div>":"")+
     '<div class="intro'+(hasIntro?"":" empty")+'">'+intro+"</div>"+
-    '<div class="acts"><button type="button" class="pop-go js-routes" data-i="'+Number(index)+
+    '<div class="acts">'+placeFavButtonHtml(place,index)+
+      '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+
       '" title="重新拉一次 /api/routes 并跳到路线面板">🚗 路线对比(时长 / 费用 / 跳转)</button></div>'+
     identityHtml(place)+"</div>";
 }
@@ -826,6 +894,9 @@ async function addFavStay(item,button){
     name:"🛏️ "+String(item.name||"(无名住宿)")+" · 住宿",
     summary:{kind:"estimate",price_estimate:item.price_estimate||null,
              stay_kind:item.kind||null,distance_km:item.distance_km}};
+  // 功能4:住宿收藏显式带上所属目的地 → 后端写进 summary.parent,收藏面板才能两层挂载
+  const parent=stayParentPayload(state.routePanel.place);
+  if(parent) payload.parent=parent;
   try{
     const resp=await sendJSON("/api/collections",{method:"POST",
       headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
@@ -948,6 +1019,24 @@ function onDocumentClick(event){
     const items=(state.stays.payload&&Array.isArray(state.stays.payload.items))?state.stays.payload.items:[];
     const item=items[Number(stayFavButton.getAttribute("data-i"))];
     if(item&&!stayFavButton.disabled) addFavStay(item,stayFavButton);
+    return;
+  }
+  // 收藏目的地按钮(TASK-FE 功能4):popup 与地图下方列表共用一套判定(kind=place)
+  const placeFavButton=target.closest(".js-place-fav");
+  if(placeFavButton){
+    event.stopPropagation();
+    const place=state.places[Number(placeFavButton.getAttribute("data-i"))];
+    if(place&&!placeFavButton.disabled) addFavPlace(place,placeFavButton);
+    return;
+  }
+  // 单条「生成介绍」(功能3):只为这一条调 /api/places/details(place_ids=…),并停掉自动续批
+  const genButton=target.closest(".js-detail-gen");
+  if(genButton){
+    event.stopPropagation();
+    if(!state.reco.busy){
+      state.reco.auto=false;
+      loadDetails(1,[Number(genButton.getAttribute("data-id"))]);
+    }
     return;
   }
   // 收藏弹层内的取消收藏按钮
@@ -1102,6 +1191,10 @@ function onLocateFailed(error){
 async function loadPlaces(refresh){
   if(!state.origin) return;
   showErr("");setBusy(true);
+  // 换分段/分类/重抓:上一段的 AI 推荐、长介绍与在飞请求一律作废(列表与 pin 重新来过)
+  state.reco.token+=1;state.reco.detailToken+=1;
+  state.reco.payload=null;state.reco.items=[];state.reco.details={};state.reco.pending=0;
+  state.reco.auto=true;state.reco.busy=false;state.reco.loading=false;state.reco.failed=false;
   const known=state.cached[state.band];
   if(refresh) setStatus("正在重新抓取 Overpass 四分类并集(公共源较慢,约 20-120s)…");
   else if(known===undefined) setStatus("该分段尚未入库,正在抓取 Overpass 四分类并集(约 20-120s)…");
@@ -1116,13 +1209,22 @@ async function loadPlaces(refresh){
     state.bandMeta=data.band;
     const total=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
     state.cached[state.band]=total;
-    renderBandOptions();drawRings();fitRings();drawPins(data.places);renderLegend(data.counts_by_category);
+    renderBandOptions();drawRings();fitRings();renderLegend(data.counts_by_category);
+    // 功能2/3:首屏不阻塞 —— 立刻按显示范围画针(默认只画推荐)+ 渲染列表骨架,
+    // AI 推荐与 2~3 句长介绍随后异步补(失败只落 #recoMsg / #placeListMsg)。
+    state.places=Array.isArray(data.places)?data.places:[];
+    state.reco.pending=Math.max(0,Number(data.detail_pending)||0);
+    renderPinsByScope();
+    renderPlaceList();
     const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"Overpass 实时抓取 → 已入库";
+    const hint=bandHint(data.band);   // 功能1:含市区/近郊那一档给一句口径说明
     const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
     setStatus('起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
       " · 分类 <b>"+esc(state.category||"全部")+"</b> · 显示 <b>"+data.count+"</b> / 库内 "+total+
-      " 条 · 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+introNote(data));
+      " 条 · 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+introNote(data)+
+      (hint?(" · "+hint):""));
     if(!data.count) showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
+    loadRecommend(false);   // 功能2:AI 推荐异步补(不 await,首屏不等它;失败只落 #recoMsg)
   }catch(error){
     showErr("查询失败:"+error.message);setStatus("查询失败");
   }finally{setBusy(false);}
@@ -1164,6 +1266,503 @@ async function fillIntros(){
   }catch(error){
     showErr("补简介失败:"+error.message);setStatus("补简介失败");
   }finally{setBusy(false);}
+}
+
+// --------------------------------------------------------------------------- //
+// AI 推荐 + 地图下方列表 + 目的地收藏(TASK-FE,功能1~4)
+// 口径全在后端:/api/places/recommend(推荐 3~5 条 + 推荐理由 + degraded/basis 降级标注、
+// 按候选指纹缓存)、/api/places/details(2~3 句长介绍,按 POI 缓存,单次 limit ≤ 40)。
+// 前端只做展示与分批调度:首屏先画骨架(名称/分类/距离),推荐与长介绍异步补;
+// 任一异步失败只在 #recoMsg / #placeListMsg 里给中文原因与下一步操作,不 alert、不抛未捕获异常。
+// 分段一律来自 state.meta.bands(前端不硬编码分段 key),含市区/近郊那一档由 low==0 认出来。
+// --------------------------------------------------------------------------- //
+const RECO_COUNT=5;         // 推荐条数(后端 clamp 到 3~5)
+const DETAIL_BATCH=10;      // 长介绍每批条数(与后端 detail_service.DEFAULT_BATCH 一致)
+const DETAIL_BATCH_MAX=40;  // 单批上限(与后端 detail_service.MAX_BATCH 一致,别超)
+
+// 功能1:分段口径由 /api/places/meta 带出;下限为 0 的那档含市区/近郊(其余是环形、不含城区)
+function bandHint(band){
+  if(!band||Number(band.low)!==0) return "";
+  return "该分段含市区/近郊(从起点 0 km 起算,不是环形差集),市内 POI 密度高、列表会更长";
+}
+
+function setRecoMsg(message,tone){
+  const box=$("recoMsg");
+  if(box){
+    box.textContent=message||"";
+    box.className="rp-msg"+((tone==="warn"||tone==="err")?(" "+tone):"");
+    box.style.display=message?"block":"none";
+  }
+  const button=$("recoRefresh");
+  if(button) button.disabled=!!state.reco.loading;
+}
+function setListMsg(message,tone){
+  const box=$("placeListMsg");
+  if(box){
+    box.textContent=message||"";
+    box.className="rp-msg"+((tone==="warn"||tone==="err")?(" "+tone):"");
+    box.style.display=message?"block":"none";
+  }
+}
+function byDistance(left,right){
+  const first=num(left&&left.distance_km),second=num(right&&right.distance_km);
+  if(!isFinite(first)) return 1;      // 没有距离(库里缺起点水位)一律排后面
+  if(!isFinite(second)) return -1;
+  return first-second;
+}
+function recoRows(){
+  const payload=state.reco.payload;
+  const items=(payload&&Array.isArray(payload.items))?payload.items:[];
+  return items.filter(place=>!!place);
+}
+// 列表数据面:推荐条置顶,其余按距起点由近到远(推荐条从"其他"里剔掉,不重复出现)
+function listSplit(){
+  const reco=recoRows();
+  const seen={};
+  reco.forEach(place=>{seen[Number(place.id)]=true;});
+  const other=(state.places||[]).filter(place=>place&&!seen[Number(place.id)]).sort(byDistance);
+  return {reco:reco,other:other};
+}
+// 长介绍:优先取本轮 /api/places/details 生成后缓存的文本,其次取推荐响应里带回的 detail
+function detailTextOf(place){
+  if(!place) return "";
+  const cached=state.reco.details[Number(place.id)];
+  if(cached) return String(cached);
+  return place.detail?String(place.detail):"";
+}
+// 推荐条与 state.places 同源(同 城市/分段/分类),但按 id/OSM 身份兜底补齐一次:
+// popup 与列表里的按钮都靠 data-i 取 state.places[i],两种画针模式下都要能取回同一条 Place。
+function ensurePlaceRow(place){
+  const list=state.places||(state.places=[]);
+  const id=Number(place&&place.id);
+  const hasOsm=!!(place&&place.osm_type&&place.osm_id!==undefined&&place.osm_id!==null);
+  for(let index=0;index<list.length;index++){
+    const row=list[index];
+    if(!row) continue;
+    if(isFinite(id)&&Number(row.id)===id) return index;
+    if(hasOsm&&row.osm_type===place.osm_type&&Number(row.osm_id)===Number(place.osm_id)) return index;
+  }
+  list.push(place);
+  return list.length-1;
+}
+
+// 功能2:按 state.pinScope 画针 —— "reco"(默认)只画 AI 推荐(大号带描边 pin + 名称 tooltip),
+// "all" 沿用既有 drawPins(全部分类配色)。切换只重画 pin,范围圈与列表都不动。
+function renderPinsByScope(){
+  if(!pins||!map) return;
+  if(state.pinScope==="all"){drawPins(state.places||[]);return;}
+  closeRoutePanel();   // 换显示范围:旧 pin 可能已不在图上,面板与画线一并清掉
+  pins.clearLayers();
+  const rows=recoRows().filter(place=>coordsReady(place));
+  rows.forEach(place=>{
+    const index=ensurePlaceRow(place);
+    const meta=categoryMeta(place.category);
+    const icon=L.divIcon({className:"",iconSize:[34,34],iconAnchor:[17,34],popupAnchor:[0,-32],
+      html:'<div class="pin reco" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
+    const marker=L.marker([place.lat,place.lng],{icon:icon,zIndexOffset:600});
+    marker.bindPopup(popupHtml(place,index));
+    marker.bindTooltip("★ "+(place.name||"(无名)")+" · "+fmtKm(place.distance_km),
+      {direction:"top",offset:[0,-30]});
+    marker.on("popupopen",()=>openRoutePanel(place));   // 点 pin → 侧栏路线面板自动展开
+    pins.addLayer(marker);
+  });
+  if(!rows.length) setListMsg(emptyPinHint(),"warn");
+}
+// 地图上没有推荐 pin 时的说明:分清「还在加载」「加载失败」「推荐为空」「推荐点缺坐标」四种情况,
+// 每种都给下一步操作(换一批 / 切全部目的地),不让人对着空地图猜
+function emptyPinHint(){
+  const scopeHint="或把「地图显示范围」切成「全部目的地」(范围圈不变)。";
+  if(state.reco.payload){
+    return state.reco.items.length
+      ? ("AI 推荐的 "+state.reco.items.length+" 条都缺坐标,画不出 pin:"+scopeHint)
+      : ("当前没有可画的推荐点(AI 推荐为空):点「🔁 换一批 / 重新推荐」重试,"+scopeHint);
+  }
+  if(state.reco.failed){
+    return "AI 推荐加载失败,地图上没有推荐点(原因见上方「AI 推荐」状态条):"+
+      "点「🔁 换一批 / 重新推荐」重试,"+scopeHint;
+  }
+  return "AI 推荐还在路上:拿到后地图上只画推荐的 3~5 个大号 pin。想马上看到全部目的地,"+
+    "把「地图显示范围」切成「全部目的地」即可。";
+}
+
+// 单行:名称 / 分类 / 距起点 / 2~3 句长介绍(缺则给「生成介绍」入口)/ ⭐收藏 / 🚗路线入口
+function placeRowHtml(place,index,isReco){
+  const meta=categoryMeta(place.category);
+  const km=num(place.distance_km);
+  const detail=detailTextOf(place);
+  const rank=Number(place.rank)||0;
+  const head='<div class="pl-top">'+
+    (isReco?('<span class="badge real" title="AI 推荐名次(rank);地图上的大号 pin 就是这几条">★ 推荐 '+
+      (rank||"—")+"</span>"):"")+
+    '<span class="pl-nm">'+(esc(place.name)||"(无名)")+"</span>"+
+    '<span class="cat" style="background:'+meta.color+'">'+meta.emoji+" "+esc(meta.label)+"</span>"+
+    '<span class="pl-km">距起点 '+esc(isFinite(km)?fmtKm(km):"—")+"</span></div>";
+  const reason=isReco
+    ? ('<div class="pl-reason">推荐理由:'+
+       (place.reason?esc(place.reason):"后端没给理由(降级为按距离推荐,见上方 AI 推荐状态)")+"</div>")
+    : "";
+  const body=detail
+    ? '<div class="pl-detail">'+esc(detail)+"</div>"
+    : '<div class="pl-detail empty">长介绍(2~3 句)还没生成'+
+      '<button type="button" class="pl-gen js-detail-gen" data-id="'+Number(place.id)+'"'+
+      ' title="只为这一条调 LLM 生成重点介绍(GET /api/places/details?place_ids=…)">生成介绍</button></div>';
+  const acts='<div class="pl-acts">'+placeFavButtonHtml(place,index)+
+    '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+'"'+
+    ' title="打开路线面板:驾车/铁路/飞机对比 + 周边住宿(路线与住宿可分别收藏,挂在目的地下面)">'+
+    "🚗 路线 / 🛏️ 住宿</button></div>";
+  return '<div class="pl-row'+(isReco?" reco":"")+'" data-id="'+Number(place.id)+'">'+
+    head+reason+body+acts+"</div>";
+}
+
+// 功能3:渲染地图下方列表(推荐置顶 + 其余按距离)。长介绍不在这次渲染里等,分批补后就地更新。
+function renderPlaceList(){
+  const box=$("placeListBody");
+  if(!box) return;
+  const split=listSplit();
+  state.list.reco=split.reco.length;
+  state.list.other=split.other.length;
+  if(!split.reco.length&&!split.other.length){
+    box.innerHTML='<div class="fp-empty">还没有目的地可列:先搜索起点城市并选分段'+
+      "(未入库的分段会自动抓一次 Overpass),或点「重新抓取」。"+
+      "有目的地后 AI 推荐与长介绍会自动补上。</div>";
+    renderListSub();syncDetailMore();
+    return;
+  }
+  let html='<div class="fp-grp"><div class="fp-grp-ttl">🤖 AI 推荐(置顶)'+
+    '<span class="fp-grp-cnt">'+(state.reco.payload?(split.reco.length+" 条 · 地图默认只画这些"):"加载中…")+
+    "</span></div>"+
+    (split.reco.length
+      ? split.reco.map(place=>placeRowHtml(place,ensurePlaceRow(place),true)).join("")
+      : '<div class="fp-empty">推荐还没到:稍等一下,或点「🔁 换一批 / 重新推荐」;'+
+        "也可以先把「地图显示范围」切成「全部目的地」。</div>")+"</div>";
+  html+='<div class="fp-grp"><div class="fp-grp-ttl">📋 其他目的地'+
+    '<span class="fp-grp-cnt">'+split.other.length+" 条 · 按距起点由近到远</span></div>"+
+    (split.other.length
+      ? split.other.map(place=>placeRowHtml(place,ensurePlaceRow(place),false)).join("")
+      : '<div class="fp-empty">这个分段/分类下没有别的目的地了。</div>')+"</div>";
+  box.innerHTML=html;
+  renderListSub();
+  syncDetailMore();
+  syncPlaceFavButtons();
+}
+function renderListSub(){
+  const box=$("placeListSub");
+  if(!box) return;
+  const payload=state.reco.payload;
+  const pending=Math.max(0,Math.round(num(state.reco.pending)||0));
+  const recoPart=payload
+    ? ((payload.degraded||payload.basis==="distance")
+        ? ("按距离推荐(未走 AI)置顶 "+state.list.reco+" 条")
+        : ("AI 推荐置顶 "+state.list.reco+" 条"))
+    : "AI 推荐加载中…";
+  box.textContent="共 "+(state.places||[]).length+" 条 · "+recoPart+" · 其他 "+state.list.other+
+    " 条按距起点由近到远 · 长介绍每批 "+DETAIL_BATCH+" 条懒加载(推荐条优先)"+
+    (pending>0?(" · 还剩 "+pending+" 条待生成"):(((state.places||[]).length)?" · 长介绍已补齐":""));
+}
+function syncDetailMore(){
+  const button=$("detailMore");
+  if(!button) return;
+  const pending=Math.max(0,Math.round(num(state.reco.pending)||0));
+  if(state.reco.busy){
+    button.disabled=false;
+    button.textContent="⏸ 暂停自动生成(还剩 "+pending+" 条)";
+    button.title="正在分批调 GET /api/places/details;点一下停止自动续批(在飞的那批仍会写完)";
+    return;
+  }
+  if(!(state.places||[]).length){
+    button.disabled=true;
+    button.textContent="继续生成介绍";
+    button.title="还没有目的地:先搜索起点城市并选分段";
+    return;
+  }
+  if(pending>0){
+    button.disabled=false;
+    button.textContent="继续生成介绍(还剩 "+pending+" 条)";
+    button.title="按批(每批 "+DETAIL_BATCH+" 条)调 GET /api/places/details 补 2~3 句重点介绍,推荐条优先";
+    return;
+  }
+  button.disabled=true;
+  button.textContent="长介绍已补齐";
+  button.title="该分段/分类下已入库的目的地都有 2~3 句重点介绍了(换分段或重新抓取后会重新计数)";
+}
+// 还缺长介绍的条目 id(推荐条在前,其余按距离)——后端 place_ids 参数就是给这个用的
+function pendingDetailIds(limit){
+  const size=Math.max(1,Math.min(DETAIL_BATCH_MAX,Math.round(num(limit)||DETAIL_BATCH)));
+  const wanted=[];
+  const rows=listSplit();
+  const ordered=rows.reco.concat(rows.other);
+  for(let index=0;index<ordered.length&&wanted.length<size;index++){
+    const place=ordered[index];
+    const id=Number(place&&place.id);
+    if(!isFinite(id)||id<=0) continue;
+    if(detailTextOf(place)) continue;
+    wanted.push(id);
+  }
+  return wanted;
+}
+// 就地更新:只把新拿到的长介绍写进对应行的 .pl-detail,不整页重渲染(免得滚动位置/按钮态丢)
+function updateDetailCells(items){
+  (items||[]).forEach(entry=>{
+    const text=(entry&&entry.text)?String(entry.text):"";
+    if(!text) return;
+    const id=Number(entry.place_id);
+    document.querySelectorAll('#placeListBody .pl-row[data-id="'+id+'"] .pl-detail').forEach(cell=>{
+      cell.className="pl-detail";
+      cell.textContent=text;
+    });
+  });
+}
+function detailReasonText(payload){
+  const reason=String((payload&&payload.reason)||"");
+  if(reason==="no_key") return "后端未配置 LLM key(WHERE2GO_LLM_* / DEEPSEEK_API_KEY)";
+  if(reason==="all_failed") return "这一批 LLM 调用全部失败(可能繁忙或超额)";
+  return reason||"未知原因";
+}
+function applyDetails(payload){
+  const items=(payload&&Array.isArray(payload.items))?payload.items:[];
+  items.forEach(entry=>{
+    const text=(entry&&entry.text)?String(entry.text):"";
+    if(text) state.reco.details[Number(entry.place_id)]=text;
+  });
+  if(payload&&payload.pending!==undefined&&payload.pending!==null){
+    state.reco.pending=Math.max(0,Number(payload.pending)||0);
+  }
+  updateDetailCells(items);
+  renderListSub();
+  const filled=Number((payload&&payload.filled)||0);
+  const failed=Number((payload&&payload.failed)||0);
+  if(filled<=0){
+    state.reco.auto=false;   // 没有进展就停下来,别空转烧额度;给出可操作的下一步
+    setListMsg("长介绍没有生成:"+detailReasonText(payload)+" · 本批扫了 "+
+      Number((payload&&payload.scanned)||0)+" 条 / 失败 "+failed+" 条。"+
+      "列表骨架与地图不受影响,可稍后点「继续生成介绍」重试。","err");
+    syncDetailMore();
+    return;
+  }
+  const pending=state.reco.pending;
+  setListMsg("长介绍:本批生成 "+filled+" 条 · 失败 "+failed+" 条 · 还剩 "+pending+" 条 · "+
+    String((payload&&payload.provider)||"LLM")+" · 耗时 "+Number((payload&&payload.elapsed_s)||0)+"s"+
+    ((pending>0&&state.reco.auto)?" · 自动续批中(点「⏸ 暂停自动生成」可停)":""),
+    pending>0?"":"warn");
+  syncDetailMore();
+  maybeContinueDetails(payload);
+}
+// 懒加载续批:成功后自动下一批,直到 pending==0 / 用户点停 / 这一批没进展(见 applyDetails)。
+// 注意:本函数在 applyDetails 里被调用,此时 state.reco.busy 还是 true(在飞的那批尚未收尾),
+// 所以这里只看 auto;真正的"上一批已收尾"由 setTimeout 回调里的 busy 复核保证。
+function maybeContinueDetails(payload){
+  if(!state.reco.auto) return;
+  if(!(Number((payload&&payload.pending)||0)>0)) return;
+  if(!(Number((payload&&payload.filled)||0)>0)) return;
+  const ids=pendingDetailIds(DETAIL_BATCH);
+  if(!ids.length) return;
+  window.setTimeout(()=>{
+    if(state.reco.auto&&!state.reco.busy) loadDetails(DETAIL_BATCH,pendingDetailIds(DETAIL_BATCH));
+  },0);
+}
+// 分批补长介绍:GET /api/places/details?origin=&band=&category=&limit=&place_ids=
+async function loadDetails(batchSize,placeIds){
+  if(!state.origin||!state.origin.city){
+    setListMsg("还没有起点:先搜索城市或点「📍 我的位置」,再生成长介绍。","warn");
+    return false;
+  }
+  const size=Math.max(1,Math.min(DETAIL_BATCH_MAX,Math.round(num(batchSize)||DETAIL_BATCH)));
+  const ids=(placeIds||[]).map(value=>Number(value))
+    .filter(value=>isFinite(value)&&value>0).slice(0,DETAIL_BATCH_MAX);
+  state.reco.detailToken+=1;
+  const token=state.reco.detailToken;
+  state.reco.busy=true;
+  syncDetailMore();
+  setListMsg("正在生成长介绍(本批 "+(ids.length||size)+" 条,"+
+    (ids.length?"推荐条与列表靠前的优先":"按库内顺序")+",约 10-60s):"+
+    "生成一批就地补进列表,不整页刷新、不阻塞地图…");
+  const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),limit:String(size)});
+  if(state.category) params.set("category",String(state.category));
+  if(ids.length) params.set("place_ids",ids.join(","));
+  try{
+    const payload=await getJSON("/api/places/details?"+params.toString());
+    if(token!==state.reco.detailToken) return false;   // 换分段/分类或被新批次顶掉:作废
+    applyDetails(payload);
+    return true;
+  }catch(error){
+    if(token!==state.reco.detailToken) return false;
+    state.reco.auto=false;
+    setListMsg("长介绍生成失败:"+((error&&error.message)||error)+
+      "。已停止自动续批(地图与列表骨架不受影响);可稍后点「继续生成介绍」重试。","err");
+    return false;
+  }finally{
+    if(token===state.reco.detailToken){state.reco.busy=false;syncDetailMore();}
+  }
+}
+// 「继续生成介绍(还剩 N 条)」:生成中点一下 = 暂停自动续批;否则从推荐条开始补一批
+function onDetailMore(){
+  if(state.reco.busy){
+    state.reco.auto=false;
+    setListMsg("已暂停自动续批(在飞的那批仍会写完);想接着补再点「继续生成介绍」。","warn");
+    syncDetailMore();
+    return;
+  }
+  state.reco.auto=true;
+  const ids=pendingDetailIds(DETAIL_BATCH);
+  if(!ids.length){
+    setListMsg((state.places||[]).length
+      ? "列表里的目的地都已有长介绍;若状态栏还报有缺口,点「重新抓取」或换个分段/分类再试。"
+      : "还没有目的地:先搜索起点城市并选分段。","warn");
+    syncDetailMore();
+    return;
+  }
+  loadDetails(DETAIL_BATCH,ids);
+}
+
+function recoReasonText(payload){
+  const reason=String((payload&&payload.reason)||"");
+  if(reason==="no_key") return "后端未配置 LLM key(WHERE2GO_LLM_* / DEEPSEEK_API_KEY)";
+  if(reason.indexOf("llm_error:")===0) return "LLM 调用失败:"+reason.slice("llm_error:".length);
+  if(reason==="unparsable") return "LLM 输出解析不出来";
+  if(reason==="no_candidates") return "该分段/分类下还没有已入库的目的地";
+  return reason||"ok";
+}
+function applyRecoData(payload){
+  state.reco.payload=payload;
+  const items=(payload&&Array.isArray(payload.items))?payload.items:[];
+  state.reco.items=items;
+  items.forEach(place=>{
+    const text=(place&&place.detail)?String(place.detail):"";
+    if(text) state.reco.details[Number(place.id)]=text;   // 推荐响应已带回的长介绍直接用
+  });
+  if(payload&&payload.detail_pending!==undefined&&payload.detail_pending!==null){
+    state.reco.pending=Math.max(0,Number(payload.detail_pending)||0);
+  }
+  renderPinsByScope();
+  renderPlaceList();
+  if(!items.length){
+    setRecoMsg("AI 推荐:没有可推荐的目的地 —— "+recoReasonText(payload)+
+      "。先点「重新抓取」把该分段入库,或换个分段/分类;地图可切「全部目的地」照常看。","warn");
+    return;
+  }
+  const bandLabel=(payload.band&&payload.band.label)||currentBand().label;
+  const parts=["AI 推荐 "+items.length+" 条 · "+bandLabel+" · 候选 "+
+    Number((payload&&payload.candidates)||0)+" 条"];
+  if(payload.degraded||payload.basis==="distance"){
+    parts.push("按距离推荐(未走 AI,原因:"+recoReasonText(payload)+")");
+  }else{
+    parts.push("依据 "+String(payload.basis||"llm+osm_tags"));
+    if(payload.provider) parts.push("模型 "+String(payload.provider));
+  }
+  parts.push(payload.cached?"命中推荐缓存(没重复调 LLM)":"本次新算");
+  if(state.reco.pending>0) parts.push("长介绍还剩 "+state.reco.pending+" 条待生成(下方分批补)");
+  setRecoMsg(parts.join(" · ")+" · 不满意可点「🔁 换一批 / 重新推荐」(refresh=true)",
+    (payload.degraded||payload.basis==="distance")?"warn":"");
+  if(state.reco.auto&&state.reco.pending>0&&!state.reco.busy){
+    const ids=pendingDetailIds(DETAIL_BATCH);
+    if(ids.length) loadDetails(DETAIL_BATCH,ids);
+  }
+}
+// 功能2:拉 AI 推荐(GET /api/places/recommend);换分段/分类时 token 作废过期响应
+async function loadRecommend(refresh){
+  if(!state.origin||!state.origin.city){
+    setRecoMsg("还没有起点:先搜索城市或点「📍 我的位置」,再让 AI 推荐该分段最值得去的目的地。","warn");
+    return;
+  }
+  state.reco.token+=1;
+  const token=state.reco.token;
+  state.reco.loading=true;
+  state.reco.failed=false;
+  setRecoMsg("正在让 AI 从「"+String(state.origin.name||state.origin.city)+" · "+
+    ((state.bandMeta&&state.bandMeta.label)||currentBand().label)+" · "+
+    (state.category?categoryMeta(state.category).label:"全部分类")+"」的候选里挑 "+RECO_COUNT+
+    " 个最值得去的(只读库不触网,约 3-20s)…");
+  try{
+    const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),
+      count:String(RECO_COUNT)});
+    if(state.category) params.set("category",String(state.category));
+    if(refresh) params.set("refresh","true");
+    const payload=await getJSON("/api/places/recommend?"+params.toString());
+    if(token!==state.reco.token) return;   // 已换分段/分类:丢掉过期响应
+    applyRecoData(payload);
+  }catch(error){
+    if(token!==state.reco.token) return;
+    state.reco.payload=null;
+    state.reco.items=[];
+    state.reco.failed=true;
+    renderPinsByScope();
+    renderPlaceList();
+    setRecoMsg("AI 推荐加载失败:"+((error&&error.message)||error)+
+      "。地图与列表不受影响:可点「🔁 换一批 / 重新推荐」重试,"+
+      "或把「地图显示范围」切成「全部目的地」。","err");
+  }finally{
+    if(token!==state.reco.token) return;
+    state.reco.loading=false;
+    const button=$("recoRefresh");
+    if(button) button.disabled=false;   // 状态文案保留原色调(降级 warn / 失败 err)
+  }
+}
+
+// 功能4:目的地收藏。判定键与后端唯一键 (kind,ref_key,mode) 同口径:
+// kind=place、mode 恒空串、ref_key="place:<osm_type>/<osm_id>"(无 OSM 身份时退化到坐标定点 7 位串)。
+function placeFavItem(place){
+  const identity=(place&&place.osm_type&&place.osm_id!==undefined&&place.osm_id!==null)
+    ? (String(place.osm_type).toLowerCase()+"/"+Number(place.osm_id))
+    : (num(place&&place.lat).toFixed(7)+","+num(place&&place.lng).toFixed(7));
+  return {kind:"place",ref_key:"place:"+identity,mode:""};
+}
+function placeFavButtonHtml(place,index){
+  const keys=currentFavKeys();
+  const faved=!!keys[favKey(placeFavItem(place))];
+  return '<button type="button" class="fav-btn js-place-fav'+(faved?" faved":"")+'" '+
+    'data-i="'+Number(index)+'"'+(faved?" disabled":"")+' title="'+
+    (faved?"这个目的地已在收藏里(收藏幂等,重复收藏只会刷新快照)"
+          :"收藏这个目的地(POST /api/collections,kind=place):它的路线与住宿收藏会挂在它下面")+'">'+
+    (faved?"★ 已收藏":"⭐ 收藏目的地")+"</button>";
+}
+function syncPlaceFavButtons(){
+  const keys=currentFavKeys();
+  document.querySelectorAll(".js-place-fav").forEach(button=>{
+    const place=(state.places||[])[Number(button.getAttribute("data-i"))];
+    if(!place) return;
+    const faved=!!keys[favKey(placeFavItem(place))];
+    button.classList.toggle("faved",faved);
+    button.disabled=faved;
+    button.textContent=faved?"★ 已收藏":"⭐ 收藏目的地";
+  });
+}
+function placeFavPayload(place){
+  const origin=state.origin||{};
+  const detail=detailTextOf(place);
+  const payload={kind:"place",
+    to_lat:num(place.lat),to_lng:num(place.lng),
+    name:"📍 "+String(place.name||"(无名)")+" · 目的地",
+    summary:{category:place.category||null,distance_km:place.distance_km,
+             intro:place.intro||null,detail_text:detail||null,source:place.source||null,
+             origin_city:origin.city||null,band:state.band,
+             rank:Number(place.rank)||null,reason:place.reason||null}};
+  if(place.name) payload.to_name=String(place.name);
+  if(place.osm_type&&place.osm_id!==undefined&&place.osm_id!==null){
+    payload.osm_type=place.osm_type;payload.osm_id=place.osm_id;
+  }
+  return payload;
+}
+async function addFavPlace(place,button){
+  if(button) button.disabled=true;
+  try{
+    const resp=await sendJSON("/api/collections",{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(placeFavPayload(place))});
+    await refreshFavItems();   // 与收藏弹层、路线/住宿收藏判定同源
+    const name=(resp.collection&&resp.collection.name)||"该目的地";
+    setRecoMsg(resp.created?("已收藏目的地:「"+name+"」(它的路线与住宿收藏会挂在它下面)")
+      :("这个目的地之前已收藏,快照已刷新:「"+name+"」"),"warn");
+  }catch(error){
+    setRecoMsg("收藏目的地失败:"+((error&&error.message)||error)+"(不影响地图与列表)","err");
+  }finally{
+    syncPlaceFavButtons();
+  }
+}
+// 住宿收藏的显式父级(功能4):用当前打开面板的目的地身份拼 parent,
+// ref_key 与目的地收藏完全同口径,收藏面板才能把住宿挂到目的地下面。
+function stayParentPayload(place){
+  if(!place||!coordsReady(place)) return null;
+  const identity=placeFavItem(place);
+  return {kind:"place",ref_key:identity.ref_key,name:String(place.name||"")};
 }
 
 // --------------------------------------------------------------------------- //
@@ -1253,7 +1852,8 @@ async function addFavRoute(route,button){
 }
 function favItemHtml(item){
   const summary=item.summary||{};
-  const isStay=favGroupOf(item)==="stay";
+  const group=favGroupOf(item);
+  const isStay=group==="stay";
   const kindBadge=(item.kind==="route")
     ? '<span class="badge real">路线</span>'
     : (isStay?'<span class="badge est">住宿</span>':'<span class="badge est">目的地</span>');
@@ -1264,10 +1864,14 @@ function favItemHtml(item){
     ? '<div class="fp-meta">预估价 <b>'+esc(summary.price_estimate||"暂无 AI 预估价")+"</b>"+
       (isFinite(num(summary.distance_km))?(" · 距目的地 <b>"+num(summary.distance_km).toFixed(1)+" km</b>"):"")+
       '<span class="sc-est">'+esc(STAYS_EST_FALLBACK)+"</span></div>"
-    : '<div class="fp-meta">时长 <b>'+esc(fmtDuration(summary.duration_min))+"</b> · 费用 <b>"+
-      esc(fmtCost(summary.cost_cny))+"</b> · 里程 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+
-      (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
-        esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>";
+    : (group==="place"
+      // 目的地节点(功能4 的父层):分类 / 距起点 / 一句话简介,不显示路线的时长费用
+      ? '<div class="fp-meta">'+(summary.category?("分类 <b>"+esc(summary.category)+"</b> · "):"")+
+        "距起点 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+(summary.intro?(" · "+esc(summary.intro)):"")+"</div>"
+      : '<div class="fp-meta">时长 <b>'+esc(fmtDuration(summary.duration_min))+"</b> · 费用 <b>"+
+        esc(fmtCost(summary.cost_cny))+"</b> · 里程 <b>"+esc(fmtKm(summary.distance_km))+"</b>"+
+        (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
+          esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>");
   return '<div class="fp-item" data-id="'+Number(item.id)+'">'+
     '<div class="fp-nm">'+esc(item.name||"(无名)")+"</div>"+
     '<div class="fp-badges">'+kindBadge+(modeLabel?'<span class="badge">'+esc(modeLabel)+"</span>":"")+
@@ -1283,21 +1887,94 @@ function renderFavItems(){
   const box=$("favPanelList");
   if(!box) return;
   if(!state.fav.items.length){
-    box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin → 路线面板里点「☆ 收藏路线」/「☆ 收藏住宿」。</div>';
+    box.innerHTML='<div class="fp-empty">还没有收藏:在地图上点目的地 pin(或地图下方列表)→「⭐ 收藏目的地」,'+
+      "再在路线面板里「☆ 收藏路线」/「☆ 收藏住宿」,它们会挂在该目的地下面。</div>";
     return;
   }
-  // 按类型分组(TASK-4a):路线 / 目的地 / 住宿。住宿是 kind=place + 🛏️ 前缀/addFavStay 的 summary 指纹
-  const groups=favGroups();
-  const titles={legs:"🚗 路线收藏",place:"📍 目的地收藏",stay:"🛏️ 住宿收藏"};
-  let html="";
-  ["legs","place","stay"].forEach(key=>{
-    const rows=groups[key];
-    if(!rows.length) return;
-    html+='<div class="fp-grp"><div class="fp-grp-ttl">'+titles[key]+
-      '<span class="fp-grp-cnt">'+rows.length+" 项</span></div>"+
-      rows.map(favItemHtml).join("")+"</div>";
+  // 两层(TASK-FE 功能4):目的地收藏作父节点,该目的地的路线/住宿收藏按 summary.parent 挂在下面;
+  // 类型判定仍复用 favGroupOf(route/place/stay),旧收藏没有 parent → 落「未归类」平铺(不丢、不报错)。
+  box.innerHTML=favTree(state.fav.items);
+}
+// 收藏面板两层(功能4):目的地收藏作父节点,路线/住宿按 summary.parent.ref_key 挂在它下面。
+// 父节点判定 = kind=="place" + ref_key 以 "place:" 开头 + 不是住宿(住宿是 kind=place 的另一种);
+// 子节点判定沿用 favGroupOf(route/stay);没有父级的旧收藏落「未归类」平铺(不丢、不报错)。
+const FAV_GROUP_TITLES={legs:"🚗 路线收藏",place:"📍 目的地收藏",stay:"🛏️ 住宿收藏",orphan:"🗂️ 未归类"};
+const FAV_KID_TITLES={routes:"🚗 路线",stays:"🛏️ 住宿"};
+function favTree(items){
+  const rows=(items||[]).filter(item=>!!item);
+  const parents=[];
+  const kids={};
+  const ghosts=[];
+  const orphan=[];
+  const isParent=item=>favGroupOf(item)==="place"&&String(item.ref_key||"").indexOf("place:")===0;
+  // 第一遍:先把目的地收藏认成父节点(列表是"新的在前",子收藏可能比父收藏先出现)
+  rows.forEach(item=>{
+    if(!isParent(item)) return;
+    const refKey=String(item.ref_key||"");
+    parents.push(item);
+    if(!kids[refKey]) kids[refKey]={routes:[],stays:[]};
   });
-  box.innerHTML=html;
+  // 第二遍:路线/住宿按 summary.parent.ref_key 挂上去;父级自己没被收藏的单独成组(数据不丢)
+  rows.forEach(item=>{
+    if(isParent(item)) return;   // 已在第一遍作为父节点渲染
+    const group=favGroupOf(item);
+    const parent=(item.summary&&item.summary.parent)||null;
+    const parentKey=String((parent&&parent.ref_key)||"");
+    if(!parentKey){orphan.push(item);return;}
+    if(!kids[parentKey]){
+      kids[parentKey]={routes:[],stays:[]};
+      ghosts.push({ref_key:parentKey,name:String((parent&&parent.name)||"")});
+    }
+    kids[parentKey][group==="stay"?"stays":"routes"].push(item);
+  });
+  let html="";
+  if(parents.length||ghosts.length){
+    html+='<div class="fp-grp"><div class="fp-grp-ttl">'+FAV_GROUP_TITLES.place+
+      '<span class="fp-grp-cnt">'+parents.length+" 个目的地 · 路线与住宿挂在下面</span></div></div>";
+  }
+  parents.forEach(item=>{
+    const key=String(item.ref_key||"");
+    html+='<div class="fp-node">'+favItemHtml(item)+favKidsHtml(kids[key])+"</div>";
+  });
+  ghosts.forEach(ghost=>{
+    // 有父级标注、但那个目的地本身没被收藏:仍单独成组挂出来,数据不丢
+    html+='<div class="fp-node"><div class="fp-item"><div class="fp-nm">📍 '+
+      (esc(ghost.name)||"(无名目的地)")+'<span class="fp-grp-cnt"> · 该目的地本身没收藏</span></div>'+
+      '<div class="fp-meta">下面这些收藏都标了父级 <b>'+esc(ghost.ref_key)+
+      "</b>;在地图上收藏该目的地后会自动并到一起。</div></div>"+
+      favKidsHtml(kids[ghost.ref_key])+"</div>";
+  });
+  if(orphan.length){
+    const titles={route:FAV_GROUP_TITLES.legs,place:FAV_GROUP_TITLES.place,stay:FAV_GROUP_TITLES.stay};
+    let inner="";
+    ["route","place","stay"].forEach(key=>{
+      const rowsOfKind=orphan.filter(item=>favGroupOf(item)===key);
+      if(!rowsOfKind.length) return;
+      inner+='<div class="fp-kid-ttl">'+titles[key]+" · "+rowsOfKind.length+" 项</div>"+
+        rowsOfKind.map(favItemHtml).join("");
+    });
+    html+='<div class="fp-grp"><div class="fp-grp-ttl">'+FAV_GROUP_TITLES.orphan+
+      '<span class="fp-grp-cnt">'+orphan.length+" 项</span></div>"+
+      '<div class="fp-orphan-note">这些收藏没有父级标注(summary.parent 缺失,多是旧数据):'+
+      "按类型平铺在下面,一条不少、可以逐条取消。</div>"+inner+"</div>";
+  }
+  return html;
+}
+// 子层:缩进 + 小标题「🚗 路线 · N 条」「🛏️ 住宿 · N 条」,每条都能单独取消收藏(沿用 deleteFav)
+function favKidsHtml(kids){
+  const rows=kids||{routes:[],stays:[]};
+  let html="";
+  if(rows.routes.length){
+    html+='<div class="fp-kids" title="'+esc(FAV_GROUP_TITLES.legs)+'"><div class="fp-kid-ttl">'+
+      FAV_KID_TITLES.routes+" · "+rows.routes.length+" 条</div>"+
+      rows.routes.map(favItemHtml).join("")+"</div>";
+  }
+  if(rows.stays.length){
+    html+='<div class="fp-kids" title="'+esc(FAV_GROUP_TITLES.stay)+'"><div class="fp-kid-ttl">'+
+      FAV_KID_TITLES.stays+" · "+rows.stays.length+" 条</div>"+
+      rows.stays.map(favItemHtml).join("")+"</div>";
+  }
+  return html;
 }
 // 收藏按类型分组(收藏面板与行程方案勾选面共用同一套分组口径)
 function favGroups(){
@@ -1332,6 +2009,7 @@ async function refreshFavItems(){
   }
   syncFavButtons();
   syncStayFavButtons();   // 住宿卡片的「已收藏」态与收藏列表同源刷新(TASK-3b)
+  syncPlaceFavButtons();  // 目的地收藏按钮(popup + 地图下方列表)同源刷新(TASK-FE 功能4)
 }
 async function openFavPanel(){
   state.fav.open=true;
@@ -1756,6 +2434,13 @@ $("band").addEventListener("change",event=>{state.band=event.target.value;drawRi
 $("category").addEventListener("change",event=>{state.category=event.target.value;loadPlaces(false);});
 $("reload").addEventListener("click",()=>loadPlaces(true));
 $("intro").addEventListener("click",fillIntros);
+// 功能2/3:地图显示范围(默认仅推荐)、AI 推荐换一批、长介绍继续生成
+$("pinScope").addEventListener("change",event=>{
+  state.pinScope=(event.target.value==="all")?"all":"reco";
+  renderPinsByScope();   // 只重画 pin:范围圈、列表与推荐结果都不动
+});
+$("recoRefresh").addEventListener("click",()=>loadRecommend(true));
+$("detailMore").addEventListener("click",onDetailMore);
 $("routePanelClose").addEventListener("click",closeRoutePanel);
 $("openFav").addEventListener("click",openFavPanel);
 $("favPanelClose").addEventListener("click",closeFavPanel);

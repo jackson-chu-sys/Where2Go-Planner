@@ -43,6 +43,7 @@ class FakeLLM:
         self.error = error
         self._enabled = enabled
         self.prompts: list[str] = []
+        self.kwargs: list[dict[str, Any]] = []
 
     @property
     def enabled(self) -> bool:
@@ -52,8 +53,9 @@ class FakeLLM:
     def label(self) -> str:
         return "假 LLM · fake-model"
 
-    def chat(self, prompt: str, *, system: str = "") -> str:
+    def chat(self, prompt: str, *, system: str = "", **kwargs: Any) -> str:
         self.prompts.append(prompt)
+        self.kwargs.append(kwargs)
         if self.error is not None:
             raise self.error
         return self.reply
@@ -211,6 +213,53 @@ def test_recommend_places_degrades_when_llm_fails_or_output_unparsable(session) 
         client=FakeLLM(reply="今天不想输出 JSON"),
     )
     assert garble["degraded"] is True and garble["reason"] == "unparsable"
+
+
+def test_degraded_recommendation_cache_retries_after_ttl(session) -> None:
+    """降级结果不能钉死:新鲜期内命中缓存,过期后自动重算(这次 LLM 好了就该是 AI 结果)。"""
+    from datetime import timedelta
+
+    from db.models import utcnow
+
+    rows = [seed(session, osm_id=index, name=f"点{index}") for index in range(1, 4)]
+    places = [place_dict(row) for row in rows]
+    first = recommend_service.recommend_places(
+        session, origin_city="上海", band="50_100", places=places, count=3,
+        client=FakeLLM(error=RuntimeError("超时")),
+    )
+    assert first["degraded"] is True and first["reason"].startswith("llm_error:")
+
+    good = FakeLLM(reply=json.dumps([{"place_id": rows[0].id, "reason": "首选"}], ensure_ascii=False))
+    cached = recommend_service.recommend_places(
+        session, origin_city="上海", band="50_100", places=places, count=3, client=good,
+    )
+    assert cached["cached"] is True and not good.prompts, "降级缓存新鲜期内不重复打 LLM"
+
+    row = repo.get_recommendation(
+        session, origin_city="上海", band="50_100", signature=cached["signature"]
+    )
+    row.updated_at = utcnow() - timedelta(seconds=recommend_service.DEGRADED_RETRY_S + 30)
+    session.commit()
+
+    retried = recommend_service.recommend_places(
+        session, origin_city="上海", band="50_100", places=places, count=3, client=good,
+    )
+    assert retried["cached"] is False and retried["degraded"] is False
+    assert retried["items"][0]["reason"] == "首选" and len(good.prompts) == 1
+
+
+def test_recommend_places_asks_for_enough_output_budget(session) -> None:
+    """回归:推荐必须显式放宽 max_tokens / timeout(默认 120 tokens / 20s 会被截断或读超时)。"""
+    rows = [seed(session, osm_id=index, name=f"点{index}") for index in range(1, 4)]
+    llm = FakeLLM(reply=json.dumps([{"place_id": rows[0].id, "reason": "近"}], ensure_ascii=False))
+    recommend_service.recommend_places(
+        session, origin_city="上海", band="50_100", places=[place_dict(row) for row in rows],
+        count=3, client=llm,
+    )
+    call = llm.kwargs[-1]
+    assert call.get("max_tokens") == recommend_service.RECO_MAX_TOKENS >= 700
+    assert call.get("timeout") == recommend_service.RECO_TIMEOUT_S >= 120, \
+        "实测单次 45~95s,超时给少了就会被读超时降级"
 
 
 def test_recommend_places_without_candidates_is_empty(session) -> None:

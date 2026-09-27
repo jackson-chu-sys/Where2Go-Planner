@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from data_sources import DataSourceError
 from db import repository as repo
+from db.models import utcnow
 from services.intro import LLMClient
 from services.intro import default_client as default_llm_client
 from services.intro import tag_facts
@@ -45,6 +46,16 @@ FACT_TAGS = 6
 
 BASIS_LLM = "llm+osm_tags"
 BASIS_DISTANCE = "distance"
+
+# 输出预算与超时(**2026-09-27 实测踩坑**):一条推荐理由 ≤80 字,5 条 = 400+ 汉字,
+# 再叠 JSON 结构;LLM 客户端默认 max_tokens=120 / timeout=20s 会把结果**截断或读超时**,
+# 表现为"推荐拿到 provider 却是降级结果"。实测 qwen3.8-max 对这份 prompt 单次要 45~95s
+# (与候选条数关系不大,是模型侧延迟),所以超时给到 180s 留足余量。
+RECO_MAX_TOKENS = 900
+RECO_TIMEOUT_S = 180.0
+# 降级结果的缓存寿命:**降级(没走成 AI)不该一直挂着**。命中降级缓存但已过期时自动重算,
+# 既不会每次请求都去打一个正在挂的 LLM,也不会让"一次失败"钉死整个分段。
+DEGRADED_RETRY_S = 600.0
 
 SOURCE_NAME = "Recommend"
 SYSTEM_PROMPT = (
@@ -77,6 +88,24 @@ def clamp_count(value: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_COUNT
     return max(MIN_COUNT, min(MAX_COUNT, number))
+
+
+def degraded_cache_fresh(row: Any, *, now: Optional[Any] = None) -> bool:
+    """降级推荐缓存是否还算新鲜(新鲜 = 直接复用,不重算)。
+
+    不能把"降级"钉死:LLM 没配 key / 超时那一次算出来的按距离结果,如果在缓存里躺到永远,
+    用户就会一直看到"按距离推荐"。这里给它 :data:`DEGRADED_RETRY_S` 的寿命。
+    """
+    stamp = getattr(row, "updated_at", None) or getattr(row, "created_at", None)
+    if stamp is None:
+        return False
+    current = utcnow()
+    try:
+        if getattr(stamp, "tzinfo", None) is None:
+            stamp = stamp.replace(tzinfo=current.tzinfo)
+        return (current - stamp).total_seconds() < DEGRADED_RETRY_S
+    except TypeError:  # 时间戳类型异常时按"不新鲜"处理,宁可重算一次
+        return False
 
 
 def candidate_facts(place: Mapping[str, Any], index: int) -> str:
@@ -227,6 +256,8 @@ def recommend_places(
     cached_row = None if refresh else repo.get_recommendation(
         session, origin_city=origin_city, band=band, category=category, signature=signature
     )
+    if cached_row is not None and cached_row.degraded and not degraded_cache_fresh(cached_row):
+        cached_row = None  # 降级缓存过期 → 自动重算(见 DEGRADED_RETRY_S)
     if cached_row is not None:
         return _payload(cached_row.items, by_id, cached_row, cached=True)
 
@@ -244,6 +275,8 @@ def recommend_places(
                 build_prompt(candidates, count=wanted, origin_name=origin_name,
                              band_label=band_label, category=category),
                 system=SYSTEM_PROMPT,
+                max_tokens=RECO_MAX_TOKENS,
+                timeout=RECO_TIMEOUT_S,
             )
             items = parse_recommendations(raw, candidates, count=wanted)
         except DataSourceError as exc:

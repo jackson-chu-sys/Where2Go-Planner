@@ -235,8 +235,20 @@ class LLMClient:
             return "未配置"
         return f"{self.resolved.label} · {self.resolved.model}"
 
-    def chat(self, prompt: str, *, system: str = SYSTEM_PROMPT) -> str:
-        """发一次对话补全,返回文本;失败抛 :class:`data_sources.DataSourceError`。"""
+    def chat(
+        self,
+        prompt: str,
+        *,
+        system: str = SYSTEM_PROMPT,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> str:
+        """发一次对话补全,返回文本;失败抛 :class:`data_sources.DataSourceError`。
+
+        ``max_tokens`` / ``timeout`` 可按调用覆盖:一句话简介用默认(120 输出 / 20s)足够,
+        而**推荐(多条目 JSON)与 2~3 句长介绍**的输出更长、prompt 更大,必须显式放宽
+        (2026-09-27 实测:不放开就会被截断 / 20s 读超时,表现为"AI 推荐静默降级")。
+        """
         resolved = self.resolved
         if resolved is None:
             raise DataSourceError(
@@ -249,7 +261,7 @@ class LLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": self.max_tokens,
+            "max_tokens": self.max_tokens if max_tokens is None else max(16, int(max_tokens)),
             "temperature": self.temperature,
             "stream": False,
         }
@@ -259,7 +271,7 @@ class LLMClient:
             source=f"{SOURCE_NAME}/{resolved.label}",
             method="POST",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else float(timeout),
             headers={
                 "Authorization": f"Bearer {resolved.api_key}",
                 "Content-Type": "application/json",

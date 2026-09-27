@@ -1671,7 +1671,7 @@ async function loadRecommend(refresh){
   setRecoMsg("正在让 AI 从「"+String(state.origin.name||state.origin.city)+" · "+
     ((state.bandMeta&&state.bandMeta.label)||currentBand().label)+" · "+
     (state.category?categoryMeta(state.category).label:"全部分类")+"」的候选里挑 "+RECO_COUNT+
-    " 个最值得去的(只读库不触网,约 3-20s)…");
+    " 个最值得去的(只读库不触网;首次要调 LLM,实测约 1-2 分钟;同分段命中缓存后秒回)…");
   try{
     const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),
       count:String(RECO_COUNT)});

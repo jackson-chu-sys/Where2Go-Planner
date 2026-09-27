@@ -39,6 +39,10 @@ FACT_TAGS = 8
 DEFAULT_BATCH = 10
 MAX_BATCH = 40
 
+# 输出预算与超时(与推荐同因:默认 120 tokens / 20s 对 2~3 句长介绍偏紧)
+DETAIL_MAX_TOKENS = 500
+DETAIL_TIMEOUT_S = 45.0
+
 SOURCE_NAME = "Detail"
 SYSTEM_PROMPT = (
     "你是 Where2Go(周末去哪儿玩)的目的地编辑,为目的地写**两到三句**重点介绍。"
@@ -100,7 +104,8 @@ def generate_detail(
     if not str(place.get("name") or "").strip():
         return ""
     try:
-        raw = llm.chat(build_detail_prompt(place), system=SYSTEM_PROMPT)
+        raw = llm.chat(build_detail_prompt(place), system=SYSTEM_PROMPT,
+                       max_tokens=DETAIL_MAX_TOKENS, timeout=DETAIL_TIMEOUT_S)
     except DataSourceError:
         return ""
     except Exception:  # noqa: BLE001 - 长介绍是增强项,任何异常都不得阻塞列表

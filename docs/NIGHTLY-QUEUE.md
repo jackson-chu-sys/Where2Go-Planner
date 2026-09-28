@@ -530,12 +530,17 @@
 
 ## [TASK-6c] 住宿三件套：负缓存 + 半径阶梯 + 估价异步回填（BUG-3/5）
 
-- 状态: pending（派 Codex；依赖无，按文件顺序排 6b 后）
+- 状态: done
 - 目标: `services/stays.py`：①空结果/失败负缓存（6h 内同坐标半径直接回缓存态）；②半径阶梯 5→10→30km 自动扩，返回最近一家距离提示；③检索入库即刻返回列表（price_estimate=null），LLM 估价转后台批量（复用 intro 线程池口径）；④空结果分 `no_data / datasource_error / timeout` 三档 `reason` 透传 API（前端文案属 6e）。
 - 只读清单: `backend/services/stays.py`、`backend/db/models.py`、`backend/app/api/stays.py`、`backend/services/intro.py`、`backend/test_stays.py`。
 - 落地契约: 负缓存可新建 `StayQueryCache` 表（键坐标定点 7 位+radius+kind+reason+fetched_at）；`/api/stays` 响应加 `reason`/`nearest_km`/`estimating`；**估价批量 5 家/prompt（神朱定）**，模型 **qwen3.8-max（神朱定，不做双模型）**，该批解析失败留 null 不抛、不重试超过 1 次。
 - 验收: 测试 ≥20 全 mock；同坐标二次请求 0 网络；既有全绿；不动 index.html。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-28 夜班，Codex 写码+执行器收口，commit `473c463`）。
+  - `db/models.py` 新增 StayQueryCache 表（坐标定点 7 位+radius_m+kind+reason+nearest_km+fetched_at）；`services/stays.py`（+982 行）：负缓存 NEG_CACHE_TTL_S=6h（同坐标同半径命中直接回缓存态、0 网络，过期重查）、半径阶梯 STAY_RADIUS_LADDER_M=(5000,10000,30000)（未显式给 radius_m 时逐级扩，nearest_km=haversine round1）、估价异步批量（5 家/prompt、qwen3.8-max token-plan 单模型、解析失败留 null 不抛、单批重试≤1、intro.py 线程池口径、测试可注入 INLINE_EXECUTOR）、reason 三档 no_data/datasource_error/timeout；`load_or_fetch_stays` 保留兼容、新增 `load_stays` 返回带 reason/nearest_km/estimating 的结果对象；预抓 CLI 加 --ladder/--estimate/--no-wait。
+  - `app/api/stays.py` 响应加 reason/nearest_km/estimating + 空态口径 note；既有字段与 400 校验口径不变。index.html 未动。
+  - `test_stays_v2.py` 58 用例全 mock（超 ≥20 要求）。执行器复跑 pytest backend/ = **700 passed**（622 基线零改动 + 78 净增）。
+  - **Codex 256K 统计**：function_calls **60**，tokens ~5.29M total（含 cache 重放 5.0M）/output 101K+reasoning 63K；**首轮写码 17.2min——超 R8 12min 线**（监控粒度粗未及 kill，但写入后一路正常）；**总时长 40.7min 触发止损被 kill**（实现+测试文件已全部落盘、622 基线绿过一轮，执行器复跑全量后收口 commit，未浪费产物）。
+  - 备注：本条是 256K 窗口后 Codex 首次触发 40min 止损——任务体量（stays.py 重写 ~1000 行 + 58 测试）明显重于 6a/6b；后续同类大改建议契约里把「先跑基线 pytest」明确省掉（本次基线跑了两遍共 ~65s）或再拆小。
 
 ---
 

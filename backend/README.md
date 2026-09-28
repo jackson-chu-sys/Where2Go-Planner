@@ -27,12 +27,15 @@ backend/
 ├─ test_routes.py                阶段2a:路线编排/费用系数/deep-link/参数校验/OSRM 降级的纯 mock 单测(28 个用例)
 ├─ test_frontend_routes.py       阶段2b:前端路线面板静态页断言 + 前后端字段契约 + node 语法检查(23 个用例)
 ├─ test_collections.py           阶段2c:收藏表约束/ref_key 纯函数/仓储幂等 CRUD/API 校验的纯 mock 单测(55 个用例)
+├─ test_photon.py                TASK-6a:Photon 解析口径/1rps 节流/Photon→Nominatim 降级链/API geocoder 标注(44 个用例)
 ├─ data_sources/                 数据获取层(阶段0,免费无 key)
 │  ├─ __init__.py                统一导出 route / geocode / reverse / nearby_places
 │  ├─ _common.py                 User-Agent、timeout(≤20s)、JSON 请求与中文错误
 │  ├─ osrm.py                    驾车路线 → {distance_km, duration_min}(with_geometry=True 时
 │  │                             附 Leaflet 折线 [[lat, lng], ...],阶段2a 画线用;默认形状不变)
-│  ├─ nominatim.py               正向/逆向地理编码 → {lat, lng, display_name}
+│  ├─ nominatim.py               正向/逆向地理编码 → {lat, lng, display_name}(**降级**用)
+│  ├─ photon.py                  正向/逆向地理编码(**主路径**,TASK-6a)→ 同形状 {lat, lng, display_name}
+│  │                             (GeoJSON,coordinates=[lon, lat];display_name 由 properties 拼)
 │  ├─ overpass.py                周边 POI 检索 → [{lat, lng, name, tags}](with_id=True 时附 osm id/type;
 │  │                             nearby_places_grouped = 多组 tag 并集、每组独立配额,一次请求查完四分类)
 │  └─ verify_poc.py              真实网络端到端验证脚本(联网)
@@ -86,7 +89,7 @@ python backend/data_sources/verify_poc.py          # 阶段0 真实验证(需联
 
 ## 阶段1a:目的地入库与检索
 
-**口径**:按 (城市, band) 抓取。首次查该段 → Nominatim 定位起点 → 按分段**上限半径**
+**口径**:按 (城市, band) 抓取。首次查该段 → 定位起点(Photon 主 + Nominatim 降级)→ 按分段**上限半径**
 查 Overpass(多 tag 并集,一次查完)→ haversine 收敛到 `[low, high)` 环内 → 去重 + 归类
 → 按唯一键 `(osm_type, osm_id, origin_city)` upsert 入库 → 记 `SegmentFetch` 水位。
 **已入库的 (城市, band) 二次查询直接读 SQLite,不发任何网络请求**;分类过滤只作用在
@@ -113,7 +116,7 @@ API(`app/api/places.py`,POC 的 `/api/discover`、`/api/categories` 行为不变
 |---|---|
 | `GET /api/places?origin=&band=&category=` | 该段内已入库目的地;可选 `lat`/`lng`(免二次地理编码)、`refresh=true` |
 | `GET /api/places/meta` | 分段与分类元信息(前端下拉/图例/pin 颜色的唯一出处) |
-| `GET /api/geocode?city=` | 起点城市搜索(Nominatim),并回报该城市哪些分段已入库 |
+| `GET /api/geocode?city=` | 起点城市搜索(Photon 主 + Nominatim 降级),回报该城市哪些分段已入库;`geocoder` 标注这次是谁答的,两个源都失败才 **400** 中文报错 |
 
 前端 `app/static/index.html`:Leaflet 1.9.4(CDN,不打包)+ OSM 瓦片,原生 JS。
 以起点为中心画当前 band 的环形范围圈(外圆 = 上限半径、虚线内圆 = 下限半径),
@@ -178,14 +181,14 @@ python -m services.place_loader 上海 50_100 --refresh --intro-limit 24
 ## 阶段1c:起点定位/换城 + 滑雪/运动种子数据
 
 **起点定位(需求 M1.01)**:前端「📍 我的位置」走 `navigator.geolocation` 拿 GPS 坐标 →
-`GET /api/geocode/reverse?lat=&lng=` → Nominatim **逆**地理编码反查城市 → 地图重定位、
+`GET /api/geocode/reverse?lat=&lng=` → **逆**地理编码(Photon 主 + Nominatim 降级)反查城市 → 地图重定位、
 范围圈以**用户真实坐标**为圆心(不用行政区中心)。失败路径全部只给**可见提示、不抛 JS 错误**:
 
 | 情况 | 前端表现 | 后端表现 |
 |---|---|---|
 | 浏览器不支持 / 非 https 或 localhost | 黄色提示,建议改用城市搜索 | 不发请求 |
 | 用户拒绝授权 / 定位不可用 / 超时 | 黄色提示 + 保留当前起点 | 不发请求 |
-| Nominatim 挂了或反查不出城市名 | 黄色提示"已用坐标作为起点",地图照常可查 | **仍是 HTTP 200**,`resolved=false`,起点名降级为 `我的位置(31.23,121.47)` |
+| Photon 与 Nominatim 都挂了,或反查不出城市名 | 黄色提示"已用坐标作为起点",地图照常可查 | **仍是 HTTP 200**,`resolved=false`、`geocoder=none`,起点名降级为 `我的位置(31.23,121.47)` |
 
 坐标起点名只保留 2 位小数(约 1 km),避免 GPS 抖动每次都造出一个新 `origin_city` 把库切碎。
 城市搜索(阶段1a 已有)同步做了健壮化:空输入给提示不发请求;**"没搜到"不再当错误**,
@@ -468,6 +471,15 @@ leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"])
   实测结果一致,可用 `WHERE2GO_OSRM_ENDPOINT` 或 `endpoint=` 切换。
 * **Nominatim**:响应里 `lat`/`lon` 是**字符串**;必须带可识别 `User-Agent`
   (`Where2Go-POC/0.1 (dev)`),官方政策 ≤1 次/秒,客户端已内置节流。
+  产品环境无 mihomo 代理时**直连不通**(实测 15s 超时),所以 TASK-6a 起只作降级源。
+* **Photon(TASK-6a 起为地理编码主路径,2026-09-28 实测)**:路径与 Nominatim 不同 ——
+  正向 `GET /api?q=&limit=`、逆向 `GET /reverse?lat=&lon=`(`/api/reverse` 实测 **404**);
+  返回 GeoJSON,坐标在 `geometry.coordinates` 且顺序是 **`[lon, lat]`**(经度在前)、是数字不是字符串;
+  **没有 `display_name`**,要自己按 `name, city, state, country` 拼(跳过空段);**不支持 `lang` 参数**
+  (中国地名本来就是中文)。逆向固定返回最近的门牌级地点、没有 `zoom`,实测 `display_name` 形如
+  `台基厂头条14号院-10号院, 北京市, 中国`,`city_from_display_name` 照样挑得出 `北京市`。
+  代理口径 **强制直连**(`WHERE2GO_PROXY_PHOTON=off`,实测直连 1.1s、走代理 5s 挂);
+  端点可用 `WHERE2GO_PHOTON_ENDPOINT` 覆盖(产品化自建实例时改这一处即可),同样内置 1 req/s 节流。
 * **Overpass**:公共实例经常返回 `504 + HTML`("The server is probably too busy")。
   实测 `overpass-api.de` 繁忙时 `z.overpass-api.de`、`maps.mail.ru` 仍可用,因此
   客户端做了**端点链 + 重试 + 退避**降级(`used_endpoint` 可查实际服务方);

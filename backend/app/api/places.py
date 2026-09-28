@@ -11,11 +11,13 @@
   LLM 简介配置的元信息(前端下拉/图例/状态栏的唯一出处,**不含任何 key**)。
 * ``GET /api/places/intros?origin=&band=`` —— 给已入库但还没有简介的 POI 补 LLM 一句话简介
   (DB 即缓存,已有简介的不再调用;失败降级为空简介)。
-* ``GET /api/geocode?city=`` —— 起点城市搜索,复用 POC 的 Nominatim 接口,
+* ``GET /api/geocode?city=`` —— 起点城市搜索(**Photon 主 + Nominatim 降级**,TASK-6a),
   并回报该城市哪些分段已入库(前端可提示"即时读库"还是"首次抓取")。
+  响应里的 ``geocoder`` 标注这次是谁答的(``photon`` / ``nominatim``);两个源都失败
+  才是错误 → **HTTP 400** 中文报错(消息里带上两边的失败原因)。
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
-  Nominatim **逆**地理编码反查城市起点。反查失败**不报错**,降级成坐标起点
-  (``resolved=false``),前端照样能画环、能查库。
+  **逆**地理编码(同样 Photon 主 + Nominatim 降级)反查城市起点。反查失败**不报错**,
+  降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
 
 ``/api/places`` 的返回里带 ``seeded`` 与 ``counts_by_source``:OSM 国内滑雪/运动覆盖差,
 缺口由 :mod:`services.seed_data` 的人工种子数据垫底,来源标注在每条 Place 的 ``source`` 字段。
@@ -63,7 +65,8 @@ INTROS_NOTE = (
     "只给 intro 为空的 POI 调 LLM(DB 即缓存);网络/额度失败降级为空简介,下次可重试。"
 )
 REVERSE_NOTE = (
-    "浏览器定位(GPS 坐标)→ Nominatim 逆地理编码反查城市起点;"
+    "浏览器定位(GPS 坐标)→ 逆地理编码反查城市起点(Photon 主 + Nominatim 降级,"
+    "geocoder 字段标注这次是谁答的,none = 两个源都没答上);"
     "范围圈始终以传入的 GPS 坐标为圆心,不用行政区中心。"
     "反查失败/限流时 resolved=false,起点名降级为『我的位置(纬度,经度)』——"
     "仍是 HTTP 200,前端照常画环查库,不报错。"
@@ -343,18 +346,23 @@ def geocode_city(
     city: str = Query(..., min_length=1, description="城市名,如:北京"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """起点城市搜索(Nominatim),并回报该城市已入库的分段。"""
+    """起点城市搜索(Photon 主 + Nominatim 降级),并回报该城市已入库的分段。
+
+    两个源都失败(Photon 挂/空结果 **且** Nominatim 也挂)才是错误:按本仓库路由口径
+    抛 **HTTP 400** 中文报错,消息里同时带上两边的失败原因,便于判断是断网还是单源故障。
+    """
     cleaned = _clean(city)
     if not cleaned:
         raise HTTPException(400, "城市名不能为空")
     try:
-        origin = place_loader.resolve_origin(cleaned)
+        origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except DataSourceError as exc:
-        raise HTTPException(502, f"无法解析城市 '{cleaned}':{exc}") from exc
+        raise HTTPException(400, f"无法解析城市 '{cleaned}':{exc}") from exc
     return {
         "origin": origin,
+        "geocoder": geocoder,
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=cleaned),
     }
@@ -364,21 +372,25 @@ def geocode_city(
 def reverse_geocode(
     lat: float = Query(..., ge=-90, le=90, description="纬度(浏览器 GPS)"),
     lng: float = Query(..., ge=-180, le=180, description="经度(浏览器 GPS)"),
-    zoom: Optional[int] = Query(None, ge=1, le=18, description="Nominatim zoom,留空 = 区县级"),
+    zoom: Optional[int] = Query(
+        None, ge=1, le=18, description="Nominatim zoom(仅降级到 Nominatim 时生效),留空 = 区县级"
+    ),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """浏览器"我的位置" → 起点城市(Nominatim 逆地理编码),**失败也返回 200**。
+    """浏览器"我的位置" → 起点城市(Photon 主 + Nominatim 降级逆地理编码),**失败也返回 200**。
 
     与 ``/api/geocode`` 的区别:坐标已知,只需反查名字;``origin`` 里的 ``lat``/``lng``
     一律沿用传入的 GPS 坐标,范围圈要以用户真实位置为圆心。``resolved=false`` 时
-    起点名降级为 ``我的位置(31.23,121.47)``,前端给个提示即可,不必当错误处理。
+    起点名降级为 ``我的位置(31.23,121.47)``,前端给个提示即可,不必当错误处理
+    (所以这里**双失败也不报 400**,只把 ``geocoder`` 标成 ``none``)。
     """
-    origin = place_loader.resolve_reverse_origin(
+    origin, geocoder = place_loader.resolve_reverse_origin_with_source(
         lat, lng, zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom))
     )
     return {
         "origin": origin,
         "resolved": bool(origin.get("resolved")),
+        "geocoder": geocoder,
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=origin["city"]),
         "note": REVERSE_NOTE,

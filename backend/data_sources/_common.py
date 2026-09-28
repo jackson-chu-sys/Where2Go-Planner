@@ -1,6 +1,6 @@
 """数据源层公共工具:统一 User-Agent、超时与中文错误处理。
 
-三个免费数据源(OSRM / Nominatim / Overpass)共用这里的 HTTP 封装,保证:
+四个免费数据源(OSRM / Nominatim / Photon / Overpass)共用这里的 HTTP 封装,保证:
 
 * 每个请求都带 ``User-Agent``(Nominatim / Overpass 的礼貌要求);
 * 每个请求都有 timeout,且不超过 ``MAX_TIMEOUT``(20s);
@@ -33,6 +33,8 @@ SNIPPET_LEN: int = 240
 #     —— 抓取慢(BUG-1)/住宿查不到(BUG-5)的主因之一
 #   * OSRM:走代理 2.7s、直连 0.7s(都能通,直连更快)
 #   * Nominatim:**直连连接失败**(15s),必须走代理(1.4s)
+#   * Photon(TASK-6a 新增,地理编码主路径):**直连 1.1s 正常**,走代理 5s 挂
+#     —— 产品环境没有 mihomo 代理,所以 Photon 必须 off;Nominatim 只作降级
 # 所以"一刀切走代理/一刀切不走代理"都不对。这里按**数据源**决定代理口径,可用
 # ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:OVERPASS / OSRM / NOMINATIM / LLM):
 #   * ``off``  → 强制直连(忽略环境变量里的全局代理)
@@ -45,6 +47,7 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "overpass": PROXY_OFF,   # 实测走代理 504/超时,直连才通
     "osrm": PROXY_OFF,       # 直连更快(0.7s vs 2.7s),且目标站点不受限
     "nominatim": PROXY_ENV,  # 实测直连不通,必须走代理
+    "photon": PROXY_OFF,     # 实测直连 1.1s、走代理 5s 挂(产品环境无代理)
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
 }
 
@@ -93,7 +96,7 @@ def build_session(user_agent: str = USER_AGENT, *, source: Optional[str] = None)
     """创建带统一 User-Agent 与 JSON Accept 头的 :class:`requests.Session`。
 
     ``source`` 给定时按 :func:`apply_proxy_policy` 应用该数据源的代理口径
-    (``overpass`` / ``osrm`` / ``nominatim`` / ``llm``);不传 = 维持 requests 默认
+    (``overpass`` / ``osrm`` / ``nominatim`` / ``photon`` / ``llm``);不传 = 维持 requests 默认
     (读环境变量代理),现有调用与单测行为不变。
     """
     session = requests.Session()

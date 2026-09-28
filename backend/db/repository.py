@@ -335,6 +335,20 @@ def record_segment(
     return record
 
 
+def bump_fetch_rounds(session: Session, record: SegmentFetch) -> int:
+    """抓取轮数 +1 并返回新值(渐进抓取 TASK-6b:每完成**一轮** Overpass 抓取记一次)。
+
+    下一轮扩抓的目标总量由它推出来(``30 × (fetch_rounds + 1)``,见
+    :func:`services.place_loader.progressive_target_total`),所以计数必须落库。
+    旧库缺列时 ``fetch_rounds`` 可能是 ``None``(:func:`db.base.ensure_columns` 补列前的
+    历史行),这里一律按 0 起算。
+    """
+    rounds = int(record.fetch_rounds or 0) + 1
+    record.fetch_rounds = rounds
+    session.flush()
+    return rounds
+
+
 def segment_to_dict(record: SegmentFetch) -> dict[str, Any]:
     """抓取水位 → dict(API 的 ``fetched_at`` / ``source`` 字段来源)。"""
     return {
@@ -345,6 +359,7 @@ def segment_to_dict(record: SegmentFetch) -> dict[str, Any]:
         "origin_lng": record.origin_lng,
         "place_count": record.place_count,
         "source": record.source,
+        "fetch_rounds": int(record.fetch_rounds or 0),
         "fetched_at": iso_utc(record.fetched_at),
     }
 

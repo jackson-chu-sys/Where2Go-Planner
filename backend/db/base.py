@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -26,6 +26,14 @@ DEFAULT_DB_PATH = BACKEND_DIR / "data" / "where2go.db"
 ENV_DB_URL = "WHERE2GO_DB_URL"
 
 _engine: Optional[Engine] = None
+
+# 轻量列迁移表:(表名, 列名, ADD COLUMN 的列定义)。
+# ``create_all`` 只建**缺失的表**,不会给已存在的表补新列,所以"加一列"这类改动
+# (TASK-6b 的 ``segment_fetch.fetch_rounds``)要在这里对旧 SQLite 库补一次
+# ``ALTER TABLE ... ADD COLUMN``。新库由 create_all 直接建出全列,这一支自然空转。
+COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("segment_fetch", "fetch_rounds", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def database_url(url: Optional[str] = None) -> str:
@@ -64,8 +72,22 @@ def _ensure_sqlite_dir(url: str) -> None:
 
 
 def init_db(engine: Engine) -> None:
-    """建表(幂等:create_all 只建缺失的表)。"""
+    """建表 + 补列(幂等:create_all 只建缺失的表,缺列由 :func:`ensure_columns` 补)。"""
     Base.metadata.create_all(engine)
+    ensure_columns(engine)
+
+
+def ensure_columns(engine: Engine) -> None:
+    """给已存在的表补 :data:`COLUMN_MIGRATIONS` 里缺失的列(幂等,可反复调用)。"""
+    inspector = inspect(engine)
+    with engine.begin() as connection:
+        for table, column, ddl in COLUMN_MIGRATIONS:
+            if not inspector.has_table(table):
+                continue
+            existing = {str(row["name"]) for row in inspector.get_columns(table)}
+            if column in existing:
+                continue
+            connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
 
 
 def get_engine() -> Engine:

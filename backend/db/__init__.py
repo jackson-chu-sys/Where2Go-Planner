@@ -23,6 +23,7 @@ from .base import (
     DEFAULT_DB_PATH,
     ENV_DB_URL,
     database_url,
+    ensure_columns,
     get_engine,
     get_session,
     init_db,
@@ -65,6 +66,7 @@ from .models import (
     utcnow,
 )
 from .repository import (
+    bump_fetch_rounds,
     collection_cat_to_dict,
     collection_summary,
     collection_to_dict,
@@ -125,6 +127,7 @@ __all__ = [
     "Stay",
     "TripPlan",
     "database_url",
+    "ensure_columns",
     "get_engine",
     "get_session",
     "init_db",
@@ -137,6 +140,7 @@ __all__ = [
     "count_by_category",
     "count_by_source",
     "count_places",
+    "bump_fetch_rounds",
     "get_segment",
     "latest_city_origin",
     "list_places",

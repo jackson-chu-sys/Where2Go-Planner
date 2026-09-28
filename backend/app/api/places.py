@@ -7,6 +7,10 @@
   四分类 tag 并集落库,之后同一 (城市, band) 直接读 SQLite、不触网。
   可选 ``lat``/``lng``(前端已地理编码过就带上,省一次 Nominatim)、``refresh=true``(强制重抓)
   与 ``intros=false``(抓取后不调 LLM 补简介)。
+  渐进抓取(TASK-6b):可选 ``page_size``(默认 15,1~100)/``offset``(默认 0,≥0)/
+  ``more``(默认 false)—— 带任一参数即进分页模式,``places`` 只含本页并回报
+  ``total_in_db``/``has_more``/``fetch_rounds``;``more=true`` 翻页越界且库内行数没到
+  常规全量配额时自动再抓一轮(``target_total=30×(fetch_rounds+1)``)。三个都不带 = 旧口径返回全量。
 * ``GET /api/places/meta`` —— 分段、四分类(含 pin 颜色/图标)、归类优先级、检索分组与
   LLM 简介配置的元信息(前端下拉/图例/状态栏的唯一出处,**不含任何 key**)。
 * ``GET /api/places/intros?origin=&band=`` —— 给已入库但还没有简介的 POI 补 LLM 一句话简介
@@ -26,6 +30,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -56,6 +61,27 @@ PLACES_NOTE = (
     "(环形分段,不含城区)。分类为四分类优先级归类(滑雪 > 运动 > 人文美食 > 自然),"
     "按 OSM (type, id) 去重,一地只属一类;intro 为 LLM 一句话简介,按 POI 缓存。"
 )
+# 渐进抓取(TASK-6b,BUG-1 主修复)的分页口径:只在**带了分页参数**时追加到 note,
+# 不带 page_size/offset/more 的老调用连 note 文案都保持原样。
+PAGING_NOTE = (
+    "渐进抓取:带 page_size/offset/more 任一参数即进分页模式,places 只含本页 —— "
+    "库内该 (城市, band[, 分类]) 的行按距离升序、同距离按 (osm_type, osm_id) 决胜稳定排序后"
+    "切 [offset, offset+page_size);分页模式下连冷启动首查也只抓一轮(30 配额),不再等整段全量。"
+    "total_in_db = 库内总行数,fetch_rounds = 该分段已完成的抓取轮数,"
+    "has_more = 库里还有下一页,或调用方带了 more=true 且该 band 还没抓到常规全量配额(还能再抓)。"
+    "more=true 且翻页越界(offset ≥ 库内行数)、库内行数没到常规全量配额时自动再抓一轮"
+    "(目标总量 30×(fetch_rounds+1)),扩抓按 (osm_type, osm_id) 去重、不覆盖已生成的 intro,"
+    "当轮不阻塞在 LLM 简介上。三个参数都不带时行为与旧版一致:一次抓满配额、返回全量 places。"
+)
+# 分页默认值与边界(契约:首查 30、显示 15、加载更多每次 +30 —— 显示 15 就是这里的 page_size)
+PAGE_SIZE_DEFAULT = 15
+PAGE_SIZE_MIN = 1
+PAGE_SIZE_MAX = 100
+OFFSET_DEFAULT = 0
+OFFSET_MIN = 0
+# more 只认这几个写法(FastAPI 的 bool 解析口径更宽,但那样非法值会变成 422 而不是 400)
+TRUE_TOKENS = frozenset({"1", "true", "t", "yes", "y", "on"})
+FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off"})
 META_NOTE = (
     "分段:环形互斥,检索按 band 上限半径一次查四分类 tag 并集(每组独立配额);"
     "分类:四分类优先级归类的可选值(color/emoji 供前端 pin 使用);"
@@ -94,6 +120,85 @@ def resolve_intro_limit(limit: Optional[int]) -> Optional[int]:
     if limit is None:
         return place_loader.INTRO_BATCH_LIMIT
     return None if int(limit) <= 0 else int(limit)
+
+
+def _page_int(
+    raw: Any,
+    *,
+    label: str,
+    default: int,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    """分页整数参数解析:留空/空串用默认,非整数或越界一律 **400 中文**。
+
+    参数在路由上按 ``Optional[str]`` 收(不套 ``Query(ge=..., le=...)``),就是为了把
+    "非法值"从 pydantic 的 422 变成本仓库统一的 400 中文报错;单测直接调路由函数时
+    传 ``int`` 也照样认。
+    """
+    if raw is None or isinstance(raw, str) and not raw.strip():
+        return default
+    if isinstance(raw, bool):
+        raise HTTPException(400, f"{label} 必须是整数,收到:{raw!r}")
+    if isinstance(raw, int):
+        value = int(raw)
+    else:
+        text = str(raw).strip()
+        try:
+            value = int(text)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, f"{label} 必须是整数,收到:{text!r}") from exc
+    if minimum is not None and maximum is not None and not minimum <= value <= maximum:
+        raise HTTPException(400, f"{label} 超出范围:应在 {minimum}~{maximum} 之间,收到:{value}")
+    if minimum is not None and maximum is None and value < minimum:
+        raise HTTPException(400, f"{label} 不能小于 {minimum},收到:{value}")
+    if maximum is not None and minimum is None and value > maximum:
+        raise HTTPException(400, f"{label} 不能大于 {maximum},收到:{value}")
+    return value
+
+
+def _page_bool(raw: Any, *, label: str, default: bool = False) -> bool:
+    """分页布尔参数解析(``true/false``、``1/0``、``yes/no``、``on/off``);其余 **400 中文**。"""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return default
+    lowered = text.lower()
+    if lowered in TRUE_TOKENS:
+        return True
+    if lowered in FALSE_TOKENS:
+        return False
+    raise HTTPException(400, f"{label} 只能是 true/false,收到:{text!r}")
+
+
+def _page_sort_key(row: Mapping[str, Any]) -> tuple[float, str, int]:
+    """分页排序键:距离升序 →(osm_type, osm_id)决胜;没有距离的排最后。"""
+    distance = row.get("distance_km")
+    return (
+        float("inf") if distance is None else float(distance),
+        str(row.get("osm_type") or ""),
+        int(row.get("osm_id") or 0),
+    )
+
+
+def _page_rows(places: list[dict[str, Any]], paging: bool) -> list[dict[str, Any]]:
+    """分页模式换成**稳定排序**后的行;非分页模式原样返回(旧口径:距离 + 名字决胜)。
+
+    :func:`db.repository.list_places` 用名字决胜,同名不同 OSM id 的两行在翻页时会在
+    两页之间漂移;分页改用唯一键 ``(osm_type, osm_id)`` 决胜,``[offset, offset+page_size)``
+    才是可重复的稳定切片。
+    """
+    if not paging:
+        return list(places)
+    return sorted(places, key=_page_sort_key)
+
+
+def _fetch_rounds(outcome: place_loader.SegmentOutcome) -> int:
+    """该 (城市, band) 已完成的抓取轮数(水位缺失/旧库缺列时按 0)。"""
+    return int((outcome.segment or {}).get("fetch_rounds") or 0)
 
 
 @router.get("/places/meta")
@@ -162,11 +267,25 @@ def list_places(
     lat: Optional[float] = Query(None, ge=-90, le=90, description="起点纬度(可选,免二次地理编码)"),
     lng: Optional[float] = Query(None, ge=-180, le=180, description="起点经度(可选)"),
     refresh: bool = Query(False, description="true = 强制重新抓取(会触网)"),
+    # 渐进抓取(TASK-6b)三参:按**字符串**收 + 自己解析,非法值才能报本仓库统一的
+    # 400 中文而不是 pydantic 的 422;默认值写成裸 None(不套 Query),单测直接调本函数
+    # 不传这几个参数时拿到的就是 None,而不是 FieldInfo。
+    page_size: Optional[str] = None,
+    offset: Optional[str] = None,
+    more: Optional[str] = None,
     intros: bool = True,
     intro_limit: Optional[int] = None,
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """返回该 (城市, band) 内已入库的目的地(可按分类过滤)。"""
+    """返回该 (城市, band) 内已入库的目的地(可按分类过滤;支持分页 + 渐进扩抓)。
+
+    分页(TASK-6b,BUG-1 主修复):``page_size`` / ``offset`` / ``more`` **一个都不带**时
+    完全走旧口径 —— 返回全量 ``places``;带了任意一个就进分页模式(缺省
+    ``page_size=15`` / ``offset=0`` / ``more=false``),``places`` 只含
+    ``[offset, offset+page_size)`` 这一页,并额外回报 ``total_in_db`` / ``has_more`` /
+    ``fetch_rounds``。``more=true`` 且这一页越界(``offset >= 库内行数``)、库内行数还没到
+    常规全量配额时,自动再抓一轮(``target_total = 30 × (fetch_rounds + 1)``)后重新排序切片。
+    """
     city = _clean(origin)
     if not city:
         raise HTTPException(400, "起点城市不能为空")
@@ -175,26 +294,76 @@ def list_places(
         raise HTTPException(
             400, f"未知分类:{category}(可选:{'、'.join(category_keys())})"
         )
+    # 分页参数**先**校验:非法就快速失败,一次网都不触(与城市/分类校验同一口径)。
+    paging = page_size is not None or offset is not None or more is not None
+    wanted_page_size = _page_int(
+        page_size,
+        label="page_size",
+        default=PAGE_SIZE_DEFAULT,
+        minimum=PAGE_SIZE_MIN,
+        maximum=PAGE_SIZE_MAX,
+    )
+    wanted_offset = _page_int(offset, label="offset", default=OFFSET_DEFAULT, minimum=OFFSET_MIN)
+    want_more = _page_bool(more, label="more")
 
     started = time.monotonic()
-    try:
-        outcome = place_loader.load_segment(
+    # 分页模式下连**冷启动首查**也只抓一小轮(30 配额),否则首屏照样是分钟级(BUG-1 本体);
+    # 三个参数都不带的老调用仍然一次抓满常规配额,行为与旧版完全一致。
+    progressive_target: Optional[int] = None
+    if paging:
+        stored = repo.get_segment(session, origin_city=city, band=_clean(band) or "")
+        progressive_target = place_loader.progressive_target_total(
+            0 if stored is None else stored.fetch_rounds
+        )
+
+    def load(*, forced: bool, target_total: Optional[int], fill_intros: bool):
+        """首查与扩抓共用同一套 load_segment 参数(只有 refresh/target_total/intros 不同)。"""
+        return place_loader.load_segment(
             session,
             city=city,
             band=_clean(band) or "",
             category=wanted_category,
             lat=lat,
             lng=lng,
-            refresh=refresh,
-            intros=intros,
+            refresh=forced,
+            target_total=target_total,
+            intros=fill_intros,
             intro_limit=resolve_intro_limit(intro_limit),
         )
+
+    try:
+        outcome = load(forced=refresh, target_total=progressive_target, fill_intros=intros)
+        rows = _page_rows(outcome.places, paging)
+        rounds = _fetch_rounds(outcome)
+        intro_stats = outcome.intro_stats
+        # 翻页越界 + 库内还没到常规全量配额 → 再抓一轮(30 ×(轮数 + 1))后重新切片。
+        # 扩抓轮**不**补简介(intros=False):首屏要快,新行的简介交给 /api/places/intros;
+        # upsert 只按 (osm_type, osm_id, origin_city) 去重,不会覆盖已生成的 intro。
+        if (
+            paging
+            and want_more
+            and wanted_offset >= len(rows)
+            and repo.count_places(session, origin_city=city, band=outcome.band["key"])
+            < search_budget()
+        ):
+            outcome = load(
+                forced=True,
+                target_total=place_loader.progressive_target_total(rounds),
+                fill_intros=False,
+            )
+            rows = _page_rows(outcome.places, paging)
+            rounds = _fetch_rounds(outcome)
+            intro_stats = outcome.intro_stats or intro_stats
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except DataSourceError as exc:
         raise HTTPException(502, f"目的地检索失败(公共数据源繁忙,请稍后重试):{exc}") from exc
 
     band_def = outcome.band
+    # 只有分页模式需要"这个 band 还能不能再抓"(has_more 的后半截),老路径不多查这一次。
+    band_rows = repo.count_places(session, origin_city=city, band=band_def["key"]) if paging else 0
+    page_rows = rows[wanted_offset:wanted_offset + wanted_page_size] if paging else rows
+    total_in_db = len(rows)
     return {
         "origin": outcome.origin,
         "band": {
@@ -204,8 +373,20 @@ def list_places(
             "high_km": band_def["high"],
         },
         "category": wanted_category,
-        "places": outcome.places,
-        "count": len(outcome.places),
+        "places": page_rows,
+        "count": len(page_rows),
+        "total_in_db": total_in_db,
+        # has_more = 后面还有**可显示**的行:库里还有下一页,或者调用方愿意扩抓(more=true)
+        # 且这个 band 还没抓到常规全量配额。少了后半截,"显示 15 / 每次 +30"的循环会在
+        # 第一轮 30 条就走完(第 2 页 has_more=false → 前端再也不点加载更多)。
+        "has_more": bool(
+            paging
+            and (
+                wanted_offset + wanted_page_size < total_in_db
+                or (want_more and band_rows < search_budget())
+            )
+        ),
+        "fetch_rounds": rounds,
         "counts_by_category": outcome.counts_by_category,
         "source": outcome.source,
         "network_used": outcome.network_used,
@@ -213,7 +394,7 @@ def list_places(
         "written": outcome.written,
         "seeded": outcome.seeded,
         "counts_by_source": outcome.counts_by_source,
-        "intro_stats": outcome.intro_stats,
+        "intro_stats": intro_stats,
         "intro_pending": repo.count_places(
             session, origin_city=city, band=band_def["key"], missing_intro=True
         ),
@@ -221,7 +402,7 @@ def list_places(
             session, origin_city=city, band=band_def["key"], category=wanted_category
         ),
         "elapsed_s": round(time.monotonic() - started, 2),
-        "note": PLACES_NOTE,
+        "note": (PLACES_NOTE + PAGING_NOTE) if paging else PLACES_NOTE,
     }
 
 

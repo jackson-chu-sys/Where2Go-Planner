@@ -140,10 +140,17 @@ class SegmentFetch(Base):
     origin_lng: Mapped[float] = mapped_column(Float, nullable=False)
     place_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="overpass")
+    # 渐进抓取(TASK-6b):该 (城市, band) 已经完成过几轮 Overpass 抓取。
+    # 冷启动只抓一小轮(配额缩到 30),前端"加载更多"每越界一次再抓一轮(30×(轮数+1)),
+    # 下一轮的目标总量由这个计数推出来,所以它必须落库、且旧库要能补列(见 db.base.init_db)。
+    fetch_rounds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
-        return f"<SegmentFetch {self.origin_city} {self.band} {self.place_count} 条 {self.source}>"
+        return (
+            f"<SegmentFetch {self.origin_city} {self.band} {self.place_count} 条 "
+            f"{self.source} 第 {self.fetch_rounds} 轮>"
+        )
 
 
 # --------------------------------------------------------------------------- #

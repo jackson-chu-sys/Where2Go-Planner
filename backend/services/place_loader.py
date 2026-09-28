@@ -17,6 +17,10 @@
    :mod:`services.seed_data` 的人工种子 —— 去重键 = 名字 + 坐标,OSM 已经抓到就不重复补;
    读库路径的补种是**幂等且纯本地**的,存量库不重抓也能拿到种子。整体开关是环境变量
    ``WHERE2GO_SEEDS``(默认开,单测在 ``backend/conftest.py`` 里默认关)。
+6. **渐进抓取**(TASK-6b,BUG-1 主修复):``target_total`` 把"一次抓满 540 配额"缩成
+   "首查 30、显示 15、加载更多每次 +30"。轮数记在 ``SegmentFetch.fetch_rounds``,
+   下一轮目标总量 = ``30 × (轮数 + 1)``(:func:`progressive_target_total`);
+   分段下拉、四分类归类与读库口径全都不变,变的只是一轮抓多少。
 
 起点除了城市名,还能来自浏览器定位:前端拿到 GPS 坐标后调 ``GET /api/geocode/reverse``,
 由 :func:`resolve_reverse_origin` 用**逆**地理编码反查城市;反查失败不报错,
@@ -36,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -72,6 +77,13 @@ SEARCH_GROUPS: list[dict[str, Any]] = classify.search_groups()
 SEARCH_TAGS: list[classify.TagSelector] = classify.search_tags()
 ELEMENT_TYPES = classify.DEFAULT_ELEMENT_TYPES
 FETCH_LIMIT = overpass.MAX_FETCH
+# 渐进抓取(TASK-6b,BUG-1 主修复):冷启动一次抓满 :data:`SEARCH_GROUPS` 的合计配额
+# (540)会让首屏等上几分钟,所以首查只抓一小轮 —— 把各组配额**按比例**缩到目标总量
+# (首轮 30),之后每"加载更多"越界一次再抓一轮(30 × 轮数)。缩放后每组至少留
+# :data:`MIN_GROUP_BUDGET` 条,免得小分组(古镇 40)被缩成 0、整类彻底消失。
+FULL_SEARCH_BUDGET: int = classify.search_budget()
+MIN_GROUP_BUDGET = 2
+PROGRESSIVE_STEP = 30
 GROUP_QUERY_TIMEOUT = overpass.DEFAULT_GROUP_QUERY_TIMEOUT
 GROUP_REQUEST_TIMEOUT = overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
 # 环形差集要在服务端扫两个圆,比单圆慢一档,超时也放宽一档(仍是批量抓取路径,
@@ -407,6 +419,48 @@ def default_fetcher(
     )
 
 
+def scale_search_groups(target_total: Optional[int]) -> Optional[list[dict[str, Any]]]:
+    """把 :data:`SEARCH_GROUPS` 各组配额按比例缩到总量 ≈ ``target_total``(渐进抓取用)。
+
+    每组 ``max(MIN_GROUP_BUDGET, round(组配额 × target_total / 540))``:按比例缩放才保得住
+    四分类的相对权重(自然风光 140 vs 古镇 40),下限 :data:`MIN_GROUP_BUDGET` 保证小分组
+    不会被缩成 0 而整类消失。``target_total`` 为 ``None`` 时返回 ``None`` = 用满配额(旧口径)。
+    **一次查完分组并集**的口径不变,变的只是服务端取数上限,所以首屏从分钟级降到秒级。
+    """
+    if target_total is None:
+        return None
+    wanted = max(1, int(target_total))
+    scaled: list[dict[str, Any]] = []
+    for group in SEARCH_GROUPS:
+        row = dict(group)
+        row["budget"] = max(
+            MIN_GROUP_BUDGET, round(int(group["budget"]) * wanted / FULL_SEARCH_BUDGET)
+        )
+        scaled.append(row)
+    return scaled
+
+
+def progressive_target_total(fetch_rounds: Optional[int] = None) -> int:
+    """下一轮扩抓的目标总量:``30 × (已完成轮数 + 1)`` → 30 / 60 / 90 ..."""
+    return PROGRESSIVE_STEP * (max(0, int(fetch_rounds or 0)) + 1)
+
+
+def _accepts_groups(fetch_fn: FetchFn) -> bool:
+    """抓取实现是否认 ``groups`` 关键字。
+
+    既有单测的替身是 ``(lat, lng, band)`` 三参签名,不能因为加了配额缩放就报错;
+    真链路 :func:`default_fetcher` 带 ``groups``,缩放后的分组从这里传下去。
+    """
+    try:
+        parameters = list(inspect.signature(fetch_fn).parameters.values())
+    except (TypeError, ValueError):  # pragma: no cover - 拿不到签名的内建对象
+        return False
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "groups"
+        for parameter in parameters
+    )
+
+
 def place_identity(place: Mapping[str, Any]) -> tuple[str, int]:
     """取 OSM 身份 ``(osm_type, osm_id)``;缺失时用"名字+坐标"指纹兜底(负数 id)。
 
@@ -533,6 +587,7 @@ def load_segment(
     geocoder: Optional[GeocodeFn] = None,
     seeds: Optional[Iterable[Mapping[str, Any]]] = None,
     refresh: bool = False,
+    target_total: Optional[int] = None,
     intros: bool = True,
     intro_limit: Optional[int] = INTRO_BATCH_LIMIT,
     intro_workers: int = intro_service.DEFAULT_WORKERS,
@@ -546,6 +601,14 @@ def load_segment(
     ``seeds`` 留空就用 :func:`services.seed_data.load_seeds`(受 ``WHERE2GO_SEEDS``
     开关控制);传 ``[]`` 可显式关掉本次的种子合并。抓取与读库两条路径都合并种子,
     所以已入库的分段也能拿到种子,不必重抓 Overpass。
+
+    ``target_total``(TASK-6b 渐进抓取)只在**真的要抓**时生效:给定了就把
+    :data:`SEARCH_GROUPS` 各组配额按比例缩到总量 ≈ ``target_total``
+    (见 :func:`scale_search_groups`),仍然只发**一次** Overpass 请求;留空 = 用满
+    配额(540)的旧口径。归类/去重/环内收敛/upsert 口径完全不变,所以扩抓轮
+    重复命中同一实体也不会产生重复行、不会覆盖已有 ``intro``。
+    每完成一轮抓取,:attr:`db.models.SegmentFetch.fetch_rounds` +1
+    (:func:`db.repository.bump_fetch_rounds`),下一轮的目标总量由它推出来。
 
     失败语义:分段/城市非法抛 :class:`ValueError`;数据源不可用抛
     :class:`data_sources.DataSourceError`(由 API 层翻成中文 HTTP 错误)。
@@ -577,12 +640,12 @@ def load_segment(
         )
 
     origin = _reuse_origin(session, city_clean, recorded=recorded, lat=lat, lng=lng, geocoder=geocoder)
-    candidates = filter_to_band(
-        fetch_fn(origin["lat"], origin["lng"], band_def) or [],
-        origin["lat"],
-        origin["lng"],
-        band_def,
-    )
+    groups = scale_search_groups(target_total)
+    if groups is not None and _accepts_groups(fetch_fn):
+        payload = fetch_fn(origin["lat"], origin["lng"], band_def, groups=groups)
+    else:
+        payload = fetch_fn(origin["lat"], origin["lng"], band_def)
+    candidates = filter_to_band(payload or [], origin["lat"], origin["lng"], band_def)
     fresh_seeds = _fresh_seeds(candidates, seed_rows, origin, band_def)
     seeded_items = to_seed_items(fresh_seeds)
     written = repo.upsert_places(
@@ -596,9 +659,17 @@ def load_segment(
         origin_city=city_clean,
         band=band_def["key"],
         origin=origin,
-        place_count=len(candidates) + len(seeded_items),
+        # 扩抓轮是**追加**在已有行之上,水位要记库内真实条数,否则 /api/geocode 的
+        # segments 会把"这一轮抓到多少"当成"这个分段一共有多少"。冷启动/refresh 的
+        # 口径保持原样(本轮候选数 + 本轮补种数)。
+        place_count=(
+            repo.count_places(session, origin_city=city_clean, band=band_def["key"])
+            if target_total is not None
+            else len(candidates) + len(seeded_items)
+        ),
         source=SOURCE_OVERPASS,
     )
+    repo.bump_fetch_rounds(session, record)
     session.commit()
     # 先落库再补简介:LLM 挂了/没 key 也只是简介为空,入库结果不受影响。
     intro_stats = None

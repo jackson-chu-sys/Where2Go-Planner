@@ -511,7 +511,7 @@
 
 ## [TASK-6b] 渐进抓取 + /api/places 分页（BUG-1 主修复）
 
-- 状态: pending（派 Codex）
+- 状态: done
 - 背景: 神朱 2026-09-28 拍板。冷抓取整 band 全量（540 配额）导致首屏分钟级；改「首查 30、显示 15、加载更多每次 +30」循环；分段下拉维持不变。
 - 目标: 后端按抓取轮次渐进入库与分页读取。**不动前端**（加载更多按钮属 6e）。
 - **只读清单**: `backend/services/bands.py`、`backend/services/place_loader.py`、`backend/services/classify.py`（search_groups 配额）、`backend/app/api/places.py`、`backend/db/repository.py`。
@@ -520,7 +520,11 @@
   - `GET /api/places` 新增：`page_size`（默认 15，1..100）、`offset`（默认 0）、`more`（默认 false）。库里已有行按距离排序切片；`more=true` 且切片越界且库内 < 该 band 常规全量 → 触发 `target_total=30×(fetch_rounds+1)` 扩抓一轮（去重键 (osm_type,osm_id)，upsert 不覆盖 intro），再切片。响应新增 `total_in_db`/`has_more`/`fetch_rounds`。兼容：不带新参数时行为与旧版一致（返回全量）。
   - 排序稳定：本地 haversine 距离升序 + (osm_type,osm_id) 决胜，翻页不漂移。
 - 验收: `backend/test_places_progressive.py` ≥18 用例全 mock（配额缩放求和≈target/轮次递增/扩抓去重/翻页稳定/has_more/非法参数 400/无参兼容）；既有 539 零回归；不动 index.html。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-28 夜班，Codex 执行，commit `008d6d6`）。
+  - `place_loader.load_segment` 增 `target_total`（各组配额按比例缩到 ≈target，每组下限 MIN_GROUP_BUDGET=2，PROGRESSIVE_STEP=30；仍单次 Overpass 请求）；`SegmentFetch` 加列 `fetch_rounds`（default 0，SQLite 旧库 ALTER TABLE 补列），`repo.bump_fetch_rounds` 每轮 +1；扩抓轮水位 place_count 记库内真实条数（避免 /api/geocode segments 把单轮当总量）。
+  - `GET /api/places` 新增 page_size(15, 1..100)/offset(≥0)/more(bool) 分页参数：库内行按距离升序 + (osm_type,osm_id) 决胜稳定排序切片；more=true 且越界且未达全量配额 → 自动扩抓一轮 target_total=30×(fetch_rounds+1) 再切片；响应加 total_in_db/has_more/fetch_rounds + PAGING_NOTE；**不带新参数时与旧版全量行为一致**；非法参数 400 中文报错。
+  - `test_places_progressive.py` 39 用例全 mock（超 ≥18 要求）。执行器复跑 pytest backend/ = **622 passed**（583 基线零改动 + 39 新增）。index.html 未动。
+  - **Codex 256K 统计**：单次调用 ~37.5min（14:37-15:15 UTC，40min 止损线内），function_calls **62**，首轮写码启动后 **~7.8min**（R8 线内），tokens **243,604**，零 compact。
 
 ---
 

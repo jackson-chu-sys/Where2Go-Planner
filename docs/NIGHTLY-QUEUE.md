@@ -490,7 +490,7 @@
 
 ## [TASK-6a] Photon 地理编码主路径 + Nominatim 降级（产品化代理口径）
 
-- 状态: pending（派 Codex）
+- 状态: done
 - 背景: 神朱 2026-09-28 拍板。产品环境无 mihomo 代理，Nominatim 直连实测不通（容器实测 15s 超时）；Photon 直连实测可用（1.1s，中文城市/乡村/区划命中正确坐标，逆地理可用；不支持 lang=zh——用默认本地语言，中国地名自带中文）。方案=Photon 主 + Nominatim 备降级链；Photon 公共实例先用，产品化再自建。
 - 目标: 新增 `backend/data_sources/photon.py`；`/api/geocode`、`/api/geocode/reverse` 及起点解析改「先 Photon，失败/空回退 Nominatim」。
 - **只读清单（只准读这 5 个，读完立即写码）**: `backend/data_sources/nominatim.py`、`backend/data_sources/_common.py`、`backend/app/api/places.py`（geocode/reverse 端点）、`backend/services/place_loader.py`（起点解析相关段）、含 nominatim 用例的测试文件。禁止其他探索。
@@ -499,7 +499,13 @@
   - `_common.py`: `DEFAULT_SOURCE_PROXY` 增 `"photon": PROXY_OFF`（实测 Photon 直连 1.1s、走代理 5s 挂）。
   - API 层: 先 Photon，`DataSourceError` 或空结果→Nominatim；响应加 `"geocoder": "photon"|"nominatim"`；双失败→400 中文报错。
 - 验收: 新增 `backend/test_photon.py` ≥12 用例全 mock（坐标解析/lon-lat 顺序/display_name 组装/空结果回退/报错回退/双失败 400/节流）；既有测试零改动；`pytest backend/` 全绿（基线 539）；不动 index.html。完成后重启 uvicorn 冒烟 `/api/geocode?city=北京` 期望 `geocoder=photon`。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-28 夜班，Codex 执行，commit `5977127`）。
+  - 新增 `backend/data_sources/photon.py`：`geocode(q,*,limit=5)`/`reverse(lat,lng)`，GeoJSON coordinates=[lon,lat] 解析、7 位定点、display_name「name, city, state, country」跳空段拼接（直辖市重复段去重）、build_session(source="photon")+1 req/s 节流、不传 lang、错误抛 DataSourceError；`_common.py` DEFAULT_SOURCE_PROXY 增 `"photon": PROXY_OFF`。
+  - `place_loader.py` 降级链 `geocode_with_fallback`/`reverse_with_fallback`（Photon 抛错或空→Nominatim，双失败中文 DataSourceError）+ `resolve_origin_with_source`/`resolve_reverse_origin_with_source`；`app/api/places.py` `/api/geocode`、`/api/geocode/reverse` 响应加 `geocoder: photon|nominatim|none`，正向双失败 502→**400 中文报错**（无既有用例覆盖），逆向维持 200+resolved=false（TASK-1c 口径）。
+  - `test_photon.py` 44 用例全 mock（超 ≥12 要求）。执行器复跑 pytest backend/ = **583 passed**（539 基线零改动 + 44 新增）。
+  - Codex 抓出契约外真 bug：Photon 逆向路径是 `/reverse` 而非 `/api/reverse`（404），已修正并真实联网冒烟：`/api/geocode?city=北京`→geocoder=photon（39.9057,116.3913）、city=崇礼→四段拼接正确、reverse→photon/resolved=true；Nominatim 降级腿真实走通一次。
+  - **Codex 256K 统计**：单次调用 ~27min（14:06-14:33 UTC），function_calls **56**，首轮写码启动后 **~10.3min**（R8 12min 线内、偏紧——本次含基线 pytest 复跑），tokens **196,396**，零 compact。
+  - 备注：Photon 主腿刻意宽 `except Exception`（尽力而为前置源，理由见 place_loader docstring），既有 no_network 断言在该段被吞、单测多 ~1s；`data_sources/__init__.py` 未改（POC 路由口径不变）。
 
 ---
 

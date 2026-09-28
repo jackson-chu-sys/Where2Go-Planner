@@ -16,6 +16,9 @@
   行程的**落脚点**、不进需求四分类,展示要的是价格区间估算而不是分类标签;唯一键
   ``(osm_type, osm_id)``,同一家酒店从不同起点搜到只存一行,``price_estimate`` / ``intro``
   由 LLM 生成后**不再被重抓覆盖**(见 services.stays)。
+* :class:`StayQueryCache` —— 住宿检索的**负缓存**(TASK-6c,BUG-3/5):记"这个坐标这个半径
+  查过了,结果是空/失败",6 小时内同坐标同半径直接回缓存态,不再重复打 Overpass;
+  空结果分 ``no_data`` / ``datasource_error`` / ``timeout`` 三档 reason 透传给前端文案。
 * :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
   把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
   报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
@@ -465,6 +468,85 @@ class Stay(Base):
         return (
             f"<Stay {self.osm_type}/{self.osm_id} {self.name!r} {self.kind} "
             f"{self.price_estimate or '未估价'}>"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 住宿检索的负缓存(TASK-6c,BUG-3/5):StayQueryCache
+# --------------------------------------------------------------------------- #
+
+STAY_REASON_LEN = 32
+# 空结果的三档 reason(API 原样透传,前端据此分文案:真的没有 / 可重试 / 稍后再试)
+REASON_NO_DATA = "no_data"
+REASON_DATASOURCE_ERROR = "datasource_error"
+REASON_TIMEOUT = "timeout"
+STAY_REASONS: tuple[str, ...] = (REASON_NO_DATA, REASON_DATASOURCE_ERROR, REASON_TIMEOUT)
+# 负缓存行的 kind:空结果记 ``empty_ok``(对应 reason=no_data),失败按档记;kind 进唯一键,
+# 所以同一个 (坐标, 半径) 允许"上次超时、这次真的没有"两行并存,取**最新**的一行当缓存态。
+STAY_CACHE_EMPTY = "empty_ok"
+STAY_CACHE_KINDS: tuple[str, ...] = (STAY_CACHE_EMPTY, REASON_DATASOURCE_ERROR, REASON_TIMEOUT)
+
+
+def stay_cache_kind(reason: Any) -> str:
+    """三档 reason → 负缓存 kind;``no_data``/空值都归 :data:`STAY_CACHE_EMPTY`,未知值按失败收。"""
+    text = str(reason or "").strip().lower()
+    if not text or text == REASON_NO_DATA:
+        return STAY_CACHE_EMPTY
+    if text in STAY_CACHE_KINDS:
+        return text
+    return REASON_DATASOURCE_ERROR
+
+
+def stay_cache_reason(kind: Any) -> str:
+    """负缓存 kind → 三档 reason(:data:`STAY_CACHE_EMPTY` 还原成 ``no_data``)。"""
+    text = str(kind or "").strip().lower()
+    if not text or text == STAY_CACHE_EMPTY:
+        return REASON_NO_DATA
+    if text in STAY_REASONS:
+        return text
+    return REASON_DATASOURCE_ERROR
+
+
+class StayQueryCache(Base):
+    """一次住宿检索的**空结果/失败**记录(负缓存):有这行且未过期 = 不必再触网。
+
+    为什么要有负缓存:住宿在郊区/小城镇经常真的搜不到,而"搜不到"这条路每次都要等
+    Overpass 三个公共实例轮一遍(实测十几秒),用户连点两下就是两次白等(BUG-3)。
+    于是把"这个坐标 + 这个半径查过了,结论是空/报错/超时"落一行,
+    :data:`services.stays.NEG_CACHE_TTL_S`(6 小时)内同键直接回缓存态。
+
+    键口径:坐标按 :data:`COORD_PRECISION` **定点**后入库(与 :class:`Stay` 一致),
+    否则浮点尾巴会让"同一个点"存成两行、缓存永远命不中;唯一键
+    ``(lat, lng, radius_m, kind)`` 让重复写变成 upsert(刷新 ``fetched_at`` 即续期)。
+    ``nearest_km`` 是空结果时"库里已知的最近一家在几公里外"(可空),给前端
+    "最近的在 X km 外"提示用;它只是提示,不是身份的一部分。
+    """
+
+    __tablename__ = "stay_query_cache"
+    __table_args__ = (
+        UniqueConstraint("lat", "lng", "radius_m", "kind", name="uq_stay_cache_query"),
+        Index("ix_stay_cache_lookup", "lat", "lng", "radius_m"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    radius_m: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[str] = mapped_column(
+        String(KIND_LEN), nullable=False, default=STAY_CACHE_EMPTY
+    )
+    reason: Mapped[str] = mapped_column(
+        String(STAY_REASON_LEN), nullable=False, default=REASON_NO_DATA
+    )
+    nearest_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return (
+            f"<StayQueryCache {self.lat:.7f},{self.lng:.7f} r={self.radius_m} "
+            f"{self.kind}/{self.reason} nearest={self.nearest_km}>"
         )
 
 

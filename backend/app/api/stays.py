@@ -17,6 +17,19 @@
 价格是 **AI 估算**,不是报价:每行带 ``estimated`` 标注,顶层 ``note`` 写明参考价口径
 (架构文档"AI 幻觉"对策:事实字段绑结构化来源,估算字段必须自带标注)。
 本模块自己不触网,触网的是服务层(Overpass 检索 + LLM 估价),测试里可整体替换。
+
+TASK-6c 的三件透传(**只在空结果/降级/后台估价中/阶梯扩档时出现**,正常结果的顶层形状
+保持原样,前端老代码零改动):
+
+* ``reason`` —— 三档空态:``no_data``(真的没有)/ ``datasource_error``(Overpass 报错,
+  可重试)/ ``timeout``(超时,稍后再试);正常结果为 ``null``。
+* ``nearest_km`` —— 最近一家的直线距离(km,1 位);空结果时是**库里已知**的最近一家,
+  给"最近的在 X km 外"文案用。
+* ``estimating`` —— 价格正在后台批量回填(``price_estimate`` 此刻可能是 null),重查即得。
+
+半径口径:调用方**没给** ``radius_km`` 时传 ``radius_m=None`` 给服务层,由它按
+5→10→30 km 阶梯自动扩(空结果才扩);给了就只查那一档。``radius_km`` 出参恒回显
+"调用方要的/默认的"公里数,不因阶梯扩档而变(前端的半径选择器与出参一一对应)。
 """
 
 from __future__ import annotations
@@ -56,6 +69,17 @@ STAYS_NOTE = (
     "否则现场检索 Overpass 并入库估价(source=overpass);"
     "refresh=true 强制重抓,但已有价格的行不会再调 LLM(不重复花 token)。"
 )
+# 空结果/降级时追加的口径说明(TASK-6c):三档 reason 怎么读、nearest_km 是什么、
+# estimating 为什么要等一会儿。正常结果不带这段,免得卡片下方多一坨没人看的字。
+STAYS_DEGRADED_NOTE = (
+    "本次为空结果或降级返回,附带 reason/nearest_km/estimating 三个判别字段:"
+    "reason=no_data 表示该半径内确实没有住宿(nearest_km 是库里已知的最近一家距离,单位 km,"
+    "为 null 表示阶梯最大档内也没有);reason=datasource_error 表示 Overpass 检索报错,可重试;"
+    "reason=timeout 表示检索超时,请稍后再试。"
+    "空结果与失败都会写负缓存,6 小时内同坐标同半径直接回缓存态、不再重复触网。"
+    "estimating=true 表示价格正在后台批量回填(每批 5 家一次 LLM 调用,不阻塞本请求),"
+    "此刻 price_estimate 可能为 null,稍后重查同一坐标即可拿到已回填的估算价。"
+)
 
 
 def _optional_text(value: Any) -> Optional[str]:
@@ -91,11 +115,11 @@ def _optional_id(name: str, value: Any) -> Optional[int]:
     return int(number)
 
 
-def _resolve_radius_km(value: Any) -> float:
-    """半径归一(公里):没给 → :data:`DEFAULT_RADIUS_KM`;≤0 或超上限 → **400**。"""
+def _resolve_radius_km(value: Any) -> Optional[float]:
+    """半径归一(公里):没给 → ``None``(服务层走 5→10→30 km 阶梯);≤0 或超上限 → **400**。"""
     radius = _optional_float("radius_km", value)
     if radius is None:
-        return DEFAULT_RADIUS_KM
+        return None
     if radius != radius or radius in (float("inf"), float("-inf")):  # NaN / inf
         raise HTTPException(400, f"参数 radius_km 非法,收到:{value!r}")
     if radius <= 0:
@@ -170,7 +194,11 @@ def list_stays(
     lng: Optional[str] = Query(None, description="起点经度(-180~180);与 place_id 二选一"),
     place_id: Optional[str] = Query(None, description="已入库目的地 id(用它的坐标当起点);与 lat/lng 二选一"),
     radius_km: Optional[str] = Query(
-        None, description=f"检索半径(公里,默认 {DEFAULT_RADIUS_KM:g},上限 {MAX_RADIUS_KM:g})"
+        None,
+        description=(
+            f"检索半径(公里,上限 {MAX_RADIUS_KM:g});不给则由服务层按 5→10→30 km 阶梯自动扩,"
+            f"出参 radius_km 回显 {DEFAULT_RADIUS_KM:g}"
+        ),
     ),
     refresh: Optional[str] = Query(None, description="true = 忽略库缓存强制重抓(会触网)"),
     session: Session = Depends(get_session),
@@ -183,23 +211,41 @@ def list_stays(
         place_id=_optional_id("place_id", place_id),
     )
     radius = _resolve_radius_km(radius_km)
+    # 出参恒回显"调用方要的/默认的"半径;没给半径时服务层按阶梯自己扩,回显值不跟着变
+    echo_radius_km = DEFAULT_RADIUS_KM if radius is None else radius
+    radius_m = None if radius is None else int(round(radius * METERS_PER_KM))
     force_refresh = _resolve_flag("refresh", refresh)
     rows = stay_service.load_or_fetch_stays(
         session,
         origin_lat,
         origin_lng,
-        radius_m=int(round(radius * METERS_PER_KM)),
+        radius_m=radius_m,
         refresh=force_refresh,
     )
     items = [_item(row) for row in rows]
     # 空结果没有可归属的行,按 db 口径报(既没抓到也没读到,不谎报 overpass)
     source = str(rows[0].get("source") or stay_service.SOURCE_DB) if rows else stay_service.SOURCE_DB
-    return {
+    reason = getattr(rows, "reason", None)
+    nearest_km = getattr(rows, "nearest_km", None)
+    estimating = bool(getattr(rows, "estimating", False))
+    expanded = bool(getattr(rows, "expanded", False))
+    body: dict[str, Any] = {
         "lat": origin_lat,
         "lng": origin_lng,
-        "radius_km": radius,
+        "radius_km": echo_radius_km,
         "count": len(items),
         "source": source,
         "note": STAYS_NOTE,
         "items": items,
     }
+    # 三档空态/后台估价中/阶梯扩过档 → 多给三个判别字段(正常结果的顶层形状保持不变)
+    if reason is not None or estimating or expanded or not items:
+        note = STAYS_NOTE + STAYS_DEGRADED_NOTE
+        effective_m = getattr(rows, "radius_m", None)
+        if expanded and effective_m:
+            note += f"本次未给半径,已按 5→10→30 km 阶梯自动扩到 {effective_m / METERS_PER_KM:g} km 检索。"
+        body["reason"] = reason
+        body["nearest_km"] = nearest_km
+        body["estimating"] = estimating
+        body["note"] = note
+    return body

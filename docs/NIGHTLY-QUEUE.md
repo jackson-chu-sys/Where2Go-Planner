@@ -487,6 +487,83 @@
 
 ---
 
+
+## [TASK-6a] Photon 地理编码主路径 + Nominatim 降级（产品化代理口径）
+
+- 状态: pending（派 Codex）
+- 背景: 神朱 2026-09-28 拍板。产品环境无 mihomo 代理，Nominatim 直连实测不通（容器实测 15s 超时）；Photon 直连实测可用（1.1s，中文城市/乡村/区划命中正确坐标，逆地理可用；不支持 lang=zh——用默认本地语言，中国地名自带中文）。方案=Photon 主 + Nominatim 备降级链；Photon 公共实例先用，产品化再自建。
+- 目标: 新增 `backend/data_sources/photon.py`；`/api/geocode`、`/api/geocode/reverse` 及起点解析改「先 Photon，失败/空回退 Nominatim」。
+- **只读清单（只准读这 5 个，读完立即写码）**: `backend/data_sources/nominatim.py`、`backend/data_sources/_common.py`、`backend/app/api/places.py`（geocode/reverse 端点）、`backend/services/place_loader.py`（起点解析相关段）、含 nominatim 用例的测试文件。禁止其他探索。
+- 落地契约:
+  - `photon.py`: `SOURCE_NAME="Photon"`、`DEFAULT_ENDPOINT="https://photon.komoot.io"`、`ENV_ENDPOINT="WHERE2GO_PHOTON_ENDPOINT"`；`geocode(q, *, limit=5) -> list[dict]`、`reverse(lat, lng) -> dict`；解析 GeoJSON `features[].geometry.coordinates=[lon,lat]`（lon 在前）与 `properties.{name,city,state,country}`，`display_name` 按「name, city, state, country」跳过空段拼接；输出形状与 nominatim 完全一致 `{lat:float, lng:float, display_name:str}`；网络/格式错误抛 `DataSourceError`；复用 `build_session(source="photon")` 与内置 1 req/s 节流；不传 lang 参数。
+  - `_common.py`: `DEFAULT_SOURCE_PROXY` 增 `"photon": PROXY_OFF`（实测 Photon 直连 1.1s、走代理 5s 挂）。
+  - API 层: 先 Photon，`DataSourceError` 或空结果→Nominatim；响应加 `"geocoder": "photon"|"nominatim"`；双失败→400 中文报错。
+- 验收: 新增 `backend/test_photon.py` ≥12 用例全 mock（坐标解析/lon-lat 顺序/display_name 组装/空结果回退/报错回退/双失败 400/节流）；既有测试零改动；`pytest backend/` 全绿（基线 539）；不动 index.html。完成后重启 uvicorn 冒烟 `/api/geocode?city=北京` 期望 `geocoder=photon`。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-6b] 渐进抓取 + /api/places 分页（BUG-1 主修复）
+
+- 状态: pending（派 Codex）
+- 背景: 神朱 2026-09-28 拍板。冷抓取整 band 全量（540 配额）导致首屏分钟级；改「首查 30、显示 15、加载更多每次 +30」循环；分段下拉维持不变。
+- 目标: 后端按抓取轮次渐进入库与分页读取。**不动前端**（加载更多按钮属 6e）。
+- **只读清单**: `backend/services/bands.py`、`backend/services/place_loader.py`、`backend/services/classify.py`（search_groups 配额）、`backend/app/api/places.py`、`backend/db/repository.py`。
+- 落地契约:
+  - `load_segment(...)` 增 `target_total: Optional[int]`：给定时把 SEARCH_GROUPS 各组 limit 按比例缩到总量≈target_total（每组 `max(2, round(组配额×target_total/540))`），仍只发一次 Overpass 请求；`SegmentFetch` 加列 `fetch_rounds: Integer default 0`，每轮 +1。
+  - `GET /api/places` 新增：`page_size`（默认 15，1..100）、`offset`（默认 0）、`more`（默认 false）。库里已有行按距离排序切片；`more=true` 且切片越界且库内 < 该 band 常规全量 → 触发 `target_total=30×(fetch_rounds+1)` 扩抓一轮（去重键 (osm_type,osm_id)，upsert 不覆盖 intro），再切片。响应新增 `total_in_db`/`has_more`/`fetch_rounds`。兼容：不带新参数时行为与旧版一致（返回全量）。
+  - 排序稳定：本地 haversine 距离升序 + (osm_type,osm_id) 决胜，翻页不漂移。
+- 验收: `backend/test_places_progressive.py` ≥18 用例全 mock（配额缩放求和≈target/轮次递增/扩抓去重/翻页稳定/has_more/非法参数 400/无参兼容）；既有 539 零回归；不动 index.html。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-6c] 住宿三件套：负缓存 + 半径阶梯 + 估价异步回填（BUG-3/5）
+
+- 状态: pending（派 Codex；依赖无，按文件顺序排 6b 后）
+- 目标: `services/stays.py`：①空结果/失败负缓存（6h 内同坐标半径直接回缓存态）；②半径阶梯 5→10→30km 自动扩，返回最近一家距离提示；③检索入库即刻返回列表（price_estimate=null），LLM 估价转后台批量（复用 intro 线程池口径）；④空结果分 `no_data / datasource_error / timeout` 三档 `reason` 透传 API（前端文案属 6e）。
+- 只读清单: `backend/services/stays.py`、`backend/db/models.py`、`backend/app/api/stays.py`、`backend/services/intro.py`、`backend/test_stays.py`。
+- 落地契约: 负缓存可新建 `StayQueryCache` 表（键坐标定点 7 位+radius+kind+reason+fetched_at）；`/api/stays` 响应加 `reason`/`nearest_km`/`estimating`；**估价批量 5 家/prompt（神朱定）**，模型 **qwen3.8-max（神朱定，不做双模型）**，该批解析失败留 null 不抛、不重试超过 1 次。
+- 验收: 测试 ≥20 全 mock；同坐标二次请求 0 网络；既有全绿；不动 index.html。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-6d] 费用引擎 v2（BUG-4 + 机票公布价锚定区间）
+
+- 状态: pending（派 Codex）
+- 背景: 神朱 2026-09-28 口径：驾车构成明细+整车/人均双标；铁路分档费率+热门对种子；机票要保留对比感但撤假精确——用**民航公布价锚定区间**（纯规则，无 LLM 无 OTA 抓取）：`[公布价近似×典型折扣, 公布价近似]`，公布价按里程分段（<812km ~1.6、812-1600 ~0.95、>1600 ~0.8 元/km 级常数表 `PUBLISHED_FARE_TIERS`），折扣主干商务线 0.45/支线 0.6。
+- 只读清单: `backend/services/routes.py`、`backend/app/api/routes.py`、`backend/test_routes.py`、`backend/data_sources/osrm.py`（steps/ref 字段）、`backend/services/seed_data.py`（种子风格）。
+- 落地契约:
+  - 驾车: `toll_cny=高速里程×区域费率(东0.45/中0.40/西0.35)`（高速里程=OSRM steps 带 G/S ref 段距离和；拿不到退 `总里程×0.55` 并标 `toll_mode="heuristic"`）；`fuel_cny=km×0.08L/km×油价(env WHERE2GO_FUEL_PRICE_CNY_L 默认 8.0)`；新增 `cost_breakdown{toll,fuel,mode}`/`vehicle_label="整车≤4人"`/`per_person_cny`。
+  - 铁路: 运营里程≈直线×1.15；费率 300km/h 线 0.46 / 250 线 0.31 元/km（双高铁枢纽判档）；内置 ≥8 对热门城市对真实票价种子（杭州-上海 73、上海-北京 553 等），命中标 `price_source="seed"`。
+  - 飞机: 上式区间 `[round(公布×折扣), 公布]`；直线 <400km 或任一端无民航机场（内置 ≥40 城机场表）→ 不给价仅跳转；`flight_low_cny/flight_high_cny` 新字段，`cost_cny=区间中值` 保持兼容；note「动态定价·浮动大·实时价以跳转为准」。
+  - 飞机候选阈值 300→600km。
+- 验收: `test_routes_cost_v2.py` ≥22 用例 mock/离线；断言样例：杭州→崇儒乡驾车人均口径、上海→北京种子命中 553、<400km 城市对不出机票价；既有 539 零回归；不动 index.html（前端展示属 6e）。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-6e] 前端适配：加载更多 + 费用新口径 + 三档空态（依赖 6b/6c/6d）
+
+- 状态: pending（派 Codex，前端 R8 放宽 20min）
+- 目标: index.html：①列表底部「加载更多(每页 15)」接 page_size/offset/more，扩抓中给进度文案；②路线卡驾车「整车/人均」双标+构成 tooltip、机票区间「¥A–B（浮动）」；③住宿空态三档文案（no_data 含「最近的在 X km 外」/datasource_error 可重试/timeout 稍后再试）；④geocoder 字段并入状态栏。
+- 涉及: 仅 index.html + test_frontend_routes.py 静态断言 + browser_exec QA。
+- 验收: pytest 全绿（含基线增量）；QA 全流程 0 JS error；既有功能不回归。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-6g] 住宿估价 v2：品牌/星级规则表优先（依赖 6c）
+
+- 状态: pending（派 Codex）
+- 目标: `services/stays.py` 估价前置**规则层**：`brand=` 连锁价格带表（汉庭/如家/7天≈180-350、亚朵/全季≈350-550、维也纳≈250-400、希尔顿/万豪系≈700+ 等 ≥25 品牌，含英文名匹配）、`hotel:stars` 1-5 星档位、hostel/guest_house/chalet 类型档、城市线级修正系数（一线/新一线/二三线映射表）。命中直接出区间标 `price_kind="rule"`（0 token）；未命中走 6c 批量 LLM（5 家/prompt、qwen3.8-max）；结果永久缓存。
+- 只读清单: `backend/services/stays.py`（6c 后版本）、`backend/db/models.py`、`backend/test_stays.py`。
+- 验收: 规则命中路径断言 0 LLM 调用；测试 ≥15 全 mock；不动前端。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

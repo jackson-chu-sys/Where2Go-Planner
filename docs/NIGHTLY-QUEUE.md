@@ -546,7 +546,7 @@
 
 ## [TASK-6d] 费用引擎 v2（BUG-4 + 机票公布价锚定区间）
 
-- 状态: pending（派 Codex）
+- 状态: done
 - 背景: 神朱 2026-09-28 口径：驾车构成明细+整车/人均双标；铁路分档费率+热门对种子；机票要保留对比感但撤假精确——用**民航公布价锚定区间**（纯规则，无 LLM 无 OTA 抓取）：`[公布价近似×典型折扣, 公布价近似]`，公布价按里程分段（<812km ~1.6、812-1600 ~0.95、>1600 ~0.8 元/km 级常数表 `PUBLISHED_FARE_TIERS`），折扣主干商务线 0.45/支线 0.6。
 - 只读清单: `backend/services/routes.py`、`backend/app/api/routes.py`、`backend/test_routes.py`、`backend/data_sources/osrm.py`（steps/ref 字段）、`backend/services/seed_data.py`（种子风格）。
 - 落地契约:
@@ -555,7 +555,12 @@
   - 飞机: 上式区间 `[round(公布×折扣), 公布]`；直线 <400km 或任一端无民航机场（内置 ≥40 城机场表）→ 不给价仅跳转；`flight_low_cny/flight_high_cny` 新字段，`cost_cny=区间中值` 保持兼容；note「动态定价·浮动大·实时价以跳转为准」。
   - 飞机候选阈值 300→600km。
 - 验收: `test_routes_cost_v2.py` ≥22 用例 mock/离线；断言样例：杭州→崇儒乡驾车人均口径、上海→北京种子命中 553、<400km 城市对不出机票价；既有 539 零回归；不动 index.html（前端展示属 6e）。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-29 夜班，Codex 写码+执行器收口，commit `c3709e9`）。
+  - `services/routes.py`（+788 行）：驾车 `toll_cny`=高速里程（OSRM steps G/S ref 段求和，`toll_mode="osrm_refs"`；拿不到退 总里程×0.55 标 `"heuristic"`）×区域费率（东0.45/中0.40/西0.35）+ `fuel_cny`=km×0.08L/km×油价（env `WHERE2GO_FUEL_PRICE_CNY_L` 默认8.0）+ `cost_breakdown{toll,fuel,mode}`/`vehicle_label="整车≤4人"`/`per_person_cny`；铁路 运营里程=直线×1.15、双枢纽判档 0.46/0.31 元/km、≥8 对热门城市对种子（上海-北京 553 等，`price_source="seed"`）；机票 `PUBLISHED_FARE_TIERS` 三段（<812km 1.6 / 812-1600 0.95 / >1600 0.8）×折扣（主干0.45/支线0.6）→ `flight_low_cny/flight_high_cny`，`cost_cny`=中值兼容，<400km 或任一端无机场（73 城机场表）不出价仅 deep-link，note「动态定价·浮动大·实时价以跳转为准」；飞行候选阈值 300→600km。osrm.py 增 steps/ref 解析，api/routes.py 透出新字段。
+  - `test_routes_cost_v2.py` 34 用例（超 ≥22 要求）+ test_routes.py 适配；执行器复跑 pytest backend/ = **734 passed**（700 基线零回归；Codex 遗留 2 处测试期望值笔误——「长沙x」枢纽误匹配、trunk 区间手算错——由执行器修正）。index.html 未动。
+  - 真机冒烟（uvicorn 重启）：上海→北京 driving kind=real cost 1283（toll 517 osrm_refs + fuel 766）per_person 321；rail 种子命中 553/seed；flight 区间 502-1115 中值 809；300km 无机票价、崇儒乡「没有匹配到民航机场」降级正确。
+  - **Codex 256K 统计**：启动 14:05 UTC，首轮写码 **11.9min**（R8 12min 线内、贴线），function_calls **63**，tokens **5.39M total**（含 cache 重放 5.12M）/output 99K+reasoning 56K；**总时长 40min 触发止损被 kill**——kill 时实现+测试已全部落盘、只差最后 commit，与 6c 同款「体量大贴线完成」形态。routes.py 单文件 ~700→1400 行是主要耗时源；后续同类建议在契约里允许分两次调用（实现/测试各一）。
+  - 备注：第一次启动因 `.env` 未导出 `ALIBABA_TOKEN_PLAN_API_KEY`（source 未加 `set -a`）秒退，改用 `set -a && source` 重启成功，浪费 ~1min。
 
 ---
 

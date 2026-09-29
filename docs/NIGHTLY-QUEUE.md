@@ -566,11 +566,15 @@
 
 ## [TASK-6e] 前端适配：加载更多 + 费用新口径 + 三档空态（依赖 6b/6c/6d）
 
-- 状态: pending（派 Codex，前端 R8 放宽 20min）
+- 状态: done
 - 目标: index.html：①列表底部「加载更多(每页 15)」接 page_size/offset/more，扩抓中给进度文案；②路线卡驾车「整车/人均」双标+构成 tooltip、机票区间「¥A–B（浮动）」；③住宿空态三档文案（no_data 含「最近的在 X km 外」/datasource_error 可重试/timeout 稍后再试）；④geocoder 字段并入状态栏。
 - 涉及: 仅 index.html + test_frontend_routes.py 静态断言 + browser_exec QA。
 - 验收: pytest 全绿（含基线增量）；QA 全流程 0 JS error；既有功能不回归。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-29 夜班，Codex 执行，commit `d14e998`，~34min 在 40min 止损线内自行完成并 commit）。
+  - index.html（+355/-35，仅前端，后端 Python 零改动）：①列表底部「加载更多(每页 15)」接 page_size/offset/more（翻到库尾带 more=true 触发服务端扩抓，进度文案「正在扩抓更多目的地…」，has_more=false 收起）；②路线卡驾车「整车≤4人 / 人均 ¥Y」双标 + cost_breakdown tooltip（toll/fuel/mode 口径说明）、铁路 price_source=seed 标注、机票「¥A–B（浮动）」区间与 null 降级「不出票价，以跳转实时为准」；③住宿空态三档（no_data 含 nearest_km「最近的在 X km 外」/datasource_error 重试按钮/timeout 稍后再试）+ estimating「AI 估价生成中」；④geocoder（Photon 主路径/Nominatim 降级）并入状态栏与页脚。
+  - test_frontend_routes.py 追加 22 例（TASK-6e 小节）：DOM/函数面/分页拼接/has_more 消费/双标与 tooltip/三档文案/geocoder；契约断言**真跑后端路由函数**（替身零触网）验证前端引用字段 ⊆ 后端输出键。执行器复跑 pytest backend/ = **756 passed**（734 基线零回归）。
+  - browser_exec 真实 QA（CDP chrome 重拉后）：开页 5 pin 0 error → 点「加载更多」出进度文案「正在加载下一页…」→ 落定后按钮复位 → 点 pin 出路线面板：驾车卡「¥66 整车≤4人 / 人均 ¥17」+ tooltip 含油费/过路费口径 → 住宿区块 6 家库缓存 + AI 预估标注 → 状态栏「Photon(主路径)」→ Esc 关闭；全程 window error **0** 条；库内无测试残留（仅 9/27 既有收藏 1 条）。
+  - **Codex 256K 统计**：单次调用 ~34min（14:54-15:28 UTC，止损线内），function_calls **78**，首轮写码启动后 **11.3min**（R8 放宽线 20min 内），tokens **7.09M total**（含 cache 重放 6.82M）/output 75K+reasoning 51K，零 compact。
 
 ---
 

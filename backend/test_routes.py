@@ -53,7 +53,17 @@ FAR_DEST = {"lat": 39.9042, "lng": 116.4074, "name": "北京"}
 SPEC_ROUTE_KEYS = {
     "mode", "label", "duration_min", "cost_cny", "distance_km", "geometry", "kind", "note",
 }
-ROUTE_KEYS = SPEC_ROUTE_KEYS | {"emoji", "degraded", "source", "links"}
+# 三种方式都有的公共字段(v1 起)
+COMMON_ROUTE_KEYS = SPEC_ROUTE_KEYS | {"emoji", "degraded", "source", "links"}
+# 费用引擎 v2(TASK-6d)按方式**新增**的字段:驾车构成明细 + 整车/人均双标、
+# 铁路票价来源(种子/估算)、机票公布价锚定区间。既有字段一个没删。
+DRIVING_V2_KEYS = {"cost_breakdown", "vehicle_label", "per_person_cny"}
+RAIL_V2_KEYS = {"price_source"}
+FLIGHT_V2_KEYS = {"flight_low_cny", "flight_high_cny"}
+V2_KEYS_BY_MODE = {
+    "driving": DRIVING_V2_KEYS, "rail": RAIL_V2_KEYS, "flight": FLIGHT_V2_KEYS,
+}
+ROUTE_KEYS = COMMON_ROUTE_KEYS | DRIVING_V2_KEYS | RAIL_V2_KEYS | FLIGHT_V2_KEYS
 LINK_KEYS = {"provider", "label", "url", "note"}
 
 DEFAULT_LEG = {
@@ -286,7 +296,10 @@ def test_service_default_router_asks_osrm_for_geometry(monkeypatch: pytest.Monke
     monkeypatch.setattr(route_service, "ds_route", fake_ds_route)
     leg = route_service.default_router((121.4737, 31.2304), (121.5, 31.3))
 
-    assert calls == [((121.4737, 31.2304), (121.5, 31.3), {"with_geometry": True})]
+    # with_steps:费用引擎 v2 要靠 steps[].ref(G/S 编号)认高速里程(TASK-6d)
+    assert calls == [
+        ((121.4737, 31.2304), (121.5, 31.3), {"with_geometry": True, "with_steps": True})
+    ]
     assert leg["distance_km"] == 10.0
 
 
@@ -295,36 +308,73 @@ def test_service_default_router_asks_osrm_for_geometry(monkeypatch: pytest.Monke
 # --------------------------------------------------------------------------- #
 
 
-def test_cost_formulas_follow_stage2_coefficients() -> None:
-    # 驾车 100km:油费 100×8/100×7.5 = 60,过路 0.7×100×0.5 = 35 → 95 元
-    assert route_service.driving_cost_cny(100) == pytest.approx(95.0)
-    assert route_service.round_cost(route_service.driving_cost_cny(122.4)) == 116
-    # 铁路 100km:计费里程 100×1.2 = 120 → 120×0.45 = 54 元
-    assert route_service.rail_cost_cny(100) == pytest.approx(54.0)
-    # 起步价下限:10km → 12×0.45 = 5.4 元,低于 20 元下限 → 20 元
-    assert route_service.rail_cost_cny(10) == pytest.approx(20.0)
-    # 飞机 300km:330×0.6 + 100 = 298 元
-    assert route_service.flight_cost_cny(300) == pytest.approx(298.0)
+def test_cost_formulas_follow_v2_coefficients() -> None:
+    """费用引擎 v2 的算式(TASK-6d):驾车构成明细、铁路分档、机票公布价区间中值。"""
+    steps = [{"distance_km": 60.0, "ref": "G60"}, {"distance_km": 40.0, "ref": None}]
+    # 驾车 100km(东部 0.45 元/km,油价默认 8 元/L):
+    # 拿不到 steps → 高速里程按 100×0.55 = 55km → 过路 24.75 + 油费 64 = 88.75 元
+    assert route_service.driving_cost_cny(100, region="east") == pytest.approx(88.75)
+    # 有 steps → 高速里程 = 60km(ref 以 G 开头那段)→ 过路 27 + 油费 64 = 91 元
+    assert route_service.driving_cost_cny(100, steps=steps, region="east") == pytest.approx(91.0)
+    money = route_service.driving_money(100, steps=steps, region="east")
+    assert money["cost_breakdown"] == {"toll": 27, "fuel": 64, "mode": "osrm_refs"}
+    assert money["cost_cny"] == 91 == 27 + 64, "先各项四舍五入再相加,toll + fuel 必等于总价"
+    assert money["per_person_cny"] == 23, "人均 = 91 ÷ 4 → 23(四舍五入)"
+    # 铁路:运营里程 = 直线 × 1.15,双高铁枢纽走 350km/h 档 0.46 元/km
+    assert route_service.rail_cost_cny(100, from_name="上海", to_name="长沙") == pytest.approx(52.9)
+    # 单端非枢纽 → 250km/h 档 0.31 元/km
+    assert route_service.rail_cost_cny(100, from_name="上海", to_name="莫干山") == pytest.approx(35.65)
+    # 起步价下限:10km → 11.5×0.31 = 3.57 元,低于 20 元下限 → 20 元
+    assert route_service.rail_cost_cny(10, from_name="上海", to_name="莫干山") == pytest.approx(20.0)
+    # 飞机:cost_cny = 公布价区间中值;给不出区间(距离不足)→ None
+    assert route_service.flight_cost_cny(1067, from_name="上海", to_name="北京") == 809
+    assert route_service.flight_cost_cny(300, from_name="上海", to_name="杭州") is None
     # 负里程按 0 处理,不会算出负费用
-    assert route_service.driving_cost_cny(-50) == 0.0
-    assert route_service.cost_for("rail", straight_km=100) == 54
+    assert route_service.driving_cost_cny(-50, region="east") == 0.0
+    assert route_service.cost_for("rail", straight_km=100, from_name="上海", to_name="长沙") == 53
     assert route_service.cost_for("driving", straight_km=100, driving_km=None) is None
     expect_error(lambda: route_service.cost_for("bike", straight_km=100), ValueError, "未知出行方式")
+
+
+def test_round_cost_is_half_up_not_bankers() -> None:
+    """票面价常以 .5 结尾(54.5 / 134.5),四舍五入必须**半进位**,不能少一块钱。"""
+    assert route_service.round_cost(74.5) == 75 and route_service.round_cost(134.5) == 135
+    assert route_service.round_cost(74.4) == 74 and route_service.round_cost(0.5) == 1
 
 
 def test_cost_model_and_mode_rules_are_exposed_for_labels() -> None:
     model = route_service.cost_coefficients()
     assert set(model) == {"driving", "rail", "flight", "disclaimer"}
     assert model["disclaimer"] == "估算·非实时·以官方为准"
+    # 驾车 v2:油耗 + 区域费率表 + 高速里程两种口径 + 整车/人均
+    assert model["driving"]["fuel_l_per_km"] == 0.08
     assert model["driving"]["fuel_l_per_100km"] == 8.0
-    assert model["driving"]["fuel_price_cny_per_l"] == 7.5
-    assert model["driving"]["highway_ratio"] == 0.7 and model["driving"]["toll_cny_per_km"] == 0.5
-    assert model["rail"]["cny_per_km"] == 0.45 and model["rail"]["min_fare_cny"] == 20.0
-    assert model["flight"]["cny_per_km"] == 0.6 and model["flight"]["base_cny"] == 100.0
+    assert model["driving"]["fuel_price_cny_per_l"] == 8.0
+    assert model["driving"]["fuel_price_env"] == "WHERE2GO_FUEL_PRICE_CNY_L"
+    assert model["driving"]["toll_cny_per_km_by_region"] == {
+        "east": 0.45, "central": 0.40, "west": 0.35,
+    }
+    assert model["driving"]["heuristic_highway_ratio"] == 0.55
+    assert model["driving"]["highway_ref_prefixes"] == ["G", "S"]
+    assert model["driving"]["vehicle_label"] == "整车≤4人" and model["driving"]["seats"] == 4
+    # 铁路 v2:运营里程系数 + 分档费率 + 种子对数
+    assert model["rail"]["operating_detour"] == 1.15
+    assert model["rail"]["rate_cny_per_km"] == {"350": 0.46, "250": 0.31}
+    assert model["rail"]["min_fare_cny"] == 20.0
+    assert model["rail"]["seed_pairs"] >= 8 and model["rail"]["hub_cities"] >= 8
+    assert model["rail"]["price_sources"] == ["seed", "estimate"]
+    # 机票 v2:公布价分档 + 折扣 + 不给价的两条规则
+    assert model["flight"]["published_fare_tiers"] == [[812.0, 1.6], [1600.0, 0.95], [None, 0.8]]
+    assert model["flight"]["discount"] == {"trunk": 0.45, "branch": 0.6}
+    assert model["flight"]["price_min_km"] == 400.0 and model["flight"]["airport_cities"] >= 40
+    # 系数表要能直接 JSON 序列化(它就在 /api/routes 的响应里)
+    assert json.loads(json.dumps(model, ensure_ascii=False))["disclaimer"] == model["disclaimer"]
 
     rules = route_service.mode_rules()
-    assert rules["rail_min_km"] == 100.0 and rules["flight_min_km"] == 300.0
+    assert rules["rail_min_km"] == 100.0 and rules["flight_min_km"] == 600.0
+    assert rules["flight_price_min_km"] == 400.0
     assert rules["rail"]["speed_kmh"] == 220.0 and rules["flight"]["ground_min"] == 210.0
+    assert rules["rail"]["fare_detour"] == 1.15 and rules["rail"]["detour"] == 1.20
 
 
 # --------------------------------------------------------------------------- #
@@ -337,8 +387,8 @@ def test_modes_appear_by_distance_threshold(stub_osrm) -> None:
     cases = [
         (99.0, ["driving"]),                       # 99km:不到铁路阈值
         (100.5, ["driving", "rail"]),
-        (299.0, ["driving", "rail"]),              # 299km:不到飞机阈值
-        (300.5, ["driving", "rail", "flight"]),
+        (599.0, ["driving", "rail"]),              # 599km:不到飞机阈值(v2 = 600km)
+        (600.5, ["driving", "rail", "flight"]),
     ]
     for km, expected in cases:
         plan = plan_for(km)
@@ -346,15 +396,20 @@ def test_modes_appear_by_distance_threshold(stub_osrm) -> None:
         assert plan.distance_km == pytest.approx(km, abs=0.05)
 
     assert "rail" not in [r["mode"] for r in plan_for(99.0).routes]
-    assert "flight" not in [r["mode"] for r in plan_for(299.0).routes]
+    assert "flight" not in [r["mode"] for r in plan_for(599.0).routes]
 
 
-def test_thresholds_and_durations_match_poc_est_mode() -> None:
-    """耗时估算与出现阈值必须和 POC ``app/api/discover.py`` 一个口径。"""
-    assert (route_service.RAIL_MIN_KM, route_service.FLIGHT_MIN_KM) == (
-        discover_api.RAIL_MIN_KM, discover_api.FLIGHT_MIN_KM
-    )
-    for km in (100.0, 150.0, 299.0, 300.5, 480.0):
+def test_durations_match_poc_but_flight_threshold_is_raised() -> None:
+    """耗时估算与铁路阈值仍和 POC ``app/api/discover.py`` 一个口径;飞机阈值 v2 起提到 600km。
+
+    POC ``/api/discover`` **不改**(AGENTS.md 硬约定),所以它自带常量还是 300km ——
+    这里断言的是"有意分叉",不是抄错数字。
+    """
+    assert route_service.RAIL_MIN_KM == discover_api.RAIL_MIN_KM == 100.0
+    assert discover_api.FLIGHT_MIN_KM == 300.0, "POC 阈值不该被本次改动带跑"
+    assert route_service.FLIGHT_MIN_KM == 600.0, "TASK-6d:飞机候选阈值 300km → 600km"
+    assert route_service.FLIGHT_PRICE_MIN_KM == 400.0
+    for km in (100.0, 150.0, 299.0, 300.5, 480.0, 900.0):
         assert route_service.estimate_duration_min("rail", km) == discover_api._est_mode("rail", km)["duration_min"]
         assert route_service.estimate_duration_min("flight", km) == discover_api._est_mode("flight", km)["duration_min"]
     expect_error(lambda: route_service.estimate_duration_min("driving", 100.0), ValueError, "仅铁路/飞机")
@@ -362,11 +417,12 @@ def test_thresholds_and_durations_match_poc_est_mode() -> None:
 
 def test_three_mode_payload_shape_and_honest_labels(stub_osrm) -> None:
     stub_osrm()
-    plan = plan_for(350.5, to_name="天目湖")
+    plan = plan_for(1067.0, to_name="北京")   # ≥600km 才有飞机条目(v2 阈值)
     driving, rail, flight = plan.routes
 
     for route in plan.routes:
-        assert set(route) == ROUTE_KEYS, f"{route['mode']} 字段应与约定形状一致"
+        assert set(route) == COMMON_ROUTE_KEYS | V2_KEYS_BY_MODE[route["mode"]], \
+            f"{route['mode']} 字段应与约定形状一致"
         assert SPEC_ROUTE_KEYS <= set(route)
         assert route["degraded"] is False
         assert route["links"], "每条路线都要带跳转链接"
@@ -375,23 +431,28 @@ def test_three_mode_payload_shape_and_honest_labels(stub_osrm) -> None:
         "driving", "驾车", "real", "OSRM"
     )
     assert driving["duration_min"] == 94 and driving["distance_km"] == 122.4
-    assert driving["cost_cny"] == 116, "驾车费用 = 油费 + 高速过路费(估算)"
+    assert driving["cost_cny"] == 108, "驾车整车费用 = 油费 78 + 高速过路费 30(估算)"
+    assert driving["cost_breakdown"] == {"toll": 30, "fuel": 78, "mode": "heuristic"}
+    assert driving["vehicle_label"] == "整车≤4人" and driving["per_person_cny"] == 27
     assert driving["geometry"] == DEFAULT_LEG["geometry"]
     assert "OSRM" in driving["note"] and "费用为估算" in driving["note"]
     assert route_service.ESTIMATE_DISCLAIMER in driving["note"]
 
     assert (rail["mode"], rail["kind"], rail["source"]) == ("rail", "estimate", "estimate")
     assert rail["label"] == "铁路(估算)" and rail["emoji"] == "🚄"
-    assert rail["distance_km"] == pytest.approx(350.5, abs=0.05)
-    assert rail["cost_cny"] == 189, "350.5km × 1.2 × 0.45 ≈ 189 元"
-    assert rail["duration_min"] == 225 and rail["geometry"] is None
+    assert rail["distance_km"] == pytest.approx(1067.0, abs=0.05)
+    assert rail["cost_cny"] == 553, "上海—北京命中种子价 553 元(二等座)"
+    assert rail["price_source"] == "seed" and "种子" in rail["note"]
+    assert rail["duration_min"] == 459 and rail["geometry"] is None
     assert route_service.ESTIMATE_DISCLAIMER in rail["note"] and "无实时班次" in rail["note"]
 
     assert (flight["mode"], flight["kind"]) == ("flight", "estimate")
     assert flight["label"] == "飞机(估算)" and flight["emoji"] == "✈️"
-    assert flight["cost_cny"] == 331, "350.5km × 1.1 × 0.6 + 100 ≈ 331 元"
-    assert flight["duration_min"] == 240
+    assert (flight["flight_low_cny"], flight["flight_high_cny"]) == (502, 1115)
+    assert flight["cost_cny"] == 809, "cost_cny = 公布价区间中值(兼容旧字段)"
+    assert flight["duration_min"] == 300
     assert route_service.ESTIMATE_DISCLAIMER in flight["note"] and "无实时航班" in flight["note"]
+    assert route_service.FLIGHT_DYNAMIC_NOTE in flight["note"]
 
 
 def test_driving_route_calls_osrm_with_lnglat_pairs() -> None:
@@ -500,7 +561,7 @@ def test_default_departure_date_is_today_in_china_time() -> None:
 
 def test_route_links_are_attached_per_mode(stub_osrm) -> None:
     stub_osrm()
-    driving, rail, flight = plan_for(350.5, to_name="天目湖", from_name="上海").routes
+    driving, rail, flight = plan_for(1067.0, to_name="北京", from_name="上海").routes
 
     assert [link["provider"] for link in driving["links"]] == ["amap", "google"]
     assert [link["provider"] for link in rail["links"]] == ["12306"]
@@ -510,9 +571,9 @@ def test_route_links_are_attached_per_mode(stub_osrm) -> None:
         assert set(link) == LINK_KEYS
         assert link["url"].startswith("https://") and link["label"] and link["note"]
 
-    assert "天目湖" in query_of(rail["links"][0]["url"])["ts"][0]
-    assert "天目湖" in query_of(flight["links"][0]["url"])["searchArrivalAirport"][0]
-    assert query_of(driving["links"][0]["url"])["to"][0].endswith(",天目湖")
+    assert "北京" in query_of(rail["links"][0]["url"])["ts"][0]
+    assert "北京" in query_of(flight["links"][0]["url"])["searchArrivalAirport"][0]
+    assert query_of(driving["links"][0]["url"])["to"][0].endswith(",北京")
     expect_error(
         lambda: route_service.route_links("bike", from_lat=31.0, from_lng=121.0,
                                           to_lat=32.0, to_lng=122.0),
@@ -539,16 +600,19 @@ def test_missing_place_names_fall_back_to_coordinates(stub_osrm) -> None:
 
 def test_osrm_failure_degrades_driving_entry() -> None:
     router = FakeRouter(error=DataSourceError("OSRM", "请求超时(>15s)"))
-    plan = plan_for(350.5, to_name="天目湖", router=router)
+    plan = plan_for(1067.0, to_name="北京", router=router)
     driving, rail, flight = plan.routes
 
     assert driving["degraded"] is True and driving["kind"] == "estimate"
     assert driving["source"] == route_service.SOURCE_UNAVAILABLE
     assert driving["duration_min"] is None and driving["cost_cny"] is None
     assert driving["distance_km"] is None and driving["geometry"] is None
+    assert driving["cost_breakdown"] is None and driving["per_person_cny"] is None, \
+        "降级时不给钱数(整车/人均都不给),但口径标注 vehicle_label 仍在"
+    assert driving["vehicle_label"] == "整车≤4人"
     assert "OSRM" in driving["note"] and route_service.ESTIMATE_DISCLAIMER in driving["note"]
     assert [link["provider"] for link in driving["links"]] == ["amap", "google"], "降级也要能跳转导航"
-    assert rail["cost_cny"] == 189 and flight["cost_cny"] == 331, "估算方式不受 OSRM 影响"
+    assert rail["cost_cny"] == 553 and flight["cost_cny"] == 809, "估算方式不受 OSRM 影响"
 
 
 def test_osrm_invalid_coordinates_degrade_instead_of_raising() -> None:
@@ -565,10 +629,10 @@ def test_osrm_invalid_coordinates_degrade_instead_of_raising() -> None:
 
 def test_api_routes_payload_shape(stub_osrm) -> None:
     router = stub_osrm()
-    dest = point_north(350.5, name="天目湖")
+    dest = point_north(1067.0, name="北京")
     payload = routes_api.list_routes(
         from_lat=SHANGHAI["lat"], from_lng=SHANGHAI["lng"],
-        to_lat=dest["lat"], to_lng=dest["lng"], to_name="天目湖", from_name="上海",
+        to_lat=dest["lat"], to_lng=dest["lng"], to_name="北京", from_name="上海",
     )
 
     assert set(payload) == {
@@ -576,8 +640,8 @@ def test_api_routes_payload_shape(stub_osrm) -> None:
         "mode_rules", "cost_model", "generated_at", "elapsed_s", "note",
     }
     assert payload["from"] == {"lat": SHANGHAI["lat"], "lng": SHANGHAI["lng"], "name": "上海"}
-    assert payload["to"]["name"] == "天目湖" and payload["to"]["lat"] == pytest.approx(dest["lat"])
-    assert payload["distance_km"] == pytest.approx(350.5, abs=0.05)
+    assert payload["to"]["name"] == "北京" and payload["to"]["lat"] == pytest.approx(dest["lat"])
+    assert payload["distance_km"] == pytest.approx(1067.0, abs=0.05)
     assert payload["count"] == 3 == len(payload["routes"])
     assert [route["mode"] for route in payload["routes"]] == ["driving", "rail", "flight"]
     assert payload["routes"][0]["kind"] == "real" and payload["routes"][1]["kind"] == "estimate"
@@ -622,9 +686,11 @@ def test_api_routes_degrades_when_osrm_fails(stub_osrm) -> None:
     driving, rail = payload["routes"]
     assert driving["mode"] == "driving" and driving["degraded"] is True
     assert driving["duration_min"] is None and driving["cost_cny"] is None
+    assert driving["cost_breakdown"] is None and driving["per_person_cny"] is None
     assert "OSRM" in driving["note"]
     assert len(driving["links"]) == 2
-    assert rail["mode"] == "rail" and rail["cost_cny"] == 81 and rail["kind"] == "estimate"
+    assert rail["mode"] == "rail" and rail["cost_cny"] == 53 and rail["kind"] == "estimate"
+    assert rail["price_source"] == "estimate", "150km × 1.15 × 0.31(250km/h 档)≈ 53 元"
 
 
 def test_api_routes_accepts_string_coordinates(stub_osrm) -> None:
@@ -662,20 +728,21 @@ def test_http_layer_rejects_bad_coordinates_with_400(stub_osrm) -> None:
 def test_http_layer_returns_full_payload_for_string_query(stub_osrm) -> None:
     """HTTP 层 query 全是字符串:``"31.2304"`` 要能规划出三方式,响应可直接 JSON 序列化。"""
     stub_osrm()
-    dest = point_north(350.5)
+    dest = point_north(1067.0)
     status, payload = http_get(
         f"from_lat={SHANGHAI['lat']}&from_lng={SHANGHAI['lng']}"
         f"&to_lat={dest['lat']:.6f}&to_lng={dest['lng']:.6f}"
-        "&to_name=%E5%A4%A9%E7%9B%AE%E6%B9%96&from_name=%E4%B8%8A%E6%B5%B7"
+        "&to_name=%E5%8C%97%E4%BA%AC&from_name=%E4%B8%8A%E6%B5%B7"
     )
 
     assert status == 200
     assert payload["count"] == 3 == len(payload["routes"])
-    assert payload["to"]["name"] == "天目湖" and payload["from"]["name"] == "上海"
-    assert payload["distance_km"] == pytest.approx(350.5, abs=0.05)
+    assert payload["to"]["name"] == "北京" and payload["from"]["name"] == "上海"
+    assert payload["distance_km"] == pytest.approx(1067.0, abs=0.05)
     assert payload["routes"][0]["kind"] == "real" and payload["routes"][0]["geometry"]
     assert [route["mode"] for route in payload["routes"]] == ["driving", "rail", "flight"]
-    assert payload["cost_model"]["rail"]["cny_per_km"] == 0.45
+    assert payload["cost_model"]["rail"]["rate_cny_per_km"] == {"350": 0.46, "250": 0.31}
+    assert payload["mode_rules"]["flight_min_km"] == 600.0
 
 
 def test_plan_routes_generated_at_is_injectable() -> None:

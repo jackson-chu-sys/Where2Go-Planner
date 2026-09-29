@@ -20,6 +20,11 @@
 ``routes[0].geometry = {"type": "LineString", "coordinates": [[lng, lat], ...]}``,
 本模块顺手换成 Leaflet 需要的 ``[[lat, lng], ...]``。**默认仍是 ``overview=false``,
 返回形状与阶段0 完全一致**(不带 ``geometry`` 键),POC 的 ``/api/discover`` 与既有单测不受影响。
+
+TASK-6d 费用引擎按需取分段明细:``route(..., with_steps=True)`` 会把 ``steps`` 换成 ``true``,
+响应里多出 ``routes[0].legs[].steps[]``(每段 ``distance`` 米 + 道路编号 ``ref``,高速形如
+``G60``、省道形如 ``S328``),本模块抽成 ``[{"distance_km", "ref"}, ...]``;服务端把带
+G/S 编号的段距离相加当高速里程。**默认仍是 ``steps=false``,返回形状不变。**
 """
 
 from __future__ import annotations
@@ -46,6 +51,11 @@ OVERVIEW_FALSE = "false"
 OVERVIEW_FULL = "full"
 GEOMETRIES_GEOJSON = "geojson"
 GEOMETRY_COORD_PRECISION = 6
+# steps=true 才返回分段明细(每段带 ``distance`` 与道路编号 ``ref``,如 ``G60``/``S328``);
+# 费用引擎 v2(TASK-6d)靠 ref 前缀 G/S 认高速里程,默认仍是 false(返回形状不变)。
+STEPS_FALSE = "false"
+STEPS_TRUE = "true"
+STEP_DISTANCE_PRECISION = 3
 
 LngLat = Union[Sequence[float], str]
 
@@ -97,11 +107,46 @@ def parse_geometry(raw: Any) -> Optional[list[list[float]]]:
     return points
 
 
-def parse_route(payload: Any, *, with_geometry: bool = False) -> dict[str, Any]:
+def parse_steps(raw_legs: Any) -> list[dict[str, Any]]:
+    """OSRM ``routes[0].legs[].steps[]`` → ``[{"distance_km": 公里, "ref": 编号 | None}, ...]``。
+
+    只留费用引擎要用的两项:段距离(米 → 公里)与道路编号 ``ref``(高速/国道形如
+    ``G60``、省道形如 ``S328``,市区路多为空)。缺 ``legs``、格式不对或距离非数字的段
+    **直接跳过**,整体拿不到就返回空列表 —— 调用方据此退化成启发式估算,
+    不该因为分段明细把一条时长/里程都真实的驾车路线判为失败。
+    """
+    if not isinstance(raw_legs, list):
+        return []
+    steps: list[dict[str, Any]] = []
+    for leg in raw_legs:
+        if not isinstance(leg, dict):
+            continue
+        raw_steps = leg.get("steps")
+        if not isinstance(raw_steps, list):
+            continue
+        for step in raw_steps:
+            if not isinstance(step, dict):
+                continue
+            distance_m = step.get("distance")
+            if isinstance(distance_m, bool) or not isinstance(distance_m, (int, float)):
+                continue
+            if distance_m < 0:
+                continue
+            ref = step.get("ref")
+            steps.append({
+                "distance_km": round(float(distance_m) / 1000.0, STEP_DISTANCE_PRECISION),
+                "ref": ref.strip() if isinstance(ref, str) and ref.strip() else None,
+            })
+    return steps
+
+
+def parse_route(payload: Any, *, with_geometry: bool = False,
+                with_steps: bool = False) -> dict[str, Any]:
     """解析 OSRM 响应 → ``{"distance_km": 公里, "duration_min": 分钟}``。
 
     ``with_geometry=True`` 时多返回一个 ``geometry`` 键(``[[lat, lng], ...]`` 或 ``None``);
-    默认不加这个键,返回形状与阶段0 保持一致。
+    ``with_steps=True`` 时多返回一个 ``steps`` 键(:func:`parse_steps` 的结果);
+    默认两个键都不加,返回形状与阶段0 保持一致。
     """
     if not isinstance(payload, dict):
         raise DataSourceError(SOURCE_NAME, f"响应格式异常(应为 JSON 对象):{type(payload).__name__}")
@@ -140,6 +185,8 @@ def parse_route(payload: Any, *, with_geometry: bool = False) -> dict[str, Any]:
     }
     if with_geometry:
         result["geometry"] = parse_geometry(first.get("geometry"))
+    if with_steps:
+        result["steps"] = parse_steps(first.get("legs"))
     return result
 
 
@@ -167,18 +214,21 @@ class OsrmClient:
         *,
         profile: str = DEFAULT_PROFILE,
         with_geometry: bool = False,
+        with_steps: bool = False,
     ) -> dict[str, Any]:
         """驾车路线规划:返回 ``{"distance_km": float, "duration_min": float}``。
 
         ``with_geometry=True`` 时改传 ``overview=full`` + ``geometries=geojson``,
         结果多一个 ``geometry``(``[[lat, lng], ...]`` 或 ``None``)—— 阶段2 地图画线用。
+        ``with_steps=True`` 时改传 ``steps=true``,结果多一个 ``steps``
+        (``[{"distance_km", "ref"}, ...]``)—— 费用引擎 v2 认高速里程用(TASK-6d)。
         """
         coordinates = f"{format_lnglat(start_lnglat)};{format_lnglat(end_lnglat)}"
         url = f"{self.endpoint}/route/v1/{profile}/{coordinates}"
         params: dict[str, Any] = {
             "overview": OVERVIEW_FULL if with_geometry else OVERVIEW_FALSE,
             "alternatives": "false",
-            "steps": "false",
+            "steps": STEPS_TRUE if with_steps else STEPS_FALSE,
             "annotations": "false",
         }
         if with_geometry:
@@ -191,7 +241,7 @@ class OsrmClient:
             timeout=self.timeout,
             headers={"User-Agent": self.user_agent},
         )
-        return parse_route(payload, with_geometry=with_geometry)
+        return parse_route(payload, with_geometry=with_geometry, with_steps=with_steps)
 
 
 _default_client: Optional[OsrmClient] = None
@@ -211,13 +261,15 @@ def route(
     *,
     profile: str = DEFAULT_PROFILE,
     with_geometry: bool = False,
+    with_steps: bool = False,
     endpoint: Optional[str] = None,
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
 ) -> dict[str, Any]:
-    """模块级便捷函数:两点间驾车路线 ``{"distance_km", "duration_min"[, "geometry"]}``。"""
+    """模块级便捷函数:两点间驾车路线 ``{"distance_km", "duration_min"[, "geometry"][, "steps"]}``。"""
     if endpoint is None and timeout is None and session is None:
         client = default_client()
     else:
         client = OsrmClient(endpoint, timeout=timeout, session=session)
-    return client.route(start_lnglat, end_lnglat, profile=profile, with_geometry=with_geometry)
+    return client.route(start_lnglat, end_lnglat, profile=profile,
+                        with_geometry=with_geometry, with_steps=with_steps)

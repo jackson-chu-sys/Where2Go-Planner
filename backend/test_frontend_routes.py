@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 import requests
@@ -37,12 +37,18 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 from app.api import collections as collections_api  # noqa: E402
+from app.api import places as places_api  # noqa: E402
 from app.api import routes as routes_api  # noqa: E402
+from app.api import stays as stays_api  # noqa: E402
 from app.api import trips as trips_api  # noqa: E402
 from app.main import STATIC, app as fastapi_app  # noqa: E402
+from db import models as db_models  # noqa: E402
 from db.base import init_db, make_engine, session_factory  # noqa: E402
+from services import place_loader  # noqa: E402
 from services import routes as route_service  # noqa: E402
+from services import stays as stay_service  # noqa: E402
 from services import trips as trip_service  # noqa: E402
+from services.bands import find_band  # noqa: E402
 
 INDEX_HTML = STATIC / "index.html"
 # 路线面板那一段 JS 的切片边界(前面是 popup/identity,后面是 drawPins)
@@ -902,3 +908,444 @@ def test_plan_save_surfaces_idempotent_refresh(html: str) -> None:
     assert "缺少方案名" in section, "方案名为空要就地给中文提示(不打无谓的 400)"
     assert "setPlanErr" in section and "error.message" in section, "失败要落后端中文报错文案"
     assert "disabled" in section, "保存中/没勾选时按钮要禁用"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-6e:前端适配 —— 加载更多(分页)/ 费用引擎 v2 口径 / 住宿三档空态 / geocoder 口径
+#          照 TASK-5b 的追加模式:静态断言(DOM、JS 函数、文案、参数拼接)+ 用替身
+#          **真跑后端路由函数**做字段契约(前端引用的响应字段必须是后端实际输出的子集)。
+#          全程不触网:Overpass/OSRM/地理编码/住宿服务层一律 monkeypatch 成替身。
+# --------------------------------------------------------------------------- #
+
+MORE_DOM_IDS = ["moreWrap", "moreBtn", "moreSub"]
+MORE_FUNCTIONS = ["placesParams", "pageNeedsExpand", "pagingNote", "placesStatusHtml",
+                  "applyPlacesPage", "syncMoreButton", "drawMorePins", "loadMorePlaces",
+                  "geocoderNote"]
+MONEY_FUNCTIONS = ["perPersonCost", "costBreakdownTip", "drivingMoneyHtml", "railMoneyHtml",
+                   "flightMoneyHtml", "routeMoneyHtml"]
+# 分页响应里前端必须消费的三个字段(TASK-6b 的口径)
+PAGE_FIELDS = ["total_in_db", "has_more", "fetch_rounds"]
+MORE_BTN_LABEL = "加载更多(每页 15)"
+MORE_EXPAND_HINT = "正在扩抓更多目的地…"
+FLIGHT_NO_PRICE = "不出票价,以跳转实时为准"
+STAY_ESTIMATING = "AI 估价生成中,稍后刷新"
+STAY_EMPTY_TEXTS = {"no_data": "附近没找到住宿", "datasource_error": "数据源暂时不可用",
+                    "timeout": "查询超时,请稍后再试"}
+# 北京 → 六安:直线约 908km(飞机会出现),但六安不在 AIRPORT_CITIES → 后端**不给票价**
+BEIJING_ORIGIN = {"lat": "39.9042", "lng": "116.4074", "name": "北京"}
+LUAN = {"lat": "31.7350", "lng": "116.5000", "name": "六安"}
+# /api/stays 的一行(形状与后端 ITEM_KEYS 一致;price_estimate 为 null = 还在后台估价)
+STAY_ROW = {"id": 11, "osm_type": "node", "osm_id": 5, "name": "测试酒店", "kind": "hotel",
+            "lat": 31.24, "lng": 121.48, "distance_km": 1.2, "price_estimate": None,
+            "currency": "CNY", "intro": "", "source": "overpass"}
+
+
+def more_section(html: str) -> str:
+    """切出「加载更多(TASK-6e)」那一段 JS(分页契约断言只在这一段里找字段引用)。"""
+    start = html.index("// 加载更多(TASK-6e,配合 TASK-6b")
+    end = html.index("// 来源计数:OSM 抓取 vs 人工种子", start)
+    return html[start:end]
+
+
+def js_string(html: str, name: str) -> str:
+    match = re.search(rf'const\s+{re.escape(name)}\s*=\s*"([^"]+)"', html)
+    assert match, f"index.html 里找不到字符串常量 {name}"
+    return match.group(1)
+
+
+def js_map(html: str, name: str) -> str:
+    match = re.search(rf"const\s+{re.escape(name)}\s*=\s*\{{(.*?)\}};", html, re.S)
+    assert match, f"index.html 里找不到映射常量 {name}"
+    return match.group(1)
+
+
+@pytest.fixture()
+def payload_no_flight_price(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """北京 → 六安:飞机出现但**没有票价**(任一端无民航机场),用来验前端的 null 降级。"""
+    monkeypatch.setattr(route_service, "default_router", FakeRouter())
+    return routes_api.list_routes(
+        from_lat=BEIJING_ORIGIN["lat"], from_lng=BEIJING_ORIGIN["lng"],
+        to_lat=LUAN["lat"], to_lng=LUAN["lng"],
+        to_name=LUAN["name"], from_name=BEIJING_ORIGIN["name"],
+    )
+
+
+@pytest.fixture()
+def page_session(tmp_path: Path):
+    """独立临时 SQLite 库:真跑 /api/places、/api/geocode、/api/stays 的路由函数。"""
+    engine = make_engine(f"sqlite:///{tmp_path / 'frontend_paging.db'}")
+    init_db(engine)
+    current = session_factory(engine)()
+    try:
+        yield current
+    finally:
+        current.close()
+        engine.dispose()
+
+
+def fake_place_rows(count: int) -> list[dict[str, Any]]:
+    """库内 40 条的样子:距离等差(分页排序稳定)、id/osm_id 连续。"""
+    return [{"id": index + 1, "name": f"目的地{index + 1}", "category": "自然风光",
+             "lat": 31.0 + index * 0.01, "lng": 121.0 + index * 0.01,
+             "distance_km": round(50.0 + index * 0.5, 2), "osm_type": "node",
+             "osm_id": 900000 + index, "intro": "", "source": "OSM"} for index in range(count)]
+
+
+@pytest.fixture()
+def paging(monkeypatch: pytest.MonkeyPatch, page_session):
+    """替身 ``load_segment``:摆出「库内 40 条、已抓 2 轮」,真跑 /api/places 的分页路径。"""
+    total = 40
+    outcome = place_loader.SegmentOutcome(
+        origin={"lat": 31.2304, "lng": 121.4737, "name": "上海", "city": "上海"},
+        band=dict(find_band("50_100")),
+        places=fake_place_rows(total),
+        source="db",
+        counts_by_category={"自然风光": total},
+        counts_by_source={"OSM": total},
+        segment={"fetch_rounds": 2},
+    )
+    monkeypatch.setattr(place_loader, "load_segment", lambda *args, **kwargs: outcome)
+
+    def call(**params: Any) -> dict[str, Any]:
+        query: dict[str, Any] = {
+            "origin": "上海", "band": "50_100", "category": None, "lat": None, "lng": None,
+            "refresh": False, "page_size": None, "offset": None, "more": None,
+            "intros": False, "intro_limit": None,
+        }
+        query.update(params)
+        return places_api.list_places(session=page_session, **query)
+
+    return call
+
+
+@pytest.fixture()
+def stays_call(monkeypatch: pytest.MonkeyPatch, page_session):
+    """替身住宿服务层:直接摆出 reason / nearest_km / estimating 三档组合,真跑薄路由。"""
+
+    def call(*, items: list[dict[str, Any]] | None = None, reason: Optional[str] = None,
+             nearest_km: Optional[float] = None, estimating: bool = False) -> dict[str, Any]:
+        rows = stay_service.StayItems([dict(row) for row in (items or [])])
+        rows.reason = reason
+        rows.nearest_km = nearest_km
+        rows.estimating = estimating
+        rows.source = stay_service.SOURCE_DB
+        monkeypatch.setattr(stays_api.stay_service, "load_or_fetch_stays",
+                            lambda *args, **kwargs: rows)
+        return stays_api.list_stays(lat="31.2304", lng="121.4737", place_id=None,
+                                    radius_km=None, refresh=None, session=page_session)
+
+    return call
+
+
+@pytest.fixture()
+def geocode_session(monkeypatch: pytest.MonkeyPatch, page_session):
+    """替身地理编码降级链:正向答 photon、逆向双失败降级成 none(坐标起点)。"""
+    origin = {"lat": 31.2304, "lng": 121.4737, "name": "上海", "city": "上海"}
+    monkeypatch.setattr(place_loader, "resolve_origin_with_source",
+                        lambda city: (dict(origin), place_loader.GEOCODER_PHOTON))
+    monkeypatch.setattr(
+        place_loader, "resolve_reverse_origin_with_source",
+        lambda lat, lng, zoom=None: ({**origin, "resolved": False}, place_loader.GEOCODER_NONE),
+    )
+    return page_session
+
+
+# --- ① 加载更多(每页 15):DOM / 函数 / 分页参数 / has_more 消费 -------------------- #
+
+
+def test_more_button_dom_present(html: str) -> None:
+    for element_id in MORE_DOM_IDS:
+        assert f'id="{element_id}"' in html, f"缺少「加载更多」DOM id:{element_id}"
+    assert re.search(r'<button type="button" id="moreBtn"[^>]*disabled', html), \
+        "按钮默认禁用(拿到分页结果、has_more=true 才亮)"
+    assert '<div class="pl-more" id="moreWrap" style="display:none"' in html, \
+        "整行默认隐藏(没有分页结果时不占位)"
+    assert MORE_BTN_LABEL in html, "按钮文案要写明「每页 15」"
+    tail = html[html.index('id="placeListBody"'):html.index("</main>")]
+    assert 'id="moreBtn"' in tail, "按钮要挂在列表底部(placeListBody 之后)"
+
+
+def test_more_functions_present_and_wired(html: str) -> None:
+    section = more_section(html)
+    for name in MORE_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少 JS 函数:{name}"
+    assert '$("moreBtn").addEventListener("click",loadMorePlaces)' in html, "按钮要绑定 loadMorePlaces"
+    assert "onclick=" not in html, "仍不许内联 onclick(与既有前端约定一致)"
+
+
+def test_more_paging_params_are_sent(html: str) -> None:
+    section = more_section(html)
+    params = section[section.index("function placesParams"):section.index("function geocoderNote")]
+    assert "new URLSearchParams(" in params, "查询串仍用 URLSearchParams 拼装(自动百分号编码)"
+    for token in ('page_size:String(PLACES_PAGE_SIZE)', 'offset:String(',
+                  'more:(more?"true":"false")'):
+        assert token in params, f"分页参数拼接缺 {token}"
+    assert 'params.set("category"' in params and 'params.set("refresh","true")' in params, \
+        "分类过滤与强制重抓参数不能丢"
+    assert 'getJSON("/api/places?"' in section, "仍打 GET /api/places"
+    assert "placesParams(refresh,0,false)" in section, "首屏 offset=0、more=false(不触发扩抓)"
+    assert "placesParams(false,offset,true)" in section, "加载更多带 more=true(允许服务端扩抓)"
+    assert section.count("placesParams(") == 3, "首屏与加载更多共用同一个参数拼装函数"
+
+
+def test_more_page_size_matches_backend(html: str) -> None:
+    size = js_constant(html, "PLACES_PAGE_SIZE")
+    assert size == places_api.PAGE_SIZE_DEFAULT == 15, "前端每页条数要与后端 PAGE_SIZE_DEFAULT 同口径"
+    assert places_api.PAGE_SIZE_MIN <= size <= places_api.PAGE_SIZE_MAX, "每页条数要在后端允许区间内"
+    assert js_string(html, "MORE_BTN_LABEL") == MORE_BTN_LABEL
+
+
+def test_more_consumes_has_more_and_total_in_db(html: str) -> None:
+    section = more_section(html)
+    for field in PAGE_FIELDS:
+        assert f"data.{field}" in section, f"前端没有消费分页字段 {field}"
+    assert "state.page.hasMore=!!data.has_more" in section, "has_more 要落进 state"
+    assert "state.page.total=Math.max(0,Math.round(num(data.total_in_db)||0))" in section
+    assert "state.page.rounds=" in section and "data.fetch_rounds" in section
+    button = section[section.index("function syncMoreButton"):section.index("// 加载更多只给")]
+    assert "button.disabled=busy||!state.page.hasMore" in button, "has_more=false 要置灰"
+    assert 'button.style.display=(busy||state.page.hasMore)?"inline-block":"none"' in button, \
+        "has_more=false 时按钮消失"
+    assert "has_more=false" in button, "没有更多了要有可见说明"
+    # total_in_db 与当前已显示条数都要渲染(状态栏 + 按钮旁)
+    assert "已显示 <b>" in section and "/ 库内 <b>" in section, "状态栏要渲染 已显示/库内 条数"
+    assert '" / 库内 "+total+" 条' in section, "按钮旁要渲染 已显示/库内 条数"
+
+
+def test_more_expand_progress_text(html: str) -> None:
+    assert js_string(html, "MORE_EXPAND_HINT") == MORE_EXPAND_HINT, "扩抓进度文案要与约定一致"
+    section = more_section(html)
+    expand = section[section.index("function pageNeedsExpand"):section.index("function pagingNote")]
+    assert "offset>=total" in expand, "翻到库尾(offset ≥ total_in_db)才是扩抓"
+    load_more = section[section.index("async function loadMorePlaces"):]
+    assert "MORE_EXPAND_HINT" in load_more and "pageNeedsExpand()" in load_more, \
+        "扩抓中要给「正在扩抓更多目的地…」"
+    assert "10-60s" in load_more, "扩抓耗时量级(10-60s)要说清楚"
+    assert "button.textContent=busy?(expand?MORE_EXPAND_HINT:MORE_PAGE_HINT):MORE_BTN_LABEL" in section
+    assert "state.page.busy=true" in load_more, "扩抓/翻页期间要有 busy 守卫(防连点)"
+
+
+def test_more_paging_contract_matches_backend(html: str, paging) -> None:
+    """真跑一遍分页响应:前端在这段里引用的 data.* 必须都是后端实际输出的键。"""
+    section = more_section(html)
+    body = paging(page_size="15", offset="0", more="false")
+    used = referenced_fields(section, "data")
+    assert not (used - set(body) - {"detail"}), \
+        f"前端读了 /api/places 没有的响应字段:{sorted(used - set(body))}"
+    for field in PAGE_FIELDS:
+        assert field in used, f"前端没有消费 {field}"
+        assert field in body, f"后端响应缺 {field}"
+    assert body["count"] == 15 == len(body["places"]), "每页 15 条"
+    assert body["total_in_db"] == 40 and body["fetch_rounds"] == 2
+    assert body["has_more"] is True, "库里还有下一页 → has_more=true"
+
+
+def test_more_last_page_and_expand_round_match_backend(html: str, paging) -> None:
+    last = paging(page_size="15", offset="30", more="false")
+    assert last["has_more"] is False and last["count"] == 10 and last["total_in_db"] == 40
+    # 同一页带上 more=true:后端认为还能再抓一轮 → has_more 重新变 true(前端按钮不该消失)
+    assert paging(page_size="15", offset="30", more="true")["has_more"] is True
+    section = more_section(html)
+    assert "!state.page.hasMore" in section, "has_more=false 时按钮要置灰/消失"
+    assert "seen[Number(row.id)]" in section, "扩抓会让排序位次漂移:追加要按 id 去重"
+
+
+def test_more_does_not_disturb_pins_or_panel(html: str) -> None:
+    section = more_section(html)
+    extra = section[section.index("// 加载更多只给"):section.index("async function loadPlaces")]
+    assert "clearLayers" not in extra, "加载更多不清图层(只给新行补 pin)"
+    assert "closeRoutePanel" not in extra, "加载更多不该关掉已打开的路线面板"
+    assert 'state.pinScope!=="all"' in extra, "只画 AI 推荐时,加载更多不动地图"
+    assert "ensurePlaceRow(place)" in extra, "新行也要能取回 state.places 序号(popup/按钮靠它)"
+    assert 'marker.on("popupopen",()=>openRoutePanel(place))' in extra, "新 pin 一样点开路线面板"
+    assert 'bindPopup(popupHtml(place,index))' in extra, "新 pin 的 popup 仍走 popupHtml"
+    # 既有图层与「换段/重画就收面板」的行为不变
+    assert "rings=L.layerGroup().addTo(map);" in html and "pins=L.layerGroup().addTo(map);" in html
+    assert "routeLayer=L.layerGroup().addTo(map);" in html and "closeRoutePanel();" in html
+    first = section[section.index("async function loadPlaces"):section.index("async function loadMorePlaces")]
+    for token in ("renderPinsByScope()", "renderPlaceList()", "loadRecommend(false)",
+                  "setBusy(true)", "state.page.token+=1", "token!==state.page.token"):
+        assert token in first, f"首屏流程/分页 token 守卫少了 {token}"
+
+
+# --- ② 路线卡片新口径:整车·人均双标 / price_source / 机票区间与 null 降级 ---------- #
+
+
+def test_money_helpers_wired_into_route_card(html: str) -> None:
+    section = panel_section(html)
+    for name in MONEY_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少 JS 函数:{name}"
+    card = section[section.index("function routeCardHtml"):section.index("function renderRouteCards")]
+    assert "routeMoneyHtml(route)" in card, "卡片费用位要换成 v2 的模式感知渲染"
+    dispatch = section[section.index("function routeMoneyHtml"):]
+    for mode in ("driving", "rail", "flight"):
+        assert f'route.mode==="{mode}"' in dispatch, f"routeMoneyHtml 缺 {mode} 分支"
+    assert "fmtCost(route.cost_cny)" in dispatch, "未知方式仍退回旧的费用口径"
+    assert "route.note" in card and "routeLinksHtml(route.links)" in card, \
+        "note 与 deep-link 照常透出(不因新口径丢掉)"
+
+
+def test_driving_card_shows_vehicle_and_per_person(html: str, payload: dict[str, Any]) -> None:
+    driving = next(item for item in payload["routes"] if item["mode"] == "driving")
+    assert driving["vehicle_label"] == route_service.VEHICLE_LABEL == "整车≤4人"
+    assert driving["per_person_cny"] is not None and driving["cost_cny"] is not None
+    assert set(driving["cost_breakdown"]) == {"toll", "fuel", "mode"}, "构成明细就这三个键"
+    section = panel_section(html)
+    money = section[section.index("function drivingMoneyHtml"):section.index("function railMoneyHtml")]
+    assert "route.vehicle_label" in money and "人均" in money, "驾车要「整车 / 人均」双标"
+    assert 'esc(costBreakdownTip(route))' in money and 'title="' in money, "构成明细要进 tooltip"
+    per = section[section.index("function perPersonCost"):section.index("// 驾车构成明细 tooltip")]
+    assert "route.per_person_cny" in per, "人均取后端 per_person_cny(前端不自己摊)"
+    assert js_constant(html, "DRIVING_SEATS_FALLBACK") == route_service.DRIVING_SEATS, \
+        "兜底除数要与后端 DRIVING_SEATS 同口径"
+    tip = section[section.index("function costBreakdownTip"):section.index("function drivingMoneyHtml")]
+    assert "route.cost_breakdown" in tip and "breakdown.toll" in tip and "breakdown.fuel" in tip
+    assert "高速费" in tip and "油费" in tip, "tooltip 要写明构成(高速费 / 油费)"
+    assert "breakdown.mode" in tip and "TOLL_MODE_LABEL" in tip, "tooltip 要标高速里程来源 mode"
+
+
+def test_toll_modes_and_price_sources_cover_backend(html: str) -> None:
+    toll = js_map(html, "TOLL_MODE_LABEL")
+    toll_modes = route_service.cost_coefficients()["driving"]["toll_modes"]
+    assert toll_modes == [route_service.TOLL_MODE_OSRM_REFS, route_service.TOLL_MODE_HEURISTIC]
+    for mode in toll_modes:
+        assert mode in toll, f"cost_breakdown.mode 文案缺 {mode}"
+    rail = js_map(html, "RAIL_PRICE_SOURCE_LABEL")
+    sources = route_service.cost_coefficients()["rail"]["price_sources"]
+    assert sources == [route_service.PRICE_SOURCE_SEED, route_service.PRICE_SOURCE_ESTIMATE]
+    for source in sources:
+        assert source in rail, f"price_source 文案缺 {source}"
+    assert 'seed:"参考真实票价"' in html, "seed 档要标「参考真实票价」"
+
+
+def test_rail_card_shows_price_source(html: str, payload: dict[str, Any]) -> None:
+    rail = next(item for item in payload["routes"] if item["mode"] == "rail")
+    assert rail["price_source"] == route_service.PRICE_SOURCE_SEED, "上海→北京命中种子票价"
+    section = panel_section(html)
+    money = section[section.index("function railMoneyHtml"):section.index("function flightMoneyHtml")]
+    assert "route.price_source" in money and "RAIL_PRICE_SOURCE_LABEL" in money
+    assert "rp-src" in money, "price_source 要有可见小徽标(不只藏在 tooltip 里)"
+    assert 'price_source=' in money, "tooltip 要写出后端字段名,便于核对口径"
+
+
+def test_flight_card_shows_range(html: str, payload: dict[str, Any]) -> None:
+    flight = next(item for item in payload["routes"] if item["mode"] == "flight")
+    low, high = flight["flight_low_cny"], flight["flight_high_cny"]
+    assert low and high and low <= flight["cost_cny"] <= high, "区间应夹住中值 cost_cny"
+    section = panel_section(html)
+    money = section[section.index("function flightMoneyHtml"):section.index("function routeMoneyHtml")]
+    assert "route.flight_low_cny" in money and "route.flight_high_cny" in money
+    assert '<b>¥' in money and "–" in money, "机票要显示「¥A–B」区间"
+    assert js_string(html, "FLIGHT_RANGE_LABEL") == "浮动", "区间要标「浮动」"
+    assert "公布价" in money, "tooltip 要说明区间是公布价锚定的"
+
+
+def test_flight_null_price_degrades_to_deep_link(html: str, payload_no_flight_price: dict[str, Any]) -> None:
+    flight = next(item for item in payload_no_flight_price["routes"] if item["mode"] == "flight")
+    assert flight["flight_low_cny"] is None and flight["flight_high_cny"] is None
+    assert flight["cost_cny"] is None, "不给票价时 cost_cny 也是 null(前端不能编数字)"
+    assert flight["links"], "不给票价也要保留 deep-link"
+    assert js_string(html, "FLIGHT_NO_PRICE_TEXT") == FLIGHT_NO_PRICE
+    section = panel_section(html)
+    money = section[section.index("function flightMoneyHtml"):section.index("function routeMoneyHtml")]
+    assert "isFinite(low)" in money and "isFinite(high)" in money, "两个端点都要判 null"
+    assert "FLIGHT_NO_PRICE_TEXT" in money, "null 时要显示「不出票价,以跳转实时为准」"
+    assert "deep-link" in money, "null 文案要把人指回跳转链接"
+    assert "routeLinksHtml(route.links)" in section, "deep-link 渲染与票价无关,照常保留"
+
+
+# --- ③ 住宿三档空态 + estimating 文案 + 字段契约 ---------------------------------- #
+
+
+def test_stay_three_tier_reason_texts(html: str) -> None:
+    mapping = js_map(html, "STAY_REASON_TEXT")
+    assert set(db_models.STAY_REASONS) == set(STAY_EMPTY_TEXTS), "后端三档 reason 口径变了"
+    for reason, text in STAY_EMPTY_TEXTS.items():
+        assert reason in mapping, f"三档 reason 文案缺 {reason}"
+        assert f'{reason}:"{text}"' in html, f"{reason} 的文案应是「{text}」"
+    section = stay_section(html)
+    empty = section[section.index("function stayEmptyText"):section.index("function applyStayData")]
+    assert "result.nearest_km" in empty and "km 外" in empty, "no_data 要给「最近的在 X km 外」"
+    assert 'reason==="no_data"' in empty and "最近的在" in empty, "nearest_km 只在 no_data 那档用"
+    assert "stayEmptyText(result)" in section and "stayEmptyTone(result)" in section, \
+        "空态文案与色调都由后端 reason 决定"
+
+
+def test_stay_datasource_error_offers_retry(html: str) -> None:
+    tone = js_map(html, "STAY_REASON_TONE")
+    assert 'datasource_error:"err"' in tone, "datasource_error 要走 err 色调"
+    assert 'no_data:"warn"' in tone and 'timeout:"warn"' in tone, "另两档是提示,不是错误"
+    section = stay_section(html)
+    assert 'retry.style.display=(message&&tone==="err")?"inline-block":"none"' in section, \
+        "setStayMsg 只在 err 色调时亮「重试」按钮 → datasource_error 才有重试"
+    assert "重试" in html[html.index('<button type="button" id="stayRetry"'):html.index("</aside>")]
+
+
+def test_stay_estimating_text(html: str) -> None:
+    assert js_string(html, "STAY_ESTIMATING_TEXT") == STAY_ESTIMATING
+    section = stay_section(html)
+    price = section[section.index("function stayPriceHtml"):section.index("function renderStayCards")]
+    assert "item.price_estimate" in price, "有 AI 预估价就照原样显示"
+    assert "state.stays.payload.estimating" in price and "STAY_ESTIMATING_TEXT" in price, \
+        "价格区在后台估价中要显示「AI 估价生成中,稍后刷新」"
+    body = section[section.index("function applyStayData"):]
+    assert "STAY_ESTIMATING_TEXT" in body and "result.estimating" in body, \
+        "副标题/提示条也要带上估价中的口径"
+
+
+def test_stays_reason_contract_matches_backend(html: str, stays_call) -> None:
+    """真跑薄路由:前端在住宿段里引用的 result.* 必须都是后端实际输出的键。"""
+    section = stay_section(html)
+    used = referenced_fields(section, "result")
+    for reason in db_models.STAY_REASONS:
+        body = stays_call(reason=reason, nearest_km=12.3)
+        assert body["reason"] == reason and body["nearest_km"] == 12.3
+        assert body["estimating"] is False and body["items"] == [] and body["count"] == 0
+        assert {"reason", "nearest_km", "estimating"} <= set(body), "三档判别字段要齐"
+        assert not (used - set(body) - {"detail"}), \
+            f"前端读了 /api/stays 没有的字段:{sorted(used - set(body))}"
+    for field in ("reason", "nearest_km", "estimating"):
+        assert field in used, f"前端没有消费 {field}"
+    busy = stays_call(items=[STAY_ROW], estimating=True)
+    assert busy["estimating"] is True and busy["items"][0]["price_estimate"] is None, \
+        "estimating=true 时价格可能还是 null(前端要显示「稍后刷新」)"
+    assert busy["count"] == 1 and busy["reason"] is None
+
+
+# --- ④ geocoder 口径进状态栏 / 页脚 ------------------------------------------------ #
+
+
+def test_geocoder_labels_cover_backend_sources(html: str) -> None:
+    labels = js_map(html, "GEOCODER_LABEL")
+    for source in (place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM,
+                   place_loader.GEOCODER_NONE):
+        assert source in labels, f"geocoder 文案缺 {source}"
+    assert "Photon" in labels and "Nominatim" in labels, "两个源的名字要写出来"
+    assert "坐标起点" in labels, "none 要说明已降级成坐标起点"
+
+
+def test_geocoder_lands_in_status_bar_and_footer(html: str) -> None:
+    origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
+    assert "data.geocoder" in origin and "state.geocoder" in origin, \
+        "applyOrigin 要把响应的 geocoder 存进 state(城市搜索与我的位置共用)"
+    section = more_section(html)
+    status = section[section.index("function placesStatusHtml"):section.index("function applyPlacesPage")]
+    assert "geocoderNote()" in status, "状态栏要带上起点解析源"
+    note = section[section.index("function geocoderNote"):section.index("// 是否要现场扩抓")]
+    assert "起点解析" in note and "GEOCODER_LABEL[key]" in note, "geocoder 要翻成中文口径再进状态栏"
+    footer = html[html.index("<footer>"):html.index("</footer>")]
+    assert "Photon" in footer and "Nominatim" in footer and "geocoder" in footer, \
+        "页脚口径说明要写清 geocoder 三档"
+
+
+def test_geocode_contract_returns_geocoder(html: str, geocode_session) -> None:
+    city = places_api.geocode_city(city="上海", session=geocode_session)
+    assert city["geocoder"] == place_loader.GEOCODER_PHOTON
+    reverse = places_api.reverse_geocode(lat=31.2304, lng=121.4737, zoom=None, session=geocode_session)
+    assert reverse["geocoder"] == place_loader.GEOCODER_NONE and reverse["resolved"] is False
+    labels = js_map(html, "GEOCODER_LABEL")
+    for body in (city, reverse):
+        assert body["geocoder"] in labels, f"geocoder={body['geocoder']} 在状态栏没有对应文案"
+    origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
+    assert not (referenced_fields(origin, "data") - set(city) - {"resolved"}), \
+        "applyOrigin 只能读 /api/geocode(+/reverse)真的会给的键"

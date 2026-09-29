@@ -77,6 +77,9 @@
   .rp-figs{display:flex;gap:16px;margin-top:8px;flex-wrap:wrap}
   .rp-fig{font-size:11px;color:#6b7280}
   .rp-fig b{display:block;font-size:15px;color:#1f2937}
+  /* 费用引擎 v2(TASK-6e):铁路 price_source 小徽标(seed = 参考真实票价) */
+  .rp-src{display:inline-block;margin-top:3px;font-size:10px;color:#92400e;background:#fef3c7;
+          border-radius:8px;padding:1px 6px}
   .rp-note{color:#6b7280;font-size:12px;line-height:1.5;margin-top:7px;
            border-top:1px dashed #e5e7eb;padding-top:6px;
            white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -291,6 +294,13 @@
     </div>
     <div class="rp-msg" id="placeListMsg" style="display:none"></div>
     <div id="placeListBody"></div>
+    <!-- 加载更多(TASK-6e):GET /api/places 分页(page_size=15 / offset / more)。
+         翻到库尾时带 more=true,后端会再抓一轮 Overpass(约 10-60s);has_more=false 就没更多了。 -->
+    <div class="pl-more" id="moreWrap" style="display:none">
+      <button type="button" id="moreBtn" class="secondary" disabled
+              title="按 offset 取下一页 15 条(读库约 1s);翻到库尾时带 more=true,后端会再抓一轮 Overpass(约 10-60s)">加载更多(每页 15)</button>
+      <span class="fp-sub" id="moreSub"></span>
+    </div>
   </div>
   <!-- 我的收藏弹层(TASK-2c-fe):对接 /api/collections;收藏按钮在路线卡片内,取消收藏在列表项内 -->
   <div id="favPanel" role="dialog" aria-modal="true" aria-labelledby="favPanelTitle">
@@ -363,7 +373,16 @@
   AI 推荐:地图默认只画后端推荐的 3~5 个目的地(可切「全部目的地」),LLM 没 key / 调用失败时
   降级为「按距离推荐」并在页面上标明原因 · 长介绍:地图下方列表分批懒加载(每批 10 条、推荐条优先),
   按 POI 缓存在库里、只补还没有的 · 收藏两层:目的地为父节点,它的路线与住宿收藏挂在下面
-  (旧收藏没有父级标注时落「未归类」,一条不丢)
+  (旧收藏没有父级标注时落「未归类」,一条不丢)·
+  起点地理编码:Photon 主路径 + Nominatim 降级,状态栏标注本次是谁答的(geocoder=photon / nominatim;
+  两个源都没答时 none,降级成坐标起点,范围圈照画、分段照查)·
+  目的地列表分页:首屏每页 15 条,「加载更多」按 offset 逐页取;翻到库尾时带 more=true 让后端再抓一轮
+  Overpass(约 10-60s,期间提示「正在扩抓更多目的地…」),has_more=false 就没有更多了 ·
+  路线费用 v2:驾车给「整车≤4人 / 人均」双标 + 构成明细(高速费 toll / 油费 fuel,高速里程来源
+  osrm_refs|heuristic),铁路标 price_source(seed = 参考真实票价 / estimate = 分档费率估算),
+  机票给公布价锚定区间「¥A–B(浮动)」;给不出票价时不编数字,只留 OTA deep-link 看实时价 ·
+  住宿空态分三档:reason=no_data(附近没找到住宿,给最近一家的距离)/ datasource_error(数据源暂时不可用,
+  可重试)/ timeout(查询超时,请稍后再试);价格还在后台回填(estimating=true)时显示「AI 估价生成中,稍后刷新」
 </footer>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -405,6 +424,10 @@ const STAYS_EST_FALLBACK="AI 预估 · 仅供参考 · 以 OTA 实时为准";   
 const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:"",bandMeta:null,cached:{},
              places:[],routeCache:{},routePanel:{open:false,place:null,data:null,mode:null,token:0},
              stays:{token:0,loadedKey:null,payload:null},
+             // 加载更多(TASK-6e):/api/places 分页游标 —— offset 是**下一页起点**、total 是库内行数
+             // (total_in_db)、hasMore/rounds 直接落响应的 has_more/fetch_rounds;token 守卫在飞的翻页请求。
+             page:{offset:0,total:0,hasMore:false,rounds:0,busy:false,token:0},
+             geocoder:"",   // 起点地理编码来源(TASK-6a):photon / nominatim / none(坐标起点)
              fav:{open:false,items:[],busy:false,favedKeys:{}},
              // 功能2/3:地图显示范围(默认只画 AI 推荐)+ 推荐与长介绍的异步态(token 守卫可作废)
              pinScope:"reco",
@@ -650,6 +673,71 @@ function routeLinksHtml(links){
     esc(link.label||link.provider||"跳转")+" ↗</a>").join("")+"</div>";
 }
 
+// --------------------------------------------------------------------------- //
+// 费用引擎 v2(TASK-6e):三种方式各有各的口径,一律照后端字段展示,前端不自己算钱。
+//   驾车:cost_breakdown{toll 高速费, fuel 油费, mode osrm_refs|heuristic} + vehicle_label
+//         (整车≤4人)/ per_person_cny(人均)双标,构成明细进 tooltip。
+//   铁路:price_source(seed = 人工校录的热门城市对票价 → 标「参考真实票价」/ estimate = 分档费率)。
+//   机票:flight_low_cny ~ flight_high_cny 的公布价锚定区间(标「浮动」);为 null 时**不编数字**,
+//         只留 deep-link 看实时价(宁可不估、不瞎估)。
+// --------------------------------------------------------------------------- //
+const TOLL_MODE_LABEL={osrm_refs:"高速里程取 OSRM 路段编号(G/S 开头)",
+  heuristic:"高速里程按 里程 × 0.55 估算"};
+const RAIL_PRICE_SOURCE_LABEL={seed:"参考真实票价",estimate:"分档费率估算"};
+const FLIGHT_RANGE_LABEL="浮动";
+const FLIGHT_NO_PRICE_TEXT="不出票价,以跳转实时为准";
+const DRIVING_SEATS_FALLBACK=4;   // 后端 per_person_cny 缺失时的兜底除数(与 routes.DRIVING_SEATS 同口径)
+
+function perPersonCost(route){
+  const given=num(route.per_person_cny);
+  if(isFinite(given)) return Math.round(Math.max(0,given));
+  const whole=num(route.cost_cny);
+  return isFinite(whole)?Math.round(Math.max(0,whole)/DRIVING_SEATS_FALLBACK):NaN;
+}
+// 驾车构成明细 tooltip:高速费 + 油费 = 整车,外加高速里程来源(mode)与人均口径
+function costBreakdownTip(route){
+  const breakdown=route.cost_breakdown||{};
+  const modeKey=String(breakdown.mode||"");
+  return ["构成明细:高速费 "+fmtCost(breakdown.toll)+" + 油费 "+fmtCost(breakdown.fuel)+
+            " = "+fmtCost(route.cost_cny),
+          "高速里程来源:"+(TOLL_MODE_LABEL[modeKey]||modeKey||"—"),
+          "口径 "+(route.vehicle_label||("整车≤"+DRIVING_SEATS_FALLBACK+"人"))+
+            ",人均 = 整车 ÷ "+DRIVING_SEATS_FALLBACK+" 人",
+          ROUTE_DISCLAIMER].join(" · ");
+}
+function drivingMoneyHtml(route){
+  const per=perPersonCost(route);
+  return '<span class="rp-fig" title="'+esc(costBreakdownTip(route))+'">'+
+    "<b>"+esc(fmtCost(route.cost_cny))+"</b>"+
+    esc(route.vehicle_label||("整车≤"+DRIVING_SEATS_FALLBACK+"人"))+
+    " / 人均 "+esc(isFinite(per)?("¥"+per):"—")+"</span>";
+}
+function railMoneyHtml(route){
+  const key=String(route.price_source||"");
+  const label=RAIL_PRICE_SOURCE_LABEL[key]||key;
+  return '<span class="rp-fig" title="票价来源 price_source='+esc(key||"—")+
+    (label?("("+esc(label)+")"):"")+'"><b>'+esc(fmtCost(route.cost_cny))+"</b>费用"+
+    (label?('<span class="rp-src">'+esc(label)+"</span>"):"")+"</span>";
+}
+function flightMoneyHtml(route){
+  const low=num(route.flight_low_cny),high=num(route.flight_high_cny);
+  if(!isFinite(low)||!isFinite(high)){
+    // 后端明确不给票价(直线 <400km 或任一端没有民航机场):不编数字,deep-link 照常保留
+    return '<span class="rp-fig" title="后端没给机票价(直线不足 400km 或任一端没有民航机场);'+
+      '宁可不估、不瞎估,请用下方 OTA deep-link 看实时价"><b>—</b>'+
+      esc(FLIGHT_NO_PRICE_TEXT)+"</span>";
+  }
+  return '<span class="rp-fig" title="民航公布价锚定区间:公布价 × 典型折扣 ~ 公布价,cost_cny 取区间中值;'+
+    '动态定价·浮动大·实时价以跳转为准"><b>¥'+Math.round(Math.max(0,low))+"–"+
+    Math.round(Math.max(0,high))+"</b>("+esc(FLIGHT_RANGE_LABEL)+")</span>";
+}
+function routeMoneyHtml(route){
+  if(route.mode==="driving") return drivingMoneyHtml(route);
+  if(route.mode==="rail") return railMoneyHtml(route);
+  if(route.mode==="flight") return flightMoneyHtml(route);
+  return '<span class="rp-fig"><b>'+esc(fmtCost(route.cost_cny))+"</b>费用(估算)</span>";
+}
+
 function routeCardHtml(route){
   const mode=route.mode||"";
   const badge=KIND_BADGE[route.kind]||KIND_BADGE.estimate;
@@ -666,7 +754,7 @@ function routeCardHtml(route){
       degraded+"</div>"+
     '<div class="rp-figs">'+
       '<span class="rp-fig"><b>'+esc(fmtDuration(route.duration_min))+"</b>时长</span>"+
-      '<span class="rp-fig"><b>'+esc(fmtCost(route.cost_cny))+"</b>费用(估算)</span>"+
+      routeMoneyHtml(route)+
       '<span class="rp-fig"><b>'+esc(fmtKm(route.distance_km))+"</b>里程</span>"+
     "</div>"+
     (route.note?'<div class="rp-note" title="'+esc(route.note)+'">'+esc(route.note)+"</div>":"")+
@@ -913,9 +1001,7 @@ async function addFavStay(item,button){
 function stayCardHtml(item,index){
   const meta=STAYS_KIND_META[item.kind]||{emoji:"🏨",label:item.kind||"住宿"};
   const km=num(item.distance_km);
-  const price=item.price_estimate
-    ? '<span class="sc-price">'+esc(item.price_estimate)+"</span>"
-    : '<span class="sc-meta">暂无 AI 预估价(以下单平台实时价为准)</span>';
+  const price=stayPriceHtml(item);
   const intro=(item.intro&&String(item.intro).trim())
     ? '<div class="sc-intro">'+esc(item.intro)+"</div>"
     : '<div class="sc-intro empty">暂无简介</div>';
@@ -931,6 +1017,14 @@ function stayCardHtml(item,index){
     stayFavButtonHtml(item,index)+
     "</div>";
 }
+// 价格区(TASK-6e):有 AI 预估价就照原样显示;没有、但后端说正在后台批量估价
+// (estimating=true)→「AI 估价生成中,稍后刷新」;两者都不是才说「暂无 AI 预估价」。
+function stayPriceHtml(item){
+  if(item.price_estimate) return '<span class="sc-price">'+esc(item.price_estimate)+"</span>";
+  if(state.stays.payload&&state.stays.payload.estimating)
+    return '<span class="sc-meta">'+esc(STAY_ESTIMATING_TEXT)+"</span>";
+  return '<span class="sc-meta">暂无 AI 预估价(以下单平台实时价为准)</span>';
+}
 function renderStayCards(result){
   const box=$("stayCards");
   const more=$("stayMore");
@@ -942,21 +1036,50 @@ function renderStayCards(result){
     more.style.display=hidden>0?"block":"none";
   }
 }
+// 三档空态(TASK-6e,口径全在后端 services/stays.py 的 reason,前端只翻成人话):
+//   no_data          → 「附近没找到住宿,最近的在 X km 外」(nearest_km 有值时)
+//   datasource_error → 「数据源暂时不可用」+ 重试按钮(tone=err 才亮 #stayRetry)
+//   timeout          → 「查询超时,请稍后再试」
+const STAY_REASON_TEXT={no_data:"附近没找到住宿",datasource_error:"数据源暂时不可用",
+  timeout:"查询超时,请稍后再试"};
+const STAY_REASON_TONE={no_data:"warn",datasource_error:"err",timeout:"warn"};
+const STAY_REASON_NEXT={
+  no_data:"OSM 覆盖有限;可换个目的地、放大分段,或稍后再试",
+  datasource_error:"Overpass 检索报错或命中失败负缓存;点「重试」再拉一次,路线与地图不受影响",
+  timeout:"公共 Overpass 繁忙时会这样;点「重试」再来一次"};
+const STAY_EMPTY_FALLBACK="该目的地周边 "+STAYS_RADIUS_KM+" km 内暂时没有查到住宿";
+const STAY_ESTIMATING_TEXT="AI 估价生成中,稍后刷新";
+function stayReasonKey(result){return String((result&&result.reason)||"");}
+function stayEmptyTone(result){return STAY_REASON_TONE[stayReasonKey(result)]||"warn";}
+function stayEmptyText(result){
+  const reason=stayReasonKey(result);
+  const head=STAY_REASON_TEXT[reason]||STAY_EMPTY_FALLBACK;
+  const nearest=num(result&&result.nearest_km);
+  const near=(reason==="no_data"&&isFinite(nearest))
+    ? (",最近的在 "+Math.max(0,nearest).toFixed(1)+" km 外"):"";
+  return head+near+"("+(STAY_REASON_NEXT[reason]||"OSM 覆盖有限;可换个目的地或稍后重试")+")。";
+}
 function applyStayData(result,place){
   state.stays.loadedKey=staysCacheKey(place);
   state.stays.payload=result;
   $("stayTitle").textContent="🛏️ 周边住宿 · "+(place.name||"目的地")+" "+STAYS_RADIUS_KM+" km 内";
   const items=(result&&Array.isArray(result.items))?result.items:[];
   const sourceNote=(result&&result.source==="db")?"来自库缓存":("现场检索("+(result&&result.source||"overpass")+")");
+  const estimating=!!(result&&result.estimating);
   $("staySub").textContent="共 "+((result&&result.count)||items.length)+" 家 · "+sourceNote+
-    " · 价格为 AI 预估参考价,不代订、不抓实时价";
+    " · 价格为 AI 预估参考价,不代订、不抓实时价"+(estimating?(" · "+STAY_ESTIMATING_TEXT):"");
   if(!items.length){
     renderStayCards([]);
-    setStayMsg("该目的地周边 "+STAYS_RADIUS_KM+" km 内暂时没有查到住宿(OSM 覆盖有限);可换个目的地或稍后重试。","warn");
+    setStayMsg(stayEmptyText(result),stayEmptyTone(result));
     return;
   }
   renderStayCards(result);
-  setStayMsg("");
+  const reason=stayReasonKey(result);
+  // 库里有行但这次检索降级了(如 Overpass 报错):行照显示,同时把原因说清楚并亮重试
+  if(reason) setStayMsg("本次为降级返回(reason="+reason+"):"+stayEmptyText(result),stayEmptyTone(result));
+  else if(estimating)
+    setStayMsg(STAY_ESTIMATING_TEXT+"(后台正在批量回填价格,重开面板或点「重试」即可看到)","warn");
+  else setStayMsg("");
 }
 async function loadStays(place,token){
   const params=new URLSearchParams({lat:String(place.lat),lng:String(place.lng),
@@ -1129,6 +1252,8 @@ async function searchCity(city){
 // 起点落地(城市搜索与浏览器定位共用):换 state、清分段计数缓存、重画范围圈并 fit
 function applyOrigin(data){
   state.origin=data.origin;
+  // 起点地理编码来源(TASK-6a/6e):/api/geocode 与 /api/geocode/reverse 都会带 geocoder
+  state.geocoder=String(data.geocoder||"");
   state.cached={};
   state.routeCache={};   // 起点变了 → 已缓存的路线全部作废
   closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉
@@ -1188,6 +1313,133 @@ function onLocateFailed(error){
   setBusy(false);
 }
 
+// --------------------------------------------------------------------------- //
+// 加载更多(TASK-6e,配合 TASK-6b 的 /api/places 分页):首屏只取第 1 页 15 条,
+// 「加载更多」按 offset 逐页取;翻到库尾(offset ≥ total_in_db)时带 more=true,后端会
+// 再抓一轮 Overpass(target_total=30×(fetch_rounds+1),实测 10-60s)—— 这期间状态栏给
+// 「正在扩抓更多目的地…」;has_more=false 就把按钮收掉。分页口径全在后端 app/api/places.py
+// (page_size / offset / more / total_in_db / has_more / fetch_rounds),前端不自己算页。
+// --------------------------------------------------------------------------- //
+const PLACES_PAGE_SIZE=15;                     // 与后端 PAGE_SIZE_DEFAULT 同口径(「每页 15」)
+const MORE_BTN_LABEL="加载更多(每页 15)";
+const MORE_EXPAND_HINT="正在扩抓更多目的地…";    // more=true 触发服务端 Overpass 扩抓时的进度文案
+const MORE_PAGE_HINT="正在加载下一页…";
+// 起点地理编码来源(TASK-6a 的 geocoder 字段):photon 主路径 / nominatim 降级 / none = 两个源都没答
+const GEOCODER_LABEL={photon:"Photon(主路径)",nominatim:"Nominatim(降级)",
+  none:"none(未解析,已降级为坐标起点)"};
+
+// 分页参数一律走 URLSearchParams(自动百分号编码);more=true 表示"翻到库尾就再抓一轮"
+function placesParams(refresh,offset,more){
+  const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),
+    lat:String(state.origin.lat),lng:String(state.origin.lng),
+    page_size:String(PLACES_PAGE_SIZE),
+    offset:String(Math.max(0,Math.round(num(offset)||0))),
+    more:(more?"true":"false")});
+  if(state.category) params.set("category",String(state.category));
+  if(refresh) params.set("refresh","true");
+  return params;
+}
+function geocoderNote(){
+  const key=String(state.geocoder||"");
+  return key?(" · 起点解析:<b>"+esc(GEOCODER_LABEL[key]||key)+"</b>"):"";
+}
+// 是否要现场扩抓:下一页起点已越过库内行数 → 后端得再抓一轮 Overpass 才有东西可给
+function pageNeedsExpand(){
+  const total=Math.max(0,Math.round(num(state.page.total)||0));
+  const offset=Math.max(0,Math.round(num(state.page.offset)||0));
+  return total>0&&offset>=total;
+}
+function pagingNote(){
+  if(!state.page.total) return "";
+  return " · 已抓 <b>"+state.page.rounds+"</b> 轮"+(state.page.hasMore
+    ? ((pageNeedsExpand()?" · 下一页要现场扩抓 Overpass":" · 库里还有下一页")+"(点「加载更多」)")
+    : " · 没有更多了(has_more=false)");
+}
+// 状态栏:分页口径(已显示 / 库内 total_in_db / 抓取轮数)+ 来源 + 起点解析源 + 分段提示
+function placesStatusHtml(data){
+  const bandTotal=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
+  const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"Overpass 实时抓取 → 已入库";
+  const hint=bandHint(data.band);   // 功能1:含市区/近郊那一档给一句口径说明
+  const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
+  return '起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
+    " · 分类 <b>"+esc(state.category||"全部")+"</b> · 已显示 <b>"+(state.places||[]).length+
+    "</b> / 库内 <b>"+state.page.total+"</b> 条(本页 "+data.count+" 条 · 该分段合计 "+bandTotal+
+    " 条)· 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+
+    introNote(data)+pagingNote()+geocoderNote()+(hint?(" · "+hint):"");
+}
+// 一页响应落地:append=false = 首屏/换段(整份替换),true = 加载更多(按 id 去重后追加)。
+// 只动 state 与状态栏,画针/渲染列表由调用方决定(加载更多不该重排地图视野)。
+function applyPlacesPage(data,append){
+  state.origin=data.origin;
+  state.bandMeta=data.band;
+  const rows=Array.isArray(data.places)?data.places:[];
+  const added=[];
+  if(append){
+    const seen={};
+    (state.places||[]).forEach(row=>{if(row) seen[Number(row.id)]=true;});
+    rows.forEach(row=>{
+      // 扩抓会让距离排序的位次漂移,页边界可能重叠:按 id 去重,不重复渲染也不重复画针
+      if(!row||seen[Number(row.id)]) return;
+      seen[Number(row.id)]=true;
+      added.push(row);
+      state.places.push(row);
+    });
+  }else{
+    state.places=rows.slice();
+  }
+  state.page.offset=(append?Math.max(0,Math.round(num(state.page.offset)||0)):0)+rows.length;
+  state.page.total=Math.max(0,Math.round(num(data.total_in_db)||0));
+  state.page.hasMore=!!data.has_more;
+  state.page.rounds=Math.max(0,Math.round(num(data.fetch_rounds)||0));
+  state.cached[state.band]=Object.values(data.counts_by_category||{})
+    .reduce((sum,value)=>sum+value,0);
+  state.reco.pending=Math.max(0,Number(data.detail_pending)||0);
+  renderBandOptions();
+  if(!append){drawRings();fitRings();renderLegend(data.counts_by_category);}
+  setStatus(placesStatusHtml(data));
+  return {rows:rows,added:added};
+}
+// 按钮态:扩抓/翻页中 → 禁用并把文案换成进度;has_more=false → 按钮消失(只留计数说明)
+function syncMoreButton(){
+  const wrap=$("moreWrap"),button=$("moreBtn"),sub=$("moreSub");
+  const busy=!!state.page.busy;
+  const total=Math.max(0,Math.round(num(state.page.total)||0));
+  const offset=Math.max(0,Math.round(num(state.page.offset)||0));
+  const expand=pageNeedsExpand();
+  if(wrap) wrap.style.display=(total>0||busy)?"flex":"none";
+  if(sub) sub.textContent=total
+    ? ("已显示 "+(state.places||[]).length+" / 库内 "+total+" 条 · 每页 "+PLACES_PAGE_SIZE+
+       " 条 · 已抓 "+state.page.rounds+" 轮"+(state.page.hasMore
+          ? (expand?" · 下一页要现场扩抓 Overpass(约 10-60s)":" · 库里还有下一页")
+          : " · 没有更多了(has_more=false)"))
+    : "";
+  if(!button) return;
+  button.textContent=busy?(expand?MORE_EXPAND_HINT:MORE_PAGE_HINT):MORE_BTN_LABEL;
+  button.disabled=busy||!state.page.hasMore;
+  button.style.display=(busy||state.page.hasMore)?"inline-block":"none";
+  button.title=busy
+    ? "正在请求下一页(翻到库尾时后端会再抓一轮 Overpass,约 10-60s)"
+    : (state.page.hasMore
+       ? ("取下一页 "+PLACES_PAGE_SIZE+" 条(offset="+offset+
+          ";翻到库尾时带 more=true 让后端再抓一轮 Overpass,约 10-60s)")
+       : "后端回报 has_more=false:这个分段/分类下没有更多目的地了");
+}
+// 加载更多只给**新行**补 pin:不清图层、不关已打开的路线面板(drawPins 两件事都会做)
+function drawMorePins(rows){
+  if(!pins||!map||state.pinScope!=="all") return;
+  (rows||[]).forEach(place=>{
+    if(!coordsReady(place)) return;
+    const index=ensurePlaceRow(place);   // 行已在 state.places 里,取回它的序号供 popup/按钮用
+    const meta=categoryMeta(place.category);
+    const icon=L.divIcon({className:"",iconSize:[26,26],iconAnchor:[13,26],popupAnchor:[0,-24],
+      html:'<div class="pin" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
+    const marker=L.marker([place.lat,place.lng],{icon:icon,title:place.name||""});
+    marker.bindPopup(popupHtml(place,index));
+    marker.on("popupopen",()=>openRoutePanel(place));
+    pins.addLayer(marker);
+  });
+}
+
 async function loadPlaces(refresh){
   if(!state.origin) return;
   showErr("");setBusy(true);
@@ -1195,39 +1447,68 @@ async function loadPlaces(refresh){
   state.reco.token+=1;state.reco.detailToken+=1;
   state.reco.payload=null;state.reco.items=[];state.reco.details={};state.reco.pending=0;
   state.reco.auto=true;state.reco.busy=false;state.reco.loading=false;state.reco.failed=false;
+  // 分页游标归零(TASK-6e):换段/换分类/重抓都从第 1 页(15 条)重新开始
+  state.page.token+=1;
+  const token=state.page.token;
+  state.page.offset=0;state.page.total=0;state.page.hasMore=false;state.page.rounds=0;
+  state.page.busy=true;
+  syncMoreButton();
   const known=state.cached[state.band];
   if(refresh) setStatus("正在重新抓取 Overpass 四分类并集(公共源较慢,约 20-120s)…");
-  else if(known===undefined) setStatus("该分段尚未入库,正在抓取 Overpass 四分类并集(约 20-120s)…");
-  else setStatus("正在读取本地库(已入库,不触网)…");
-  const params=new URLSearchParams({origin:state.origin.city,band:state.band,
-    lat:String(state.origin.lat),lng:String(state.origin.lng)});
-  if(state.category) params.set("category",state.category);
-  if(refresh) params.set("refresh","true");
+  else if(known===undefined) setStatus("该分段尚未入库,正在抓第一轮(分页模式每轮 30 配额,约 10-60s)…");
+  else setStatus("正在读取本地库(已入库,不触网;首屏每页 "+PLACES_PAGE_SIZE+" 条)…");
   try{
-    const data=await getJSON("/api/places?"+params.toString());
-    state.origin=data.origin;
-    state.bandMeta=data.band;
-    const total=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
-    state.cached[state.band]=total;
-    renderBandOptions();drawRings();fitRings();renderLegend(data.counts_by_category);
+    const data=await getJSON("/api/places?"+placesParams(refresh,0,false).toString());
+    if(token!==state.page.token) return;   // 已换段/换分类:丢掉过期响应
+    applyPlacesPage(data,false);
     // 功能2/3:首屏不阻塞 —— 立刻按显示范围画针(默认只画推荐)+ 渲染列表骨架,
     // AI 推荐与 2~3 句长介绍随后异步补(失败只落 #recoMsg / #placeListMsg)。
-    state.places=Array.isArray(data.places)?data.places:[];
-    state.reco.pending=Math.max(0,Number(data.detail_pending)||0);
     renderPinsByScope();
     renderPlaceList();
-    const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"Overpass 实时抓取 → 已入库";
-    const hint=bandHint(data.band);   // 功能1:含市区/近郊那一档给一句口径说明
-    const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
-    setStatus('起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
-      " · 分类 <b>"+esc(state.category||"全部")+"</b> · 显示 <b>"+data.count+"</b> / 库内 "+total+
-      " 条 · 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+introNote(data)+
-      (hint?(" · "+hint):""));
-    if(!data.count) showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
+    syncMoreButton();
+    if(!(state.places||[]).length)
+      showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
     loadRecommend(false);   // 功能2:AI 推荐异步补(不 await,首屏不等它;失败只落 #recoMsg)
   }catch(error){
+    if(token!==state.page.token) return;
     showErr("查询失败:"+error.message);setStatus("查询失败");
-  }finally{setBusy(false);}
+  }finally{
+    if(token===state.page.token){state.page.busy=false;setBusy(false);syncMoreButton();}
+  }
+}
+
+// 「加载更多(每页 15)」:offset 递增翻页;翻到库尾时 more=true 让后端再抓一轮 Overpass。
+// 与 loadPlaces 共用一个 token:期间换段/换分类,这次翻页的回填一律作废。
+async function loadMorePlaces(){
+  if(!state.origin||state.page.busy||!state.page.hasMore) return;
+  const offset=Math.max(0,Math.round(num(state.page.offset)||0));
+  const expand=pageNeedsExpand();
+  state.page.busy=true;
+  state.page.token+=1;
+  const token=state.page.token;
+  syncMoreButton();
+  setStatus(expand
+    ? (MORE_EXPAND_HINT+"(本页已到库尾,后端正在再抓一轮 Overpass:约 10-60s,别切分段)")
+    : (MORE_PAGE_HINT+"(offset="+offset+",读库约 1s)"));
+  try{
+    const data=await getJSON("/api/places?"+placesParams(false,offset,true).toString());
+    if(token!==state.page.token) return;
+    const added=applyPlacesPage(data,true).added;
+    drawMorePins(added);
+    renderPlaceList();
+    setListMsg(added.length
+      ? ("已加载 "+added.length+" 条 · 现共显示 "+(state.places||[]).length+" / 库内 "+
+         state.page.total+" 条"+(state.page.hasMore?"":" · 到底了,没有更多了"))
+      : ("这一页没有新条目"+(state.page.hasMore
+          ? "(后端刚补抓了一轮,可再点一次「加载更多」)":" · 到底了,没有更多了")),
+      added.length?"":"warn");
+  }catch(error){
+    if(token!==state.page.token) return;
+    setListMsg("加载更多失败:"+((error&&error.message)||error)+
+      "(已显示的条目不受影响,可再点一次「加载更多」)","err");
+  }finally{
+    if(token===state.page.token){state.page.busy=false;syncMoreButton();}
+  }
 }
 
 // 来源计数:OSM 抓取 vs 人工种子(TASK-1c 补 OSM 国内滑雪/运动缺口);没种子就不占状态栏
@@ -1450,14 +1731,18 @@ function renderListSub(){
   if(!box) return;
   const payload=state.reco.payload;
   const pending=Math.max(0,Math.round(num(state.reco.pending)||0));
+  const shown=(state.places||[]).length;
+  const total=Math.max(0,Math.round(num(state.page.total)||0));
   const recoPart=payload
     ? ((payload.degraded||payload.basis==="distance")
         ? ("按距离推荐(未走 AI)置顶 "+state.list.reco+" 条")
         : ("AI 推荐置顶 "+state.list.reco+" 条"))
     : "AI 推荐加载中…";
-  box.textContent="共 "+(state.places||[]).length+" 条 · "+recoPart+" · 其他 "+state.list.other+
-    " 条按距起点由近到远 · 长介绍每批 "+DETAIL_BATCH+" 条懒加载(推荐条优先)"+
-    (pending>0?(" · 还剩 "+pending+" 条待生成"):(((state.places||[]).length)?" · 长介绍已补齐":""));
+  box.textContent="已显示 "+shown+" 条"+(total?(" / 库内 "+total+" 条"):"")+" · "+recoPart+
+    " · 其他 "+state.list.other+" 条按距起点由近到远 · 长介绍每批 "+DETAIL_BATCH+
+    " 条懒加载(推荐条优先)"+
+    (state.page.hasMore?(" · 底部「加载更多」每次 +"+PLACES_PAGE_SIZE+" 条"):"")+
+    (pending>0?(" · 还剩 "+pending+" 条待生成"):(shown?" · 长介绍已补齐":""));
 }
 function syncDetailMore(){
   const button=$("detailMore");
@@ -2441,6 +2726,8 @@ $("pinScope").addEventListener("change",event=>{
 });
 $("recoRefresh").addEventListener("click",()=>loadRecommend(true));
 $("detailMore").addEventListener("click",onDetailMore);
+// 加载更多(TASK-6e):offset 逐页取,翻到库尾时带 more=true 让后端再抓一轮 Overpass
+$("moreBtn").addEventListener("click",loadMorePlaces);
 $("routePanelClose").addEventListener("click",closeRoutePanel);
 $("openFav").addEventListener("click",openFavPanel);
 $("favPanelClose").addEventListener("click",closeFavPanel);

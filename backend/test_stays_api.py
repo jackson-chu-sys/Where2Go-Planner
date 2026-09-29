@@ -54,7 +54,7 @@ SAMPLE_ORDER = ["老船长青旅", "", "外滩华尔道夫酒店", "衡山路小
 TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "source", "note", "items"}
 ITEM_KEYS = {
     "id", "osm_type", "osm_id", "name", "kind", "lat", "lng",
-    "distance_km", "price_estimate", "currency", "intro", "estimated",
+    "distance_km", "price_estimate", "price_kind", "currency", "intro", "estimated",
 }
 EXISTING_PATHS = {
     "/api/discover", "/api/categories", "/api/places", "/api/places/meta",
@@ -312,9 +312,11 @@ def test_list_stays_projects_items_with_estimate_label(http, fake_overpass, fake
     first = body["items"][0]
     assert set(first) == ITEM_KEYS, f"单条形状不对:{set(first) ^ ITEM_KEYS}"
     assert first["estimated"] == "AI 预估 · 仅供参考 · 以 OTA 实时为准"
-    assert first["price_estimate"] == "约¥200-400/晚", "价格是服务层规范化的估算串"
+    # TASK-6g:老船长青旅命中 hostel 规则档 → 价格来自规则表,一次 LLM 都没调
+    assert first["price_estimate"] == "约¥50-150/晚", "价格是服务层规范化的估算串"
+    assert first["price_kind"] == "rule", "出处标记透出:规则表(0 token)"
     assert first["currency"] == DEFAULT_CURRENCY
-    assert first["intro"] == "位于市中心的经济型酒店。"
+    assert first["intro"] is None, "规则层不出简介(不为简介烧 token)"
     assert first["osm_type"] == "node" and first["osm_id"] == 2
     assert first["kind"] == "hostel"
     assert first["distance_km"] == pytest.approx(0.79, abs=0.05)
@@ -322,9 +324,11 @@ def test_list_stays_projects_items_with_estimate_label(http, fake_overpass, fake
     # 估算口径必须在 note 里写明(AI 预估参考价、非实时报价、以 OTA 为准)
     for fragment in ("估算", "OTA", "不是实时报价"):
         assert fragment in body["note"], f"note 应写明 {fragment}"
+    assert "price_kind" in body["note"], "note 应写明 price_kind 的口径"
     # 无名公寓没有名称 → 服务层不调 LLM,价格留空但不影响 200
     assert body["items"][1]["price_estimate"] is None
-    assert fake_llm.calls == 3, "只该给有名称的三行估价"
+    assert body["items"][1]["price_kind"] is None
+    assert fake_llm.calls == 0, "三行有名称的都命中规则表,LLM 一次都不该调"
 
 
 def test_radius_km_filters_items_and_is_echoed(http, fake_overpass, fake_llm) -> None:
@@ -491,29 +495,37 @@ def test_db_cache_hit_is_offline_and_llm_free(http, session, monkeypatch) -> Non
 def test_refresh_refetches_without_re_estimating(http, fake_overpass, fake_llm) -> None:
     status, first = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200 and first["source"] == stay_service.SOURCE_FETCH
-    assert fake_overpass.calls == 1 and fake_llm.calls == 3
+    assert fake_overpass.calls == 1 and fake_llm.calls == 0
 
     status, cached = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200 and cached["source"] == stay_service.SOURCE_DB
     assert fake_overpass.calls == 1, "未 refresh 时不该再检索"
-    assert fake_llm.calls == 3
+    assert fake_llm.calls == 0
 
     status, refreshed = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, refresh="1")
     assert status == 200 and refreshed["source"] == stay_service.SOURCE_FETCH
     assert fake_overpass.calls == 2, "refresh=true 应强制重抓"
-    assert fake_llm.calls == 3, "已有价格的行不该再调 LLM(不重复花 token)"
+    assert fake_llm.calls == 0, "已有价格的行不该再调 LLM(不重复花 token)"
     assert refreshed["count"] == 4
 
 
 @pytest.mark.parametrize("kwargs", [{"enabled": False}, {"error": RuntimeError("限流 429")}])
 def test_llm_degradation_keeps_200_and_null_price(http, fake_overpass, monkeypatch, kwargs) -> None:
-    """未配 key / 限流 → 价格与简介留空,接口照常 200(估算失败不影响事实字段)。"""
+    """未配 key / 限流 → LLM 那一路降级成 null,接口照常 200(估算失败不影响事实字段)。
+
+    TASK-6g:规则层是 0 token 的,没有 key 也照样出价,所以"降级"只降规则未命中的行。
+    """
     llm = FakeLLM(**kwargs)
     monkeypatch.setattr(stay_service, "default_llm_client", lambda: llm)
     status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200, body
     assert body["count"] == 4 and body["source"] == stay_service.SOURCE_FETCH
     for item in body["items"]:
-        assert item["price_estimate"] is None and item["intro"] is None
+        assert item["intro"] is None, "简介只有 LLM 那一路会给"
         assert item["estimated"] == stays_api.ESTIMATED_LABEL, "标注恒定,不因估不出而消失"
         assert item["name"] in SAMPLE_ORDER and item["distance_km"] is not None
+    by_name = {item["name"]: item for item in body["items"]}
+    assert by_name[""]["price_estimate"] is None and by_name[""]["price_kind"] is None
+    assert by_name["老船长青旅"]["price_estimate"] == "约¥50-150/晚"
+    assert by_name["老船长青旅"]["price_kind"] == "rule"
+    assert by_name["外滩华尔道夫酒店"]["price_estimate"] == "约¥1200-3000/晚"

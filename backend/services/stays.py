@@ -40,6 +40,19 @@ TASK-6c 在这个骨架上加了三件事(BUG-3/5):
   解析不出就留 null 不抛),响应带 ``estimating=True``;一批以内仍就地算完,首屏即有价格。
   线程池口径照 :func:`services.intro._run_batch`,执行器可注入(测试/CLI 用同步执行器)。
 
+TASK-6g 在估价路径最前面又插了一层(**规则层,0 token**):
+
+* :data:`BRAND_PRICE_BANDS` 品牌价格带表(≥25 个连锁品牌,**中英文别名都收**、大小写不敏感、
+  包含匹配、最长别名优先)+ ``hotel:stars``/``stars`` 星级档 + 类型兜底档
+  (:data:`KIND_PRICE_BANDS`,hostel/guest_house/chalet/apartment),命中就直接出
+  ``约¥A-B/晚``;再按 :data:`CITY_TIER_FACTOR` 做城市线级修正(一线 ×1.2、新一线 ×1.05、
+  其他城市 ×0.9,认不出城市 ×1.0),取整到 :data:`PRICE_BAND_STEP` 元。
+* 判档优先级 **品牌 > 星级 > 类型**(品牌与星级同时命中取品牌档)。命中规则的行标
+  ``price_kind="rule"``,**一次 LLM 都不调**;规则未命中的行才进既有的批量 LLM
+  (5 家/prompt、``qwen3.8-max``),标 ``price_kind="llm"``;两边都拿不到就仍是 null。
+* 规则产物与 LLM 产物同口径**永久缓存**:``Stay.price_estimate``/``price_kind`` 一旦写下,
+  重抓不覆盖(规则表日后调价也不会重算已入库的行,与 ``Place.intro`` 一致)。
+
 CLI(给夜间预抓/排查用,联网)::
 
     python -m services.stays 31.2304 121.4737 --radius 8000 --limit 10
@@ -69,6 +82,10 @@ from db.models import (
     DEFAULT_CURRENCY,
     KIND_LEN,
     NAME_LEN,
+    PRICE_KIND_LEN,
+    PRICE_KIND_LLM,
+    PRICE_KIND_RULE,
+    PRICE_KINDS,
     PRICE_LEN,
     REASON_DATASOURCE_ERROR,
     REASON_NO_DATA,
@@ -141,6 +158,152 @@ ESTIMATE_OFF = "off"
 ESTIMATE_MODES: tuple[str, ...] = (ESTIMATE_AUTO, ESTIMATE_SYNC, ESTIMATE_ASYNC, ESTIMATE_OFF)
 # 超时判定的文案线索:``data_sources._common`` 把 requests.Timeout 包成"请求超时(>20s)"
 TIMEOUT_HINTS: tuple[str, ...] = ("请求超时", "超时(>", "timed out", "timeout")
+
+# --- TASK-6g:规则估价层(**0 token**,命中即出区间;未命中才走既有批量 LLM) --- #
+# 为什么规则前置:连锁品牌与星级的房价带是**公开常识**,不必花 token 问模型;只有
+# "没品牌、没星级、类型也不在兜底表里"的行才交给 LLM(神朱 2026-09-29 定)。
+# 档位口径(元/晚,全国典型价):经济 / 中档 / 高档 / 奢华,再乘城市线级系数。
+PRICE_TIER_ECONOMY = "economy"
+PRICE_TIER_MIDSCALE = "midscale"
+PRICE_TIER_UPSCALE = "upscale"
+PRICE_TIER_LUXURY = "luxury"
+PRICE_TIERS: tuple[str, ...] = (
+    PRICE_TIER_ECONOMY, PRICE_TIER_MIDSCALE, PRICE_TIER_UPSCALE, PRICE_TIER_LUXURY,
+)
+# 奢华档规范写的是"约¥1200+":落区间串必须给上界,取 3000(安缦/宝格丽这类天花板)
+PRICE_TIER_BANDS: dict[str, tuple[int, int]] = {
+    PRICE_TIER_ECONOMY: (150, 300),
+    PRICE_TIER_MIDSCALE: (300, 550),
+    PRICE_TIER_UPSCALE: (600, 1200),
+    PRICE_TIER_LUXURY: (1200, 3000),
+}
+
+# 品牌 → 档位(**中英文别名都收**)。匹配口径见 :func:`brand_token`:大小写不敏感 +
+# 去空白/连字符/标点后**包含**匹配,命中**最长**别名优先 —— 所以 "Park Hyatt"(奢华)
+# 不会被 "Hyatt"(高档)抢先,"Holiday Inn Express"(中档)与 "Crowne Plaza"(高档)
+# 也互不误伤(两者互不包含)。
+BRAND_TIERS: tuple[tuple[str, str], ...] = (
+    # 经济型(约 ¥150-300)
+    ("汉庭", PRICE_TIER_ECONOMY), ("hanting", PRICE_TIER_ECONOMY),
+    ("如家", PRICE_TIER_ECONOMY), ("home inn", PRICE_TIER_ECONOMY),
+    ("7天", PRICE_TIER_ECONOMY), ("7 days inn", PRICE_TIER_ECONOMY),
+    ("7 days", PRICE_TIER_ECONOMY),
+    ("锦江之星", PRICE_TIER_ECONOMY), ("jinjiang inn", PRICE_TIER_ECONOMY),
+    ("城市便捷", PRICE_TIER_ECONOMY), ("city comfort", PRICE_TIER_ECONOMY),
+    ("格林豪泰", PRICE_TIER_ECONOMY), ("greentree", PRICE_TIER_ECONOMY),
+    ("速8", PRICE_TIER_ECONOMY), ("super 8", PRICE_TIER_ECONOMY),
+    ("莫泰", PRICE_TIER_ECONOMY), ("motel 168", PRICE_TIER_ECONOMY),
+    ("海友", PRICE_TIER_ECONOMY), ("hi inn", PRICE_TIER_ECONOMY),
+    ("怡莱", PRICE_TIER_ECONOMY), ("elan", PRICE_TIER_ECONOMY),
+    ("尚客优", PRICE_TIER_ECONOMY), ("thank inn", PRICE_TIER_ECONOMY),
+    ("布丁", PRICE_TIER_ECONOMY), ("pod inn", PRICE_TIER_ECONOMY),
+    ("99旅馆", PRICE_TIER_ECONOMY), ("99 inn", PRICE_TIER_ECONOMY),
+    # 中档(约 ¥300-550)
+    ("全季", PRICE_TIER_MIDSCALE), ("ji hotel", PRICE_TIER_MIDSCALE),
+    ("亚朵", PRICE_TIER_MIDSCALE), ("atour", PRICE_TIER_MIDSCALE),
+    ("维也纳", PRICE_TIER_MIDSCALE), ("vienna", PRICE_TIER_MIDSCALE),
+    ("桔子", PRICE_TIER_MIDSCALE), ("orange", PRICE_TIER_MIDSCALE),
+    ("麗枫", PRICE_TIER_MIDSCALE), ("丽枫", PRICE_TIER_MIDSCALE),
+    ("lavande", PRICE_TIER_MIDSCALE),
+    ("智选假日", PRICE_TIER_MIDSCALE), ("holiday inn express", PRICE_TIER_MIDSCALE),
+    ("citigo", PRICE_TIER_MIDSCALE),
+    ("美居", PRICE_TIER_MIDSCALE), ("mercure", PRICE_TIER_MIDSCALE),
+    ("诺富特", PRICE_TIER_MIDSCALE), ("novotel", PRICE_TIER_MIDSCALE),
+    ("宜必思", PRICE_TIER_MIDSCALE), ("ibis", PRICE_TIER_MIDSCALE),
+    ("星程", PRICE_TIER_MIDSCALE),
+    ("丽呈", PRICE_TIER_MIDSCALE), ("麗呈", PRICE_TIER_MIDSCALE),
+    # 高档(约 ¥600-1200)
+    ("希尔顿", PRICE_TIER_UPSCALE), ("hilton", PRICE_TIER_UPSCALE),
+    ("万豪", PRICE_TIER_UPSCALE), ("marriott", PRICE_TIER_UPSCALE),
+    ("喜来登", PRICE_TIER_UPSCALE), ("sheraton", PRICE_TIER_UPSCALE),
+    ("洲际", PRICE_TIER_UPSCALE), ("intercontinental", PRICE_TIER_UPSCALE),
+    ("凯悦", PRICE_TIER_UPSCALE), ("hyatt", PRICE_TIER_UPSCALE),
+    ("香格里拉", PRICE_TIER_UPSCALE), ("shangri-la", PRICE_TIER_UPSCALE),
+    ("皇冠假日", PRICE_TIER_UPSCALE), ("crowne plaza", PRICE_TIER_UPSCALE),
+    ("雅高", PRICE_TIER_UPSCALE), ("accor", PRICE_TIER_UPSCALE),
+    ("索菲特", PRICE_TIER_UPSCALE), ("sofitel", PRICE_TIER_UPSCALE),
+    ("威斯汀", PRICE_TIER_UPSCALE), ("westin", PRICE_TIER_UPSCALE),
+    ("万怡", PRICE_TIER_UPSCALE), ("courtyard", PRICE_TIER_UPSCALE),
+    ("万丽", PRICE_TIER_UPSCALE), ("renaissance", PRICE_TIER_UPSCALE),
+    ("凯宾斯基", PRICE_TIER_UPSCALE), ("kempinski", PRICE_TIER_UPSCALE),
+    ("福朋", PRICE_TIER_UPSCALE), ("four points", PRICE_TIER_UPSCALE),
+    ("铂尔曼", PRICE_TIER_UPSCALE), ("pullman", PRICE_TIER_UPSCALE),
+    ("美爵", PRICE_TIER_UPSCALE), ("grand mercure", PRICE_TIER_UPSCALE),
+    # 奢华(约 ¥1200+)
+    ("丽思卡尔顿", PRICE_TIER_LUXURY), ("ritz-carlton", PRICE_TIER_LUXURY),
+    ("宝格丽", PRICE_TIER_LUXURY), ("bulgari", PRICE_TIER_LUXURY),
+    ("安缦", PRICE_TIER_LUXURY), ("aman", PRICE_TIER_LUXURY),
+    ("华尔道夫", PRICE_TIER_LUXURY), ("waldorf", PRICE_TIER_LUXURY),
+    ("柏悦", PRICE_TIER_LUXURY), ("park hyatt", PRICE_TIER_LUXURY),
+    ("瑞吉", PRICE_TIER_LUXURY), ("st. regis", PRICE_TIER_LUXURY),
+    ("半岛", PRICE_TIER_LUXURY), ("peninsula", PRICE_TIER_LUXURY),
+    ("四季酒店", PRICE_TIER_LUXURY), ("four seasons", PRICE_TIER_LUXURY),
+    ("文华东方", PRICE_TIER_LUXURY), ("mandarin oriental", PRICE_TIER_LUXURY),
+    ("悦榕庄", PRICE_TIER_LUXURY), ("banyan tree", PRICE_TIER_LUXURY),
+    ("松赞", PRICE_TIER_LUXURY), ("songtsam", PRICE_TIER_LUXURY),
+    ("君悦", PRICE_TIER_LUXURY), ("grand hyatt", PRICE_TIER_LUXURY),
+    ("瑰丽", PRICE_TIER_LUXURY), ("rosewood", PRICE_TIER_LUXURY),
+    ("丽晶", PRICE_TIER_LUXURY), ("艾迪逊", PRICE_TIER_LUXURY),
+)
+
+# 品牌价格带表:别名 → ``(低, 高)`` 元/晚(:data:`BRAND_TIERS` × :data:`PRICE_TIER_BANDS`
+# 摊平而来)。匹配用的是**归一后**的 :data:`BRAND_ALIAS_BANDS`(按别名长度倒序,最长优先)。
+BRAND_PRICE_BANDS: dict[str, tuple[int, int]] = {
+    alias: PRICE_TIER_BANDS[tier] for alias, tier in BRAND_TIERS
+}
+
+# 星级档(``hotel:stars`` / ``stars``):1-2 星 / 3 星 / 4 星 / 5 星
+STARS_PRICE_BANDS: dict[int, tuple[int, int]] = {
+    1: (100, 250),
+    2: (100, 250),
+    3: (250, 450),
+    4: (450, 900),
+    5: (900, 2000),
+}
+STARS_TAGS: tuple[str, ...] = ("stars", "hotel:stars", "stars:hotel")
+# OSM 的星级写法五花八门(``4`` / ``4*`` / ``四星`` / ``S4``),中文数字也认
+CN_STAR_DIGITS: dict[str, int] = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5}
+
+# 类型兜底档(**没品牌也没星级**时才用)。``hotel`` 刻意不在表里:"酒店"这一类的房价带
+# 太宽(100 到 3000 都有),规则乱猜不如让 LLM 看名称猜 —— 兜底只给窄口径的四种类型。
+KIND_PRICE_BANDS: dict[str, tuple[int, int]] = {
+    "hostel": (50, 150),  # 床位价
+    "guest_house": (200, 500),
+    "chalet": (200, 500),
+    "apartment": (300, 800),
+}
+
+# 城市线级修正系数:一线 ×1.2、新一线 ×1.05、其他城市 ×0.9
+CITY_TIER_FIRST = "tier1"
+CITY_TIER_NEW_FIRST = "new_tier1"
+CITY_TIER_OTHER = "other"
+CITY_TIER_FACTOR: dict[str, float] = {
+    CITY_TIER_FIRST: 1.2,
+    CITY_TIER_NEW_FIRST: 1.05,
+    CITY_TIER_OTHER: 0.9,
+}
+# 认不出城市时的系数:中性 1.0 —— 既不打折也不加价,保持档位表原值。
+# OSM 大量住宿行没有 ``addr:city``,把"缺标签"当成"低线城市"会系统性压价。
+CITY_TIER_UNKNOWN_FACTOR = 1.0
+TIER1_CITIES: tuple[str, ...] = ("北京", "上海", "广州", "深圳")
+NEW_TIER1_CITIES: tuple[str, ...] = (
+    "杭州", "成都", "武汉", "南京", "苏州", "重庆", "西安", "长沙", "天津", "郑州",
+    "东莞", "青岛", "合肥", "佛山", "宁波", "无锡", "福州", "厦门", "济南", "大连",
+    "沈阳", "昆明", "南昌", "贵阳", "太原", "石家庄", "哈尔滨", "长春", "南宁", "温州",
+    "常州", "泉州", "嘉兴", "南通", "惠州", "徐州", "绍兴", "中山", "台州", "兰州",
+    "烟台", "潍坊", "保定", "洛阳",
+)
+KNOWN_TIER_CITIES: tuple[str, ...] = TIER1_CITIES + NEW_TIER1_CITIES
+# 城市线索:先看地址 tag,再从名称里捞(``上海虹桥康得思酒店`` 这种写法很常见)
+CITY_TAGS: tuple[str, ...] = (
+    "addr:city", "addr:town", "addr:municipality", "addr:district", "addr:province", "city",
+)
+# 系数乘完取整到 5 元:区间好看,也不会把 150×1.05=157.5 这种尾数塞给用户
+PRICE_BAND_STEP = 5
+# 品牌别名归一要去掉的字符(空白/连字符/点/引号/括号…);大小写另算
+BRAND_NOISE_RE = re.compile(r"[\s\-_.·、,，'\"“”‘’()（）\[\]]+")
+# 回填统计里 ``provider`` 的口径:全靠规则表填完(没花 token)时用它,而不是"未配置"
+RULE_PROVIDER_LABEL = "规则表(0 token)"
 
 # 进 prompt 的住宿标签白名单(房价线索优先;上限 STAY_FACT_LIMIT 个,不塞整包 tag)
 STAY_FACT_TAGS: tuple[str, ...] = (
@@ -288,6 +451,223 @@ def _raw_distance(origin_lat: float, origin_lng: float, lat: Any, lng: Any) -> O
     if latitude is None or longitude is None:
         return None
     return overpass.haversine_km(origin_lat, origin_lng, latitude, longitude)
+
+
+# --------------------------------------------------------------------------- #
+# 规则估价(TASK-6g:品牌 > 星级 > 类型兜底,再乘城市线级系数;**0 token**)
+# --------------------------------------------------------------------------- #
+
+
+def band_text(low: Any, high: Any) -> str:
+    """``(低, 高)`` → 规范串 ``约¥A-B/晚``(相等/上界缺失 → ``约¥A/晚``)。
+
+    LLM 路径的 :func:`normalize_price_range` 也走这里:规则与 LLM 两条路产出的价格串
+    **格式必须一致**,"约"字就是估算标注(架构文档:估算字段必须自带标注)。
+    非整数入参(``_clean_number`` 可能给出 ``300.5``)按**向下取整**成元,不塞小数房价。
+    """
+    left = int(_as_float(low) or 0)
+    right = int(_as_float(high) or 0)
+    if right and right != left:
+        return f"约¥{left}-{right}/晚"[:PRICE_LEN]
+    return f"约¥{left}/晚"[:PRICE_LEN]
+
+
+def brand_token(text: Any) -> str:
+    """品牌匹配用的归一:去空白/连字符/标点 + 转小写(``Shangri-La`` → ``shangrila``)。"""
+    return BRAND_NOISE_RE.sub("", str(text or "")).lower()
+
+
+# 归一后的别名表,按**别名长度倒序** —— 匹配时最长优先(``parkhyatt`` 先于 ``hyatt``)
+BRAND_ALIAS_BANDS: tuple[tuple[str, tuple[int, int]], ...] = tuple(
+    sorted(
+        ((brand_token(alias), band) for alias, band in BRAND_PRICE_BANDS.items()),
+        key=lambda item: (-len(item[0]), item[0]),
+    )
+)
+
+
+def brand_band(name: Any) -> Optional[tuple[int, int]]:
+    """名称 → 品牌价格带:大小写不敏感的**包含**匹配(最长别名优先);没命中 → ``None``。"""
+    token = brand_token(name)
+    if not token:
+        return None
+    for alias, band in BRAND_ALIAS_BANDS:
+        if alias and alias in token:
+            return band
+    return None
+
+
+def _first_star_digit(text: str) -> Optional[int]:
+    """``4*`` / ``四星`` / ``S5`` 里的第一个星级数字(ASCII 数字或中文数字);没有 → ``None``。"""
+    for char in text:
+        if char in "0123456789":
+            return int(char)
+        if char in CN_STAR_DIGITS:
+            return CN_STAR_DIGITS[char]
+    return None
+
+
+def stars_value(stay: Any) -> Optional[int]:
+    """一行的星级(:data:`STARS_TAGS` 里任一个 tag)→ 1..5;认不出/超范围 → ``None``。"""
+    tags = _get(stay, "tags")
+    normalized = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in dict(tags if isinstance(tags, Mapping) else {}).items()
+    }
+    for key in STARS_TAGS:
+        text = normalized.get(key, "")
+        if not text:
+            continue
+        number = _first_star_digit(text)
+        if number in STARS_PRICE_BANDS:
+            return number
+    return None
+
+
+def stars_band(stay: Any) -> Optional[tuple[int, int]]:
+    """星级 → 价格带(1-2 星 / 3 星 / 4 星 / 5 星);没有星级 tag → ``None``。"""
+    number = stars_value(stay)
+    return None if number is None else STARS_PRICE_BANDS[number]
+
+
+def kind_band(stay: Any) -> Optional[tuple[int, int]]:
+    """类型兜底价带(:data:`KIND_PRICE_BANDS`);``hotel``/未知类型 → ``None``(交给 LLM)。"""
+    return KIND_PRICE_BANDS.get(normalize_kind(stay))
+
+
+def rule_band(stay: Any) -> Optional[tuple[int, int]]:
+    """基础价格带,**品牌 > 星级 > 类型兜底**(品牌与星级同时命中取品牌档)。"""
+    return brand_band(_get(stay, "name")) or stars_band(stay) or kind_band(stay)
+
+
+def normalize_city_name(text: Any) -> str:
+    """地名归一:去空白与结尾"市"(照 ``services.routes.normalize_city`` 的思路)。
+
+    刻意**不 import** :mod:`services.routes`:服务层之间不横向依赖,城市小表内置在本模块。
+    """
+    core = str(text or "").strip()
+    return (core.rstrip("市") or core).strip()
+
+
+def city_tier(city: Any) -> Optional[str]:
+    """城市名 → 线级档:一线 / 新一线 / 其他(空值 → ``None``)。
+
+    判定用**最长包含匹配**(``上海市黄浦区`` / ``杭州西湖`` 都能归到城市);认得出来但
+    不在线级表里的城市一律 :data:`CITY_TIER_OTHER`(×0.9)。
+    """
+    core = normalize_city_name(city)
+    if not core:
+        return None
+    best: Optional[str] = None
+    best_len = 0
+    for name in KNOWN_TIER_CITIES:
+        if name in core and len(name) > best_len:
+            best_len = len(name)
+            best = CITY_TIER_FIRST if name in TIER1_CITIES else CITY_TIER_NEW_FIRST
+    return best or CITY_TIER_OTHER
+
+
+def stay_city(stay: Any) -> Optional[str]:
+    """一行的城市线索:地址 tag(:data:`CITY_TAGS`)> 显式 ``city`` 字段 > **名称**里的城市。
+
+    名称里只认 :data:`KNOWN_TIER_CITIES`(``上海虹桥康得思酒店`` 这类写法),免得把
+    ``半岛``/``四季`` 这种词误当城市;三处都没有 → ``None``(按中性系数处理)。
+    """
+    tags = _get(stay, "tags")
+    normalized = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in dict(tags if isinstance(tags, Mapping) else {}).items()
+    }
+    for key in CITY_TAGS:
+        value = normalized.get(key, "")
+        if value and value.lower() not in ("no", "none", "unknown"):
+            return normalize_city_name(value)
+    explicit = normalize_city_name(_get(stay, "city"))
+    if explicit:
+        return explicit
+    name = str(_get(stay, "name") or "")
+    best = ""
+    for city in KNOWN_TIER_CITIES:
+        if city in name and len(city) > len(best):
+            best = city
+    return best or None
+
+
+def city_price_factor(stay: Any) -> float:
+    """城市线级系数:一线 ×1.2 / 新一线 ×1.05 / 其他城市 ×0.9 / 认不出城市 ×1.0。"""
+    city = stay_city(stay)
+    if not city:
+        return CITY_TIER_UNKNOWN_FACTOR
+    tier = city_tier(city)
+    return CITY_TIER_FACTOR.get(tier, CITY_TIER_UNKNOWN_FACTOR) if tier else CITY_TIER_UNKNOWN_FACTOR
+
+
+def round_band_value(value: Any) -> int:
+    """系数乘完的价 → 取整到 :data:`PRICE_BAND_STEP`(5 元,四舍五入);非数字 → 0。"""
+    number = _as_float(value)
+    if number is None:
+        return 0
+    return int(math.floor(number / PRICE_BAND_STEP + 0.5)) * PRICE_BAND_STEP
+
+
+def rule_price_estimate(stay: Any) -> Optional[tuple[int, int, str]]:
+    """规则层估价 → ``(低, 高, "rule")``;命中不了规则 → ``None``(该行交给 LLM)。
+
+    判档顺序 **品牌 > 星级 > 类型兜底**,再乘 :func:`city_price_factor` 并取整到 5 元。
+    没有名称的行不估(与 :func:`stays_needing_price` 同口径:无名行是低质数据,不猜)。
+    **0 token、不触网、绝不抛异常** —— 出任何意外都退回 ``None`` 让 LLM 兜。
+    """
+    if not str(_get(stay, "name") or "").strip():
+        return None
+    band = rule_band(stay)
+    if band is None:
+        return None
+    try:
+        factor = city_price_factor(stay)
+        low = round_band_value(band[0] * factor)
+        high = round_band_value(band[1] * factor)
+    except Exception:  # noqa: BLE001 - 规则层是增强项,炸了就当没命中(退回 LLM)
+        return None
+    if low <= 0:
+        return None
+    return low, max(high, low), PRICE_KIND_RULE
+
+
+def _write_price(stay: Any, price: str, kind: str) -> None:
+    """就地写价格 + 出处标记(ORM 行与 dict 入参都收)。"""
+    if isinstance(stay, dict):
+        stay["price_estimate"] = price
+        stay["price_kind"] = kind
+        return
+    stay.price_estimate = price
+    stay.price_kind = kind
+
+
+def apply_rule_prices(stays: Sequence[Any]) -> int:
+    """给**缺价格且命中规则**的行就地补 ``(price_estimate, price_kind="rule")``,返回条数。
+
+    与 LLM 路径看同一批候选(没价格 + 有名称),但 0 token,所以能在请求线程里同步跑完,
+    不必排后台。已有价格的行原样跳过(**永久缓存**,规则表改了也不重算,与 LLM 产物同口径)。
+    只改内存里的行,``commit`` 交给调用方(与 :func:`upsert_stays` 一致)。
+    """
+    filled = 0
+    for stay in stays or ():
+        if clean_text(_get(stay, "price_estimate"), limit=PRICE_LEN):
+            continue
+        rule = rule_price_estimate(stay)
+        if rule is None:
+            continue
+        _write_price(stay, band_text(rule[0], rule[1]), rule[2])
+        filled += 1
+    return filled
+
+
+def rows_without_price(stays: Sequence[Any]) -> list[Any]:
+    """规则层跑完之后**还缺价格**的行(这些才是 LLM 的活儿)。"""
+    return [
+        stay for stay in (stays or ())
+        if not clean_text(_get(stay, "price_estimate"), limit=PRICE_LEN)
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -645,9 +1025,7 @@ def normalize_price_range(value: Optional[str]) -> str:
     high = _clean_number(numbers.group("high"))
     if not low:
         return ""
-    if high and high != low:
-        return f"约¥{low}-{high}/晚"[:PRICE_LEN]
-    return f"约¥{low}/晚"[:PRICE_LEN]
+    return band_text(low, high)
 
 
 def parse_intro_line(completion: Optional[str], *, max_chars: int = INTRO_TARGET_CHARS) -> str:
@@ -671,26 +1049,73 @@ def estimate_price(
     降级口径(与 :func:`services.intro.generate_intro` 一致):未配 key、没有名称、
     网络/限流异常、返回格式不对 —— 一律 ``("", "")``,**绝不抛异常**。
     已有 ``price_estimate`` 的行**原样返回、不调用 LLM**(DB 即缓存)。
+    TASK-6g 起真正的口径在 :func:`estimate_price_tagged`(多返回一个出处标记),
+    本函数是它的两元组薄壳,既有调用方与单测零改动。
+    """
+    price, intro, _kind = estimate_price_tagged(stay, client=client, environ=environ)
+    return price, intro
+
+
+def normalize_price_kind(value: Any) -> str:
+    """价格出处标记归一:只认 :data:`~db.models.PRICE_KINDS`,其余 → ``""``(老行没有出处)。"""
+    text = clean_text(value, limit=PRICE_KIND_LEN)
+    lowered = (text or "").lower()
+    return lowered if lowered in PRICE_KINDS else ""
+
+
+def _write_intro(stay: Any, intro: str) -> None:
+    """就地写简介(ORM 行与 dict 入参都收)。"""
+    if isinstance(stay, dict):
+        stay["intro"] = intro
+        return
+    stay.intro = intro
+
+
+def estimate_price_tagged(
+    stay: Any,
+    *,
+    client: Optional[LLMClient] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> tuple[str, str, str]:
+    """逐家估价,返回 ``(price_estimate, intro, price_kind)``;**规则层前置**(TASK-6g)。
+
+    顺序是"缓存 → 名称 → 规则 → LLM":
+
+    1. 已有价格 → 原样返回(出处标记也照搬,**永久缓存**,规则表改了也不重算);
+    2. 没有名称 → ``("", "", "")``(不猜,既有口径);
+    3. :func:`rule_price_estimate` 命中品牌/星级/类型档 → 直接出 ``约¥A-B/晚``,
+       ``price_kind="rule"``,**一次 LLM 都不调**(0 token;简介因此留空,不为简介烧额度);
+    4. 未命中规则才走 LLM(``price_kind="llm"``),未配 key / 超时 / 限流 / 格式不对
+       一律 ``("", "", "")``,**绝不抛异常**。
     """
     existing = clean_text(_get(stay, "price_estimate"), limit=PRICE_LEN)
     if existing:
-        return existing, str(_get(stay, "intro") or "").strip()
+        return (
+            existing,
+            str(_get(stay, "intro") or "").strip(),
+            normalize_price_kind(_get(stay, "price_kind")),
+        )
+
+    if not str(_get(stay, "name") or "").strip():
+        return "", "", ""
+
+    rule = rule_price_estimate(stay)
+    if rule is not None:
+        return band_text(rule[0], rule[1]), str(_get(stay, "intro") or "").strip(), rule[2]
 
     llm = client if client is not None else resolve_llm(environ)
     if not llm.enabled:
-        return "", ""
-    if not str(_get(stay, "name") or "").strip():
-        return "", ""
+        return "", "", ""
     try:
         completion = llm.chat(build_price_prompt(stay), system=STAY_SYSTEM_PROMPT)
     except DataSourceError:
-        return "", ""
+        return "", "", ""
     except Exception:  # noqa: BLE001 - 估价是增强项,任何异常都不得阻塞入库
-        return "", ""
+        return "", "", ""
     price = parse_price(completion)
     if not price:
-        return "", ""
-    return price, parse_intro_line(completion)
+        return "", "", ""
+    return price, parse_intro_line(completion), PRICE_KIND_LLM
 
 
 def estimate_missing(
@@ -699,17 +1124,22 @@ def estimate_missing(
     client: Optional[LLMClient] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> int:
-    """给**缺价格**的行就地补 ``(price_estimate, intro)``,返回补上的条数(不 commit)。"""
+    """给**缺价格**的行就地补 ``(price_estimate, intro, price_kind)``,返回条数(不 commit)。
+
+    逐家口径(TASK-3a1 遗留,``estimate=sync`` 档在用):每家先过
+    :func:`rule_price_estimate` 的规则层(命中即 0 token 出价、``price_kind="rule"``),
+    未命中才调一次 LLM(``price_kind="llm"``)。
+    """
     estimated = 0
     for stay in stays:
         if clean_text(_get(stay, "price_estimate"), limit=PRICE_LEN):
             continue
-        price, intro = estimate_price(stay, client=client, environ=environ)
+        price, intro, kind = estimate_price_tagged(stay, client=client, environ=environ)
         if not price:
             continue
-        stay.price_estimate = price
+        _write_price(stay, price, kind)
         if intro and not str(_get(stay, "intro") or "").strip():
-            stay.intro = intro
+            _write_intro(stay, intro)
         estimated += 1
     return estimated
 
@@ -917,18 +1347,25 @@ def fill_prices_batched(
 
     与 :func:`estimate_missing`(逐家一次调用)的区别只在**批量**:5 家一个 prompt,
     token 与限流额度都省到 1/5;写入口径完全一致(已有价格/简介不覆盖)。
+
+    TASK-6g:**规则层前置** —— 先用 :func:`apply_rule_prices` 把命中品牌/星级/类型档的行
+    就地填掉(``price_kind="rule"``,0 token),剩下的才切批进 prompt(``price_kind="llm"``)。
+    所以"7 家全命中规则"这种情况一次 LLM 都不调,prompt 数也从 2 降到 0。
     """
     pending = stays_needing_price(stays)
     if not pending:
         return 0
-    filled = 0
-    for batch in price_batches(pending, batch_size=batch_size):
+    filled = apply_rule_prices(pending)
+    remaining = rows_without_price(pending)
+    if not remaining:
+        return filled
+    for batch in price_batches(remaining, batch_size=batch_size):
         for stay, (price, intro) in zip(batch, estimate_batch(batch, client=client, environ=environ)):
             if not price:
                 continue
-            stay.price_estimate = price
+            _write_price(stay, price, PRICE_KIND_LLM)
             if intro and not str(_get(stay, "intro") or "").strip():
-                stay.intro = intro
+                _write_intro(stay, intro)
             filled += 1
     return filled
 
@@ -989,8 +1426,15 @@ def price_fill_job(
 
     自己开 Session:SQLAlchemy 的 Session 非线程安全,请求线程的 Session 绝不能跨线程用;
     而且调用方在 ``submit`` 之前已经 commit 过事实行(否则新连接看不见未提交数据)。
+
+    TASK-6g:后台任务里也**先跑规则层**(0 token,即使没配 LLM key 也能把品牌/星级/类型
+    档的行填上并 commit),剩下没命中规则的行才切批问 LLM;``stats`` 因此多一个
+    ``rule_filled``,``filled`` = 规则命中数 + LLM 补上的数。
     """
-    stats: dict[str, Any] = {"scanned": 0, "filled": 0, "batches": 0, "pending": 0, "provider": "未配置"}
+    stats: dict[str, Any] = {
+        "scanned": 0, "filled": 0, "rule_filled": 0, "batches": 0, "pending": 0,
+        "provider": "未配置",
+    }
     ids = [int(item) for item in (stay_ids or ()) if item is not None]
     if not ids or engine is None:
         return stats
@@ -1004,14 +1448,23 @@ def price_fill_job(
         stats["pending"] = len(pending)
         if not pending:
             return stats
+        stats["rule_filled"] = apply_rule_prices(pending)
+        remaining = rows_without_price(pending)
+        if stats["rule_filled"]:
+            session.commit()
+        if not remaining:
+            stats["filled"] = stats["rule_filled"]
+            stats["provider"] = RULE_PROVIDER_LABEL
+            return stats
         llm = client if client is not None else resolve_price_llm(environ)
         # ``getattr``:注入的假客户端(单测)可以没有 label,不能因此把整个回填任务打死
         stats["provider"] = str(getattr(llm, "label", "") or "") if llm.enabled else "未配置"
         if not llm.enabled:
+            stats["filled"] = stats["rule_filled"]
             return stats
-        stats["batches"] = len(price_batches(pending, batch_size=batch_size))
-        stats["filled"] = fill_prices_batched(
-            pending, client=llm, environ=environ, batch_size=batch_size
+        stats["batches"] = len(price_batches(remaining, batch_size=batch_size))
+        stats["filled"] = stats["rule_filled"] + fill_prices_batched(
+            remaining, client=llm, environ=environ, batch_size=batch_size
         )
         if stats["filled"]:
             session.commit()
@@ -1153,6 +1606,8 @@ def upsert_stays(session: Session, rows: Sequence[Mapping[str, Any]]) -> int:
             stay.distance_km = None if distance is None else round(distance, DISTANCE_PRECISION)
         if created or not str(stay.price_estimate or "").strip():
             stay.price_estimate = clean_text(_get(row, "price_estimate"), limit=PRICE_LEN)
+            # 出处标记跟着价格走:价格没被覆盖时标记也不动(重抓不冲掉已有结论)
+            stay.price_kind = normalize_price_kind(_get(row, "price_kind")) or None
         if created or not str(stay.intro or "").strip():
             stay.intro = clean_text(_get(row, "intro"))
         currency = clean_text(_get(row, "currency"), limit=CURRENCY_LEN)
@@ -1198,6 +1653,7 @@ def stay_to_dict(
         "distance_km": None if distance is None else round(distance, DISTANCE_PRECISION),
         "price_estimate": stay.price_estimate or None,
         "price_is_estimate": bool(stay.price_estimate),
+        "price_kind": normalize_price_kind(stay.price_kind) or None,
         "currency": stay.currency or DEFAULT_CURRENCY,
         "intro": stay.intro or None,
         "fetched_at": iso_utc(stay.fetched_at),
@@ -1290,6 +1746,12 @@ def _finish_rows(
     """把库里的行按 :func:`estimate_mode` 的口径估完价(或排到后台),再序列化返回。"""
     origin_lat, origin_lng = origin
     pending = stays_needing_price(rows)
+    # 规则层前置(TASK-6g):命中品牌/星级/类型档的行**当场 0 token 补价**并 commit,
+    # 剩下的才进 LLM 队列 —— 全命中时 ``pending`` 变空,mode=off、estimating=False,
+    # 既不调 LLM 也不排后台任务。
+    if apply_rule_prices(pending):
+        session.commit()
+    pending = rows_without_price(pending)
     mode = estimate_mode(estimate, pending_count=len(pending))
     estimating = False
     if mode == ESTIMATE_SYNC:

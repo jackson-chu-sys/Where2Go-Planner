@@ -424,6 +424,13 @@ PRICE_LEN = 64
 CURRENCY_LEN = 8
 # 价格估算串(price_estimate)恒为人民币口径,串里自带"约"字标注是估算而非报价
 DEFAULT_CURRENCY = "CNY"
+# 价格**出处**(TASK-6g):``rule`` = 品牌/星级/类型规则表算出来的(0 token),
+# ``llm`` = 批量 LLM 估的。两者都是估算(price_is_estimate 恒 True),区分出处只为
+# 前端能分文案与排查口径漂移;老行没有这个信息 → NULL(不猜)。
+PRICE_KIND_LEN = 16
+PRICE_KIND_RULE = "rule"
+PRICE_KIND_LLM = "llm"
+PRICE_KINDS: tuple[str, ...] = (PRICE_KIND_RULE, PRICE_KIND_LLM)
 
 
 class Stay(Base):
@@ -438,6 +445,10 @@ class Stay(Base):
     缓存口径与 ``Place.intro`` 一致:``price_estimate``(形如 ``约¥300-500/晚``)与
     ``intro`` 由 LLM 生成后落库,**重新抓取不覆盖**(见 services.stays.upsert_stays);
     ``currency`` 默认 :data:`DEFAULT_CURRENCY`,与价格串里的 ``¥`` 对应。
+
+    TASK-6g 起价格多了一个出处标记 ``price_kind``(:data:`PRICE_KINDS`):命中品牌/星级/
+    类型规则表的行是 ``rule``(**永久缓存**,与 LLM 产物同口径,重抓不覆盖),走批量 LLM 的
+    行是 ``llm``,估不出来的是 NULL。
     """
 
     __tablename__ = "stays"
@@ -456,6 +467,7 @@ class Stay(Base):
     tags: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     distance_km: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     price_estimate: Mapped[Optional[str]] = mapped_column(String(PRICE_LEN), nullable=True)
+    price_kind: Mapped[Optional[str]] = mapped_column(String(PRICE_KIND_LEN), nullable=True)
     currency: Mapped[str] = mapped_column(
         String(CURRENCY_LEN), nullable=False, default=DEFAULT_CURRENCY
     )

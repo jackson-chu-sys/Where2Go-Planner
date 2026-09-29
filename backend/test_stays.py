@@ -664,12 +664,18 @@ def test_load_or_fetch_stays_fetches_upserts_and_estimates(session) -> None:
     assert len(items) == 4 == len(all_stays(session))
     assert [item["name"] for item in items] == SAMPLE_ORDER
     assert all(item["source"] == "overpass" for item in items)
-    # 无名公寓不调 LLM(没有名称就不猜价格)
-    assert llm.calls == 3
-    assert items[0]["price_estimate"] == "约¥200-400/晚"
+    # TASK-6g:三行有名称的住宿全部命中规则表(青旅/华尔道夫/民宿)→ **0 次 LLM 调用**
+    assert llm.calls == 0
+    assert items[0]["price_estimate"] == "约¥50-150/晚", "hostel 类型档(床位价)"
+    assert items[0]["price_kind"] == stay_service.PRICE_KIND_RULE
     assert items[0]["price_is_estimate"] is True
-    assert items[0]["intro"] == "位于市中心的经济型酒店。"
+    assert items[0]["intro"] is None, "规则层只出价格,不为简介烧 token"
+    # 无名公寓:没有名称就不猜价格(规则层与 LLM 层同一个候选口径)
     assert items[1]["price_estimate"] is None and items[1]["price_is_estimate"] is False
+    assert items[1]["price_kind"] is None
+    assert items[2]["price_estimate"] == "约¥1200-3000/晚", "华尔道夫命中奢华品牌档"
+    assert items[3]["price_estimate"] == "约¥200-500/晚", "民宿走 guest_house 类型兜底档"
+    assert all(item["price_kind"] == "rule" for item in items if item["name"])
 
 
 def test_load_or_fetch_stays_cache_hit_is_offline_and_llm_free(session) -> None:
@@ -730,10 +736,15 @@ def test_load_or_fetch_stays_survives_missing_llm_key(session) -> None:
         session, ORIGIN_LAT, ORIGIN_LNG, client=client, llm=FakeLLM(enabled=False)
     )
     assert len(items) == 4
-    assert all(item["price_estimate"] is None for item in items)
-    assert all(item["price_is_estimate"] is False for item in items)
     assert [item["name"] for item in items] == SAMPLE_ORDER
-    # 落库了,配上 key 后重抓才会补价格
+    # TASK-6g:规则层 **0 token**,没配 key 也照样出价;只有 LLM 那一路降级成 null
+    assert [item["price_estimate"] for item in items] == [
+        "约¥50-150/晚", None, "约¥1200-3000/晚", "约¥200-500/晚",
+    ]
+    assert all(item["intro"] is None for item in items), "简介只有 LLM 那一路会给"
+    assert all(item["price_kind"] in (None, "rule") for item in items)
+    assert items[1]["price_is_estimate"] is False
+    # 落库了,配上 key 后重抓才会给规则未命中的行补 LLM 价格
     assert len(all_stays(session)) == 4
 
 

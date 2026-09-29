@@ -27,6 +27,10 @@ TASK-6c 的三件透传(**只在空结果/降级/后台估价中/阶梯扩档时
   给"最近的在 X km 外"文案用。
 * ``estimating`` —— 价格正在后台批量回填(``price_estimate`` 此刻可能是 null),重查即得。
 
+TASK-6g:每行多透出一个 ``price_kind`` —— ``"rule"`` = 价格来自品牌/星级/类型规则表
+(0 token、离线算的),``"llm"`` = 批量 LLM 估的,``null`` = 还没估出来。两者**都是估算**
+(``estimated`` 标注照旧),前端据此可以分文案("参考价规则" vs "AI 预估")。
+
 半径口径:调用方**没给** ``radius_km`` 时传 ``radius_m=None`` 给服务层,由它按
 5→10→30 km 阶梯自动扩(空结果才扩);给了就只查那一档。``radius_km`` 出参恒回显
 "调用方要的/默认的"公里数,不因阶梯扩档而变(前端的半径选择器与出参一一对应)。
@@ -58,12 +62,14 @@ ESTIMATED_LABEL = "AI 预估 · 仅供参考 · 以 OTA 实时为准"
 # 是给夜间任务与排查用的,住宿卡片不需要,裁掉免得前端误当成事实字段
 ITEM_KEYS: tuple[str, ...] = (
     "id", "osm_type", "osm_id", "name", "kind", "lat", "lng",
-    "distance_km", "price_estimate", "currency", "intro",
+    "distance_km", "price_estimate", "price_kind", "currency", "intro",
 )
 STAYS_NOTE = (
     "价格与简介是 AI 依据名称/住宿类型/星级等 OSM 标签给出的**参考价估算**"
     "(形如 约¥A-B/晚,人民币、一晚),不是实时报价,下单前请以携程/Booking/Agoda 等 OTA 实时价格为准;"
     "估不出来的行 price_estimate 为 null(不编数字)。"
+    "price_kind 标明价格出处:rule = 命中品牌/星级/类型规则表(离线算的,不花 token),"
+    "llm = AI 估的,null = 还没估出来;两者都是估算口径。"
     "distance_km 是距起点的大圆直线距离,不是步行/驾车里程。"
     "DB 即缓存:该坐标半径内已入库就直接读库(source=db,零次网络与 LLM),"
     "否则现场检索 Overpass 并入库估价(source=overpass);"

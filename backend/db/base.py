@@ -33,6 +33,7 @@ _engine: Optional[Engine] = None
 # ``ALTER TABLE ... ADD COLUMN``。新库由 create_all 直接建出全列,这一支自然空转。
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("segment_fetch", "fetch_rounds", "INTEGER NOT NULL DEFAULT 0"),
+    ("stays", "price_kind", "VARCHAR(16)"),
 )
 
 

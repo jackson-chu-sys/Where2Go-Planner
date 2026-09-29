@@ -580,11 +580,16 @@
 
 ## [TASK-6g] 住宿估价 v2：品牌/星级规则表优先（依赖 6c）
 
-- 状态: pending（派 Codex）
+- 状态: done
 - 目标: `services/stays.py` 估价前置**规则层**：`brand=` 连锁价格带表（汉庭/如家/7天≈180-350、亚朵/全季≈350-550、维也纳≈250-400、希尔顿/万豪系≈700+ 等 ≥25 品牌，含英文名匹配）、`hotel:stars` 1-5 星档位、hostel/guest_house/chalet 类型档、城市线级修正系数（一线/新一线/二三线映射表）。命中直接出区间标 `price_kind="rule"`（0 token）；未命中走 6c 批量 LLM（5 家/prompt、qwen3.8-max）；结果永久缓存。
 - 只读清单: `backend/services/stays.py`（6c 后版本）、`backend/db/models.py`、`backend/test_stays.py`。
 - 验收: 规则命中路径断言 0 LLM 调用；测试 ≥15 全 mock；不动前端。
-- 结果: (待夜班回填)
+- 结果: **完成**（2026-09-29 夜班，Codex 写码+执行器收口，commit `e154c2a`）。
+  - `services/stays.py`：估价前置规则层 `rule_price_estimate` → 品牌价格带表（≥25 品牌含英文名、大小写不敏感包含匹配：经济 汉庭/Hanting/如家/7天/锦江之星/格林豪泰/速8/莫泰/海友/怡莱 ≈¥150-300+系数、中档 全季/亚朵/Atour/维也纳/桔子/麗枫/智选假日/美居/诺富特 ≈¥300-550、高档 希尔顿/万豪/喜来登/洲际/凯悦/香格里拉/皇冠假日/索菲特 ≈¥600-1200、奢华 丽思卡尔顿/宝格丽/安缦/华尔道夫/柏悦/瑞吉/半岛 ¥1200+）；`hotel:stars` 1-5 星档；hostel/guest_house/chalet/apartment 类型档；城市线级系数（一线×1.2/新一线×1.05/其他×0.9，内置小表不 import routes）。命中标 `price_kind="rule"`（**0 LLM 调用**，测试注入计数假 client 断言）、未命中回落 6c 批量 LLM 标 `"llm"`、都失败 null 不编数字；`Stay` 表加 `price_kind` 列（SQLite 旧库 ALTER TABLE 补列，db/base.py）；`app/api/stays.py` items 透出 price_kind（属契约允许范围）。
+  - `test_stays_rule_price.py` 29 用例（超 ≥15 要求）+ test_stays/test_stays_api 适配。执行器复跑 pytest backend/ = **785 passed**（756 基线零回归）。index.html 未动。
+  - 真机冒烟（uvicorn 重启）：`/api/stays` 上海市中心 140 家 source=db 正常，存量缓存行 price_kind=null 属预期（规则层只作用于新估价，旧缓存永久保留口径不变）；规则函数抽验：汉庭→(180,360,rule)、Atour→(300,550,rule)、青旅→(50,150,rule)、某某宾馆→None 回落。
+  - **Codex 256K 统计**：function_calls **86**，首轮写码启动后 **11.2min**（R8 线内），tokens **7.31M total**（含 cache 重放 6.91M）/output 91K+reasoning 52K；**总时长 40min 触发止损被 kill**——kill 时实现+测试已全部落盘且全量 pytest 绿（执行器复跑确认），只差 commit，与 6c/6d 同款形态。
+  - 备注：连续三条（6c/6d/6g）都是「产物完整但贴 40min 线被 kill」——stays.py 已 ~1000 行、routes.py ~1400 行,单文件体量是主因；后续大改任务建议契约明示「分两次调用（实现/测试各一）」或拆条目。
 
 ---
 

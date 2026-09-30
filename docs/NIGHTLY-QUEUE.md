@@ -593,6 +593,15 @@
 
 ---
 
+## [TASK-7a] 搜索/重新抓取提速:环形抓取组间并行 + OriginCache 地理编码持久缓存(神朱 2026-09-30 拍板方案①)
+
+- 状态: pending
+- 目标: 冷抓「重新抓取」从 ~383s 串行降到 ~120-150s(6 组并行、错峰端点);/api/geocode 重复城市从 2.7~3.4s 降到 <0.05s(持久缓存 7 天)。
+- 涉及: backend/data_sources/overpass.py、backend/db/models.py、backend/db/repository.py、backend/app/api/places.py(+测试)
+- 契约: **逐字执行 `docs/TASK-7a-CONTRACT.md`**(含实测数据、只读清单、落地契约、线程安全要求、失败语义不变、测试口径、不许动清单)——R9 已满足,勿再自行探索。
+- 验收: pytest 全绿(基线 785,新增用例后 ≥789,全 mock 不触网);commit message 按契约;主会话白天复跑真机冒烟(冷抓计时 + geocode 二连击)。
+- 结果: (待夜班回填)
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

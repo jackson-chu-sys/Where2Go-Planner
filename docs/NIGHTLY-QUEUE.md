@@ -595,12 +595,18 @@
 
 ## [TASK-7a] 搜索/重新抓取提速:环形抓取组间并行 + OriginCache 地理编码持久缓存(神朱 2026-09-30 拍板方案①)
 
-- 状态: pending
+- 状态: done
 - 目标: 冷抓「重新抓取」从 ~383s 串行降到 ~120-150s(6 组并行、错峰端点);/api/geocode 重复城市从 2.7~3.4s 降到 <0.05s(持久缓存 7 天)。
 - 涉及: backend/data_sources/overpass.py、backend/db/models.py、backend/db/repository.py、backend/app/api/places.py(+测试)
 - 契约: **逐字执行 `docs/TASK-7a-CONTRACT.md`**(含实测数据、只读清单、落地契约、线程安全要求、失败语义不变、测试口径、不许动清单)——R9 已满足,勿再自行探索。
 - 验收: pytest 全绿(基线 785,新增用例后 ≥789,全 mock 不触网);commit message 按契约;主会话白天复跑真机冒烟(冷抓计时 + geocode 二连击)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-09-30 夜班,Codex 执行,commit `a8d252a`)。
+  - overpass.py(+233 行):`nearby_places_ring` 组间 ThreadPoolExecutor 并行(`WHERE2GO_OVERPASS_WORKERS` 默认 3、钳制 1~4),`execute`/`_ring_request` 加 `start_index` 端点错峰(第 i 组从 endpoints[i%len] 起,失败仍走全链+2 次重试);每 worker 独立 session(threading.local 构造,实测每线程各建 1 个);`_ring_group_rows` 选择器降级嵌套并行(≤2,总并发≤4);失败语义不变(单组 OOM → DataSourceError 带组名、取消未开跑组、不写残缺水位、不吞成空列表);单圆路径(inner=0)仍委托 nearby_places_grouped 原样。
+  - db:新表 `OriginCache`(city 主键/name/lat/lng/geocoder/updated_at,坐标定点 7 位),repository 加 get_origin_cache/upsert_origin_cache(对齐 StayQueryCache 风格);旧库 create_all 自动建表不动存量。
+  - app/api/places.py::geocode_city:先查缓存 TTL=`WHERE2GO_ORIGIN_CACHE_TTL_S` 默认 604800(7 天);命中零网络、响应形状不变(geocoder 存原值);仅 photon/nominatim 写缓存,none/坐标退化不写;resolve_origin_with_source 签名未动。
+  - 测试:新增 7 例(4 并行:峰值并发/墙钟<串行/端点轮转/每线程独立 session + 嵌套拆分并行/workers 钳制;3 缓存:命中零网络、geocoder 原值透出、none 不写)+ 2 例既有串行断言 monkeypatch WORKERS=1 钉旧口径。执行器复跑 pytest backend/ = **792 passed**(785 基线零回归 + 7 净增,33s)。index.html/SEARCH_GROUPS/渐进口径/nearby_places/端点链成员均未动。
+  - **Codex 256K 统计**:单次调用 37.9min(40min 止损线内自行完成全部实现+测试+全量绿),function_calls **71**,首轮写码启动后 **~12.4min**(R8 12min 线贴线略超,写入后一路正常),tokens **4.77M total**(含 cache 重放 4.54M)/output 73K+reasoning 47K,零 compact。
+  - 备注:真机冒烟(新城市冷抓墙钟 + geocode 二连击)按契约留主会话白天做;uvicorn :8000 已重启(Python 有变)。仓库根发现未跟踪文件 `AzureMapsKey.txt`(明文 key 样态,9/30 09:56 UTC 落盘、非夜班产物、未 commit)——待神朱处置(建议 gitignore 或移出仓库)。
 
 ## 追加模板(新任务复制此段)
 

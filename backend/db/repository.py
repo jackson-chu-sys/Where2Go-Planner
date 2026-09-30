@@ -15,7 +15,10 @@
 * :func:`list_collections` / :func:`count_by_kind` / :func:`delete_collection` ——
   收藏列表(可按 kind / mode / 分组过滤,新的在前)、分类计数与删除;
 * :func:`upsert_collection_cat` / :func:`delete_collection_cat` —— 收藏分组(M4 铺路):
-  分组名唯一,删分组只把旗下收藏**摘下来**(``cat_id`` 置空),不连带删收藏。
+  分组名唯一,删分组只把旗下收藏**摘下来**(``cat_id`` 置空),不连带删收藏;
+* :func:`get_origin_cache` / :func:`upsert_origin_cache` —— 城市 → 起点坐标的地理编码
+  持久缓存(TASK-7a):``city`` 是主键,重复写只刷新坐标/来源与 ``updated_at``;
+  过期判定(TTL)在 API 层做,这里只管读写。
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from .models import (
     CAT_NAME_LEN,
     COLLECTION_CAT_SOURCES,
     COORD_PRECISION,
+    GEOCODER_LEN,
     KIND_PLACE,
     KIND_ROUTE,
     LAT_LIMIT,
@@ -49,6 +53,7 @@ from .models import (
     UNCATEGORIZED,
     Collection,
     CollectionCat,
+    OriginCache,
     Place,
     PlaceDetail,
     PlaceRecommendation,
@@ -956,3 +961,48 @@ def upsert_details(
             row.text = str(text)
         session.flush()
     return written
+
+
+# --------------------------------------------------------------------------- #
+# 地理编码持久缓存(TASK-7a):OriginCache 的读写
+# --------------------------------------------------------------------------- #
+
+
+def get_origin_cache(session: Session, *, city: str) -> Optional[OriginCache]:
+    """按城市名取一行地理编码缓存;没有(或城市名为空)返回 ``None``。
+
+    **不做**过期判定:TTL 口径(``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天)属于
+    API 层的策略,这里只按主键读行,与 :func:`get_segment` 同一风格。
+    """
+    stmt = select(OriginCache).where(OriginCache.city == _clean_city(city))
+    return session.scalars(stmt).first()
+
+
+def upsert_origin_cache(
+    session: Session,
+    *,
+    city: str,
+    name: Any,
+    lat: Any,
+    lng: Any,
+    geocoder: Any,
+) -> OriginCache:
+    """写入/刷新一个城市的起点坐标(主键 = 城市名,重复写只更新坐标与时间戳)。
+
+    坐标按 :data:`COORD_PRECISION` **定点**后入库(与 :class:`Place` / :class:`Stay` 同一
+    口径);``name`` 是地理编码源给的展示名(如 ``北京市, 中国``),空值兜成城市名本身;
+    ``geocoder`` 存 ``photon`` / ``nominatim`` 原值,命中时按原样回报给前端。
+    只 ``flush`` 不 ``commit``:提交时机交给调用方(与 :func:`upsert_places` 一致)。
+    """
+    cleaned = _clean_city(city)
+    row = get_origin_cache(session, city=cleaned)
+    if row is None:
+        row = OriginCache(city=cleaned)
+        session.add(row)
+    row.name = clean_text(name, limit=NAME_LEN) or cleaned
+    row.lat = round(float(lat), COORD_PRECISION)
+    row.lng = round(float(lng), COORD_PRECISION)
+    row.geocoder = clean_text(geocoder, limit=GEOCODER_LEN) or ""
+    row.updated_at = utcnow()
+    session.flush()
+    return row

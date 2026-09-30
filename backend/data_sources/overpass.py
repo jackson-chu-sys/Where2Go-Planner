@@ -51,6 +51,15 @@
   20-110s,远超交互请求的 20s 上限,因此 :meth:`OverpassClient.execute` 支持按次
   覆盖 timeout,分组路径用 :data:`DEFAULT_GROUP_REQUEST_TIMEOUT_S`;
   ``nearby_places``(交互/POC 路径)仍走 ``normalize_timeout`` 的 20s 上限,行为不变;
+* TASK-7a 起环形差集的**每组一次请求改成组间并行**(:meth:`OverpassClient.nearby_places_ring`):
+  成都 50-100km 环六组串行实测 114.8/42.8/65.9/5.3/68.2/86.3s、合计 383s,而各组 elements
+  只有 2~8 条 —— 慢在服务端扫两个圆的几何、与配额几乎无关,减墙钟只能靠并行。并发数取
+  ``WHERE2GO_OVERPASS_WORKERS``(缺省 :data:`DEFAULT_RING_WORKERS`,钳制 1~4),第 ``i`` 组从
+  ``endpoints[i % len]`` 起**错峰**,组内「按选择器拆开」的降级也并行(嵌套 ≤
+  :data:`NESTED_SPLIT_WORKERS`),同时在飞的请求总数由 :data:`MAX_RING_REQUESTS` 闸门兜住;
+  ``requests.Session`` 不保证线程安全,所以每个 worker 线程用自己的 session
+  (:meth:`OverpassClient._worker_session`)。并行只换墙钟:合并顺序仍按组序/选择器原序、
+  结果仍全局按大圆距离排序、失败仍抛 :class:`DataSourceError`(不吞成空列表);
 * 公共实例经常返回 ``504 + HTML``("The server is probably too busy"),实测
   ``overpass-api.de`` 繁忙时 ``z.overpass-api.de`` / ``maps.mail.ru`` 仍可用,
   因此这里做**端点链 + 重试**降级;``overpass.osm.ch`` 实测无数据、
@@ -61,8 +70,10 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, Optional, Union
 
 from ._common import (
@@ -81,6 +92,16 @@ FALLBACK_ENDPOINTS: tuple[str, ...] = (
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 )
 ENV_ENDPOINT = "WHERE2GO_OVERPASS_ENDPOINT"
+# 环形抓取的并发口径(TASK-7a):六组差集**串行**实测合计 383s(成都 50-100km、配额 30),
+# 而各组 elements 只有 2~8 条 —— 成本全在服务端扫两个圆的几何,减墙钟只能靠并行。
+ENV_WORKERS = "WHERE2GO_OVERPASS_WORKERS"
+DEFAULT_RING_WORKERS = 3
+MIN_RING_WORKERS = 1
+MAX_RING_WORKERS = 4
+# 组内「按选择器拆开」降级的嵌套并发(滑雪场组四个选择器实测 27/29/44/58s 逐条累加)。
+NESTED_SPLIT_WORKERS = 2
+# 同时在飞的环形请求上限:组间并行 × 组内选择器并行最坏会叠出 8 条,公共实例配额扛不住。
+MAX_RING_REQUESTS = 4
 
 ELEMENT_TYPES = ("node", "way", "relation")
 ELEMENT_TYPES_ALIASES = {"nwr": ELEMENT_TYPES, "nw": ("node", "way")}
@@ -239,6 +260,20 @@ def resolve_group_limit(limit: Optional[int]) -> int:
     if limit is None:
         return MAX_FETCH
     return max(1, min(MAX_FETCH, int(limit)))
+
+
+def ring_workers() -> int:
+    """环形抓取的组间并发数:``WHERE2GO_OVERPASS_WORKERS``,缺省 3、钳制 1~4。
+
+    非法值(空串、非整数)一律回落缺省值,不报错 —— 并发度只是性能旋钮,
+    不该因为一个环境变量写错就让整条抓取路径挂掉。
+    """
+    raw = (os.environ.get(ENV_WORKERS) or "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_RING_WORKERS
+    except ValueError:
+        value = DEFAULT_RING_WORKERS
+    return max(MIN_RING_WORKERS, min(MAX_RING_WORKERS, value))
 
 
 def build_grouped_query(
@@ -537,8 +572,30 @@ class OverpassClient:
         self.retries = max(1, int(retries))
         self.retry_backoff_s = max(0.0, float(retry_backoff_s))
         self.used_endpoint: Optional[str] = None
+        # 调用方注入的 session(单测替身)必须原样共用:断言都打在它身上;自建的 session
+        # 则**每线程一个**(requests.Session 不保证线程安全,见 _worker_session)。
+        self._shared_session = session
         self._session = session if session is not None else build_session(self.user_agent, source="overpass")
+        self._local = threading.local()
+        self._local.session = self._session
+        self._request_slots = threading.Semaphore(MAX_RING_REQUESTS)
         self._sleep = sleep
+
+    def _worker_session(self) -> Any:
+        """当前线程发请求用的 session:注入的替身共用,自建的**每线程一个**。
+
+        TASK-7a 起环形抓取会并行发多组请求,而 ``requests.Session`` 官方明确不保证线程
+        安全(连接池与 cookie jar 都可能被并发写坏),所以每个 worker 线程第一次要 session
+        时自己建一个(``threading.local``);构造客户端的那个线程沿用 ``self._session``,
+        与串行时代的行为一致。
+        """
+        if self._shared_session is not None:
+            return self._shared_session
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = build_session(self.user_agent, source="overpass")
+            self._local.session = session
+        return session
 
     @property
     def endpoints(self) -> tuple[str, ...]:
@@ -654,7 +711,10 @@ class OverpassClient:
         1. **每组一次请求**。差集要在服务端同时物化上限圆与下限圆两个集合,六组塞进一次
            请求实测直接撞公共实例的单查询内存上限(maps.mail.ru 回 OOM remark、
            overpass-api.de 504 拒收);拆开后单组实测 24-130s 可跑通。每组各自走
-           :meth:`execute` 的端点链 + 重试退避。
+           :meth:`execute` 的端点链 + 重试退避。TASK-7a 起这几组**并行**发出
+           (:meth:`_ring_groups_parallel`,并发 ``WHERE2GO_OVERPASS_WORKERS``,缺省 3、
+           钳制 1~4),第 ``i`` 组从 ``endpoints[i % len]`` 起错峰;六组串行实测合计 383s,
+           并行只换墙钟,合并顺序仍按组序、结果仍全局按距离排序。
         2. **单组仍太重时按选择器再拆**(见 :meth:`_ring_group_rows`):实测滑雪场组
            在 overpass-api.de / maps.mail.ru 都 OOM,拆成一个选择器一条差集后
            每条 27-58s 跑通;拆分后仍受该组配额约束。
@@ -663,8 +723,8 @@ class OverpassClient:
            远环又只剩几条,正好回到本任务要修的老问题。
 
         ``inner_radius_m`` 为 0 / None 时没有内圈可减,直接委托
-        :meth:`nearby_places_grouped`(单圆、一次请求、单圆超时),行为与 TASK-1b 一致。
-        分组并集、每组配额、去重键 ``(type, id)`` 与归类优先级口径都不变。
+        :meth:`nearby_places_grouped`(单圆、一次请求、单圆超时、**不并行**),行为与
+        TASK-1b 一致。分组并集、每组配额、去重键 ``(type, id)`` 与归类优先级口径都不变。
         """
         latitude = float(lat)
         longitude = float(lng)
@@ -688,23 +748,100 @@ class OverpassClient:
         if not groups:
             raise ValueError("groups 不能为空")
 
-        rows: list[dict[str, Any]] = []
-        for group in groups:
-            rows.extend(
-                self._ring_group_rows(
+        configured = ring_workers()
+        # WORKERS=1 是**全串行**总开关(组间不并行、组内选择器降级也不并行),
+        # 排查公共实例配额/复现旧口径时用;>1 时嵌套并发固定 ≤ NESTED_SPLIT_WORKERS。
+        split_workers = 1 if configured <= 1 else NESTED_SPLIT_WORKERS
+        workers = min(configured, len(groups))
+        if workers <= 1:
+            # 串行口径:第一组失败即中止,不白跑后面几组。
+            rows: list[dict[str, Any]] = []
+            for index, group in enumerate(groups):
+                rows.extend(
+                    self._ring_group_rows(
+                        group,
+                        latitude,
+                        longitude,
+                        outer_radius_m,
+                        inner,
+                        require_name=require_name,
+                        query_timeout=query_timeout,
+                        request_timeout=request_timeout,
+                        with_id=with_id,
+                        start_index=index,
+                        split_workers=split_workers,
+                    )
+                )
+        else:
+            rows = self._ring_groups_parallel(
+                groups,
+                latitude,
+                longitude,
+                outer_radius_m,
+                inner,
+                require_name=require_name,
+                query_timeout=query_timeout,
+                request_timeout=request_timeout,
+                with_id=with_id,
+                workers=workers,
+                split_workers=split_workers,
+            )
+        rows.sort(key=lambda item: haversine_km(latitude, longitude, item["lat"], item["lng"]))
+        return rows
+
+    def _ring_groups_parallel(
+        self,
+        groups: Sequence[Mapping[str, Any]],
+        lat: float,
+        lng: float,
+        outer_radius_m: float,
+        inner_radius_m: float,
+        *,
+        require_name: bool,
+        query_timeout: float,
+        request_timeout: float,
+        with_id: bool,
+        workers: int,
+        split_workers: int,
+    ) -> list[dict[str, Any]]:
+        """组间并行取环内结果(TASK-7a):并发换墙钟,**口径与失败语义和串行一致**。
+
+        * 每组一个 worker,第 ``i`` 组从 ``endpoints[i % len]`` 起**错峰**(失败仍走完链上
+          其余端点 + 每端点原 ``retries`` 次重试),免得几条并行请求全挤在同一个公共实例上;
+        * 某组抛错 → 取消还没开跑的组、原样上抛(不吞成空列表,调用方也就不会把这个
+          (城市, band) 记成"已抓取"的水位);
+        * 结果按**组顺序**拼接,再由 :meth:`nearby_places_ring` 全局按距离排序。
+        """
+        pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="overpass-ring")
+        failed = False
+        try:
+            futures = [
+                pool.submit(
+                    self._ring_group_rows,
                     group,
-                    latitude,
-                    longitude,
+                    lat,
+                    lng,
                     outer_radius_m,
-                    inner,
+                    inner_radius_m,
                     require_name=require_name,
                     query_timeout=query_timeout,
                     request_timeout=request_timeout,
                     with_id=with_id,
+                    start_index=index,
+                    split_workers=split_workers,
                 )
-            )
-        rows.sort(key=lambda item: haversine_km(latitude, longitude, item["lat"], item["lng"]))
-        return rows
+                for index, group in enumerate(groups)
+            ]
+            rows: list[dict[str, Any]] = []
+            try:
+                for future in futures:
+                    rows.extend(future.result())
+            except BaseException:
+                failed = True
+                raise
+            return rows
+        finally:
+            pool.shutdown(wait=not failed, cancel_futures=failed)
 
     def _ring_group_rows(
         self,
@@ -718,6 +855,8 @@ class OverpassClient:
         query_timeout: float,
         request_timeout: float,
         with_id: bool,
+        start_index: int = 0,
+        split_workers: int = 1,
     ) -> list[dict[str, Any]]:
         """一个分组的环内结果:先**整组一次请求**,失败再**按选择器拆开**逐个请求。
 
@@ -730,11 +869,16 @@ class OverpassClient:
         拆分后仍受**该组配额**约束:合并 → ``(type, id)`` 去重 → 由近及远取前 ``budget`` 条
         (:func:`_merge_split_rows`),与整组查询 ``out center budget`` 的口径一致。
         拆到选择器粒度仍全部失败才抛错(带组名),免得把残缺结果记成"已抓取"的水位。
+
+        拆出来的几条查询彼此独立(同组四个选择器实测 27/29/44/58s 逐条累加),所以按
+        ``split_workers``(≤ :data:`NESTED_SPLIT_WORKERS`)**并行**发出;**合并顺序仍按选择器
+        原序**,失败明细的先后与串行一致,配额截断结果也与串行逐字节相同。
+        ``start_index`` 是这一组在端点链上的错峰起点,拆出的每条再依次错开一位。
         """
         label = str(group.get("group") or group.get("category") or "未命名分组")
         budget = resolve_group_limit(group.get("budget", group.get("limit")))
 
-        def fetch(targets: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        def fetch(targets: Sequence[Mapping[str, Any]], offset: int = 0) -> list[dict[str, Any]]:
             return self._ring_request(
                 targets,
                 lat,
@@ -745,6 +889,7 @@ class OverpassClient:
                 query_timeout=query_timeout,
                 request_timeout=request_timeout,
                 with_id=with_id,
+                start_index=start_index + offset,
             )
 
         try:
@@ -756,15 +901,31 @@ class OverpassClient:
         if len(selectors) < 2:
             raise self._ring_failure(label, whole) from whole
 
-        rows: list[dict[str, Any]] = []
-        failures: list[str] = []
-        for selector in selectors:
+        def one(offset: int, selector: str) -> tuple[list[dict[str, Any]], Optional[str]]:
             split = dict(group)
             split["tags"] = [selector]
             try:
-                rows.extend(fetch([split]))
+                return fetch([split], offset), None
             except DataSourceError as exc:
-                failures.append(f"{selector}:{exc.message[:DETAIL_LEN]}")
+                return [], f"{selector}:{exc.message[:DETAIL_LEN]}"
+
+        splits = list(enumerate(selectors))
+        workers = max(1, min(int(split_workers), len(splits)))
+        if workers <= 1:
+            outcomes = [one(offset, selector) for offset, selector in splits]
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="overpass-split"
+            ) as pool:
+                futures = [pool.submit(one, offset, selector) for offset, selector in splits]
+                outcomes = [future.result() for future in futures]
+
+        rows: list[dict[str, Any]] = []
+        failures: list[str] = []
+        for chunk, failure in outcomes:
+            rows.extend(chunk)
+            if failure:
+                failures.append(failure)
         if failures:
             raise self._ring_failure(label, whole, failures) from whole
         return _merge_split_rows(rows, budget, lat, lng)
@@ -781,8 +942,14 @@ class OverpassClient:
         query_timeout: float,
         request_timeout: float,
         with_id: bool,
+        start_index: int = 0,
     ) -> list[dict[str, Any]]:
-        """发一条环形差集查询并解析(端点链 + 重试由 :meth:`execute` 负责)。"""
+        """发一条环形差集查询并解析(端点链 + 重试由 :meth:`execute` 负责)。
+
+        ``start_index`` 是端点链上的**错峰起点**(第 i 组从 ``endpoints[i % len]`` 起);
+        外面还套一道 :data:`MAX_RING_REQUESTS` 的并发闸门 —— 组间并行 × 组内选择器并行
+        最坏会叠出 8 条在飞的差集查询,公共实例的配额扛不住(挤在一起反而更慢)。
+        """
         query = build_grouped_ring_query(
             lat,
             lng,
@@ -792,7 +959,13 @@ class OverpassClient:
             require_name=require_name,
             query_timeout=query_timeout,
         )
-        payload = self.execute(query, timeout=request_timeout, reject_runtime_errors=True)
+        with self._request_slots:
+            payload = self.execute(
+                query,
+                timeout=request_timeout,
+                reject_runtime_errors=True,
+                start_index=start_index,
+            )
         return parse_places(
             payload, lat, lng, limit=None, require_name=require_name, with_id=with_id
         )
@@ -810,7 +983,12 @@ class OverpassClient:
         )
 
     def execute(
-        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
+        self,
+        query: str,
+        *,
+        timeout: Optional[float] = None,
+        reject_runtime_errors: bool = False,
+        start_index: int = 0,
     ) -> Any:
         """执行一段 Overpass QL:依次尝试各端点,临时失败(504/超时)自动重试与降级。
 
@@ -820,14 +998,21 @@ class OverpassClient:
         这类错误源于查询本身太重,而三个公共实例的单查询内存上限实测都是 2048 MB,
         换端点只会再等一遍;该由调用方把查询拆小(见 :meth:`_ring_group_rows`)。
         超时 remark 不在此列,照旧收下部分结果。
+
+        ``start_index`` 让并行发出的几条查询从端点链的**不同成员**起头(错峰,见
+        :meth:`_ring_groups_parallel`):第 i 条从 ``endpoints[i % len]`` 开始,失败仍按环形
+        顺序走完链上其余端点、每端点原 ``retries`` 次重试,失败语义不变;缺省 0 = 老口径。
         """
         request_timeout = self.timeout if timeout is None else max(1.0, float(timeout))
+        endpoints = self.endpoints
+        offset = int(start_index) % len(endpoints)
         attempts_log: list[str] = []
-        for index, endpoint in enumerate(self.endpoints):
+        for index in (*range(offset, len(endpoints)), *range(0, offset)):
+            endpoint = endpoints[index]
             for attempt in range(1, self.retries + 1):
                 try:
                     payload = http_json(
-                        self._session,
+                        self._worker_session(),
                         endpoint,
                         source=SOURCE_NAME,
                         method="POST",

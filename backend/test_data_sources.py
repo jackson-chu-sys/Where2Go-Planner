@@ -12,10 +12,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
 import sys
+import threading
+import time
+from collections.abc import Iterator
 from typing import Any, Callable, Optional
 
 import requests
@@ -94,6 +98,40 @@ class FakeClock:
         value = self.now
         self.now += self.step
         return value
+
+
+@contextlib.contextmanager
+def workers_env(value: Optional[str]) -> Iterator[None]:
+    """临时设定 ``WHERE2GO_OVERPASS_WORKERS``(``None`` = 清掉,走缺省值),退出即还原。"""
+    previous = os.environ.get(overpass.ENV_WORKERS)
+    if value is None:
+        os.environ.pop(overpass.ENV_WORKERS, None)
+    else:
+        os.environ[overpass.ENV_WORKERS] = str(value)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(overpass.ENV_WORKERS, None)
+        else:
+            os.environ[overpass.ENV_WORKERS] = previous
+
+
+def serial_ring(func: Callable[[], Any]) -> Callable[[], Any]:
+    """把环形抓取钉在**串行口径**(``WHERE2GO_OVERPASS_WORKERS=1``)再跑这个用例。
+
+    TASK-7a 起 ``nearby_places_ring`` 组间并行、组内选择器降级也并行,请求的**条数与先后**
+    不再确定;下面几个用例断言的正是"发了几条、第几条查哪个选择器、第一组失败就不白跑后面",
+    所以钉在串行口径逐字保留原断言(并行口径见 :func:`test_overpass_ring_parallel`)。
+    写成装饰器而不是 fixture:本文件还带一个不依赖 pytest 的 ``_run_all`` 直接运行入口。
+    """
+    def wrapper() -> Any:
+        with workers_env("1"):
+            return func()
+
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 
 def expect_error(func: Callable[[], Any], exc_type: type, *fragments: str) -> Exception:
@@ -568,6 +606,7 @@ def test_overpass_execute_raises_on_out_of_memory_remark_without_failover() -> N
     assert client.used_endpoint is None
 
 
+@serial_ring
 def test_overpass_ring_splits_a_too_heavy_group_by_selector() -> None:
     """整组差集 OOM → **按选择器拆开**重发同样的差集(每条小得多,实测 27-58s 跑通)。"""
     piste = {"type": "way", "id": 9, "center": {"lat": 41.5, "lon": 117.0},
@@ -597,6 +636,7 @@ def test_overpass_ring_splits_a_too_heavy_group_by_selector() -> None:
     ], "跨选择器合并后仍按由近及远排序"
 
 
+@serial_ring
 def test_overpass_ring_split_rows_are_deduped_and_capped_by_group_budget() -> None:
     """拆分后每组仍受配额约束:``(type, id)`` 去重 + 由近及远取前 ``budget`` 条。"""
 
@@ -617,6 +657,7 @@ def test_overpass_ring_split_rows_are_deduped_and_capped_by_group_budget() -> No
     )
 
 
+@serial_ring
 def test_overpass_ring_fails_loud_when_the_selector_split_also_fails() -> None:
     """拆到选择器粒度仍全灭 → 抛错带组名,且不白跑后面的分组(不写残缺水位)。"""
     session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
@@ -653,6 +694,7 @@ def test_overpass_ring_accepts_partial_groups_on_timeout_remark() -> None:
     assert [row["name"] for row in rows] == ["环内村落"]
 
 
+@serial_ring
 def test_overpass_ring_reports_the_group_that_exhausted_the_endpoint_chain() -> None:
     """某组把端点链跑完仍失败 → 抛错并带组名(不返回残缺结果,免得被记成"已抓取")。"""
     session = FakeSession(FakeResponse(None, status_code=504, text=OVERPASS_BUSY_HTML))
@@ -679,6 +721,192 @@ def test_overpass_ring_without_inner_radius_delegates_to_single_circle() -> None
     assert sent.count("out center ") == len(groups)
     assert "around:100000,39.904200,116.407400" in sent
     assert "\n  -\n" not in sent, "退化路径不应出现集合差运算符"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-7a:环形抓取组间并行 + 端点错峰
+# --------------------------------------------------------------------------- #
+
+# 替身 execute 每条查询"跑"这么久:足够让线程真的重叠起来,又不至于拖慢单测。
+RING_PARALLEL_SLEEP_S = 0.12
+RING_PARALLEL_GROUPS = [
+    {"group": "小城古镇", "tags": [{"historic": "town"}], "element_types": "nwr", "budget": 10},
+    {"group": "自然风光", "tags": [{"natural": "peak"}], "element_types": "nwr", "budget": 11},
+    {"group": "运动场所", "tags": [{"sport": "climbing"}], "element_types": "nwr", "budget": 12},
+]
+SKI_SELECTORS = ['["piste:type"]', '["ski"~"^(yes)$"]', '["landuse"="winter_sports"]',
+                 '["sport"~"^(ski|skiing)$"]']
+
+
+class TimedRecorder:
+    """给 :meth:`OverpassClient.execute` 套一层计时:记录进入/离开时间与错峰起点。
+
+    并发度看**时间区间重叠**得到的峰值(``peak``),串行累加耗时 = 各次调用耗时之和
+    (``serial_total``);两者一比就知道"组间并行"有没有真的把墙钟压下来。
+    """
+
+    def __init__(self, original: Callable[..., Any], sleep_s: float = RING_PARALLEL_SLEEP_S) -> None:
+        self.original = original
+        self.sleep_s = sleep_s
+        self.lock = threading.Lock()
+        self.spans: list[tuple[float, float, int]] = []
+        self.live = 0
+        self.peak = 0
+
+    def run(self, client: Any, query: str, **kwargs: Any) -> Any:
+        entered = time.monotonic()
+        with self.lock:
+            self.live += 1
+            self.peak = max(self.peak, self.live)
+        try:
+            time.sleep(self.sleep_s)
+            return self.original(client, query, **kwargs)
+        finally:
+            with self.lock:
+                self.live -= 1
+                self.spans.append((entered, time.monotonic(), int(kwargs.get("start_index", 0))))
+
+    @property
+    def serial_total(self) -> float:
+        return sum(end - start for start, end, _ in self.spans)
+
+    def install(self) -> Callable[..., Any]:
+        """返回可直接挂到类属性上的替身函数(函数才会被描述符协议绑定 ``self``)。"""
+        def timed_execute(client: Any, query: str, **kwargs: Any) -> Any:
+            return self.run(client, query, **kwargs)
+
+        overpass.OverpassClient.execute = timed_execute
+        return timed_execute
+
+
+def test_overpass_ring_parallel() -> None:
+    """TASK-7a:环形差集**组间并行** + 端点错峰 —— 墙钟从"逐组累加"降到"最慢一组"。
+
+    实测成都 50-100km 环六组串行合计 383s(114.8 / 42.8 / 65.9 / 5.3 / 68.2 / 86.3),
+    而各组 elements 只有 2~8 条:成本在服务端扫两个圆的几何,只有并行能减墙钟。
+    这里用替身 ``execute``(每条睡 0.12s)复现同一形态,断言 ①峰值并发 ≥2、
+    ②总墙钟 < 各组耗时之和、③第 i 组从 ``endpoints[i % len]`` 起头。
+    """
+    session = FakeSession(FakeResponse({"elements": []}))
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    endpoints = client.endpoints
+    recorder = TimedRecorder(overpass.OverpassClient.execute)
+    try:
+        recorder.install()
+        with workers_env("3"):
+            started = time.monotonic()
+            rows = client.nearby_places_ring(
+                39.9042, 116.4074, 300_000, 200_000, RING_PARALLEL_GROUPS
+            )
+            wall = time.monotonic() - started
+    finally:
+        overpass.OverpassClient.execute = recorder.original
+
+    assert rows == []
+    assert len(recorder.spans) == len(RING_PARALLEL_GROUPS), "并行只换墙钟,请求条数不变"
+    assert recorder.peak >= 2, f"组间应并行,实际峰值并发 {recorder.peak}"
+    assert wall < recorder.serial_total, (
+        f"总墙钟 {wall:.3f}s 应小于串行累加 {recorder.serial_total:.3f}s"
+    )
+    assert sorted(index for _, _, index in recorder.spans) == [0, 1, 2], "每组一个错峰起点"
+    # 错峰要落到真实 URL 上:按各组配额认出自己的那条查询,再看它打的是哪个端点。
+    used: dict[str, str] = {}
+    for call in session.calls:
+        sent = call.data["data"]
+        group = next(
+            item for item in RING_PARALLEL_GROUPS if f"out center {item['budget']};" in sent
+        )
+        used[group["group"]] = call.url
+    assert len(endpoints) >= 2, "端点链至少两个成员才谈得上错峰"
+    for index, group in enumerate(RING_PARALLEL_GROUPS):
+        wanted = endpoints[index % len(endpoints)]
+        assert used[group["group"]] == wanted, (
+            f"{group['group']}(第 {index} 组)应从 {wanted} 起头,实际 {used[group['group']]}"
+        )
+
+
+def test_overpass_ring_selector_split_runs_in_parallel() -> None:
+    """组内「按选择器拆开」的降级也并行(嵌套 ≤2):四条查询不必逐条累加。
+
+    实测滑雪场组四个选择器 27/29/44/58s 串行累加 158s;并行后合并口径不变 ——
+    仍按**选择器原序**合并 → ``(type, id)`` 去重 → 由近及远取前 ``budget`` 条。
+    """
+    ski = {"group": "滑雪场", "tags": list(SKI_SELECTORS), "element_types": "nwr", "budget": 3}
+    node = {"type": "node", "id": 7, "lat": 41.0, "lon": 116.9,
+            "tags": {"name": "环内雪场", "ski": "yes"}}
+    session = FakeSession(
+        FakeResponse({"remark": OOM_REMARK, "elements": []}),
+        FakeResponse({"elements": [node]}),
+    )
+    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
+    recorder = TimedRecorder(overpass.OverpassClient.execute)
+    try:
+        recorder.install()
+        with workers_env(None):  # 缺省并发:单组没有"组间"可并行,拆分降级仍要并行
+            started = time.monotonic()
+            rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, [ski])
+            wall = time.monotonic() - started
+    finally:
+        overpass.OverpassClient.execute = recorder.original
+
+    assert len(recorder.spans) == 1 + len(SKI_SELECTORS), "整组 1 次 + 每个选择器各 1 次"
+    assert recorder.peak >= 2, f"拆分后的几条查询应并行,实际峰值并发 {recorder.peak}"
+    assert recorder.peak <= overpass.MAX_RING_REQUESTS, "同时在飞的请求不超过并发闸门"
+    assert wall < recorder.serial_total, (
+        f"总墙钟 {wall:.3f}s 应小于串行累加 {recorder.serial_total:.3f}s"
+    )
+    assert [(row["name"], row["osm_id"]) for row in rows] == [("环内雪场", 7)], (
+        "四条查询命中同一地物 → 按 (type, id) 去重后只剩一条"
+    )
+
+
+def test_overpass_ring_workers_env_is_clamped() -> None:
+    """并发数只认 1~4,非法值回落缺省 3(并发是性能旋钮,不该因写错环境变量就挂)。"""
+    cases = {
+        "": overpass.DEFAULT_RING_WORKERS,
+        "1": 1,
+        "2": 2,
+        "3": 3,
+        "4": 4,
+        "0": overpass.MIN_RING_WORKERS,
+        "-3": overpass.MIN_RING_WORKERS,
+        "9": overpass.MAX_RING_WORKERS,
+        "很多": overpass.DEFAULT_RING_WORKERS,
+    }
+    for raw, expected in cases.items():
+        with workers_env(raw):
+            assert overpass.ring_workers() == expected, f"{raw!r} 应收敛到 {expected}"
+    with workers_env(None):
+        assert overpass.ring_workers() == overpass.DEFAULT_RING_WORKERS, "不设 env = 缺省 3"
+    assert overpass.NESTED_SPLIT_WORKERS <= 2, "嵌套并发 ≤2"
+    assert overpass.MAX_RING_REQUESTS <= 4, "总并发 ≤4"
+
+
+def test_overpass_ring_uses_one_session_per_worker_thread() -> None:
+    """``requests.Session`` 不保证线程安全 → 每个 worker 线程用自己的 session。"""
+    built: list[str] = []
+    lock = threading.Lock()
+    original_build = overpass.build_session
+
+    def fake_build_session(user_agent: str = overpass.USER_AGENT, *, source: Optional[str] = None) -> Any:
+        with lock:
+            built.append(threading.current_thread().name)
+        return FakeSession(FakeResponse({"elements": []}))
+
+    recorder = TimedRecorder(overpass.OverpassClient.execute)
+    overpass.build_session = fake_build_session
+    try:
+        client = overpass.OverpassClient(retries=1, retry_backoff_s=0, sleep=lambda _: None)
+        recorder.install()  # 每条查询"跑" 0.12s:三个 worker 真的同时在飞,才会各建各的 session
+        with workers_env("3"):
+            client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_PARALLEL_GROUPS)
+    finally:
+        overpass.OverpassClient.execute = recorder.original
+        overpass.build_session = original_build
+
+    assert len(built) == 1 + len(RING_PARALLEL_GROUPS), "构造线程 1 个 + 每个 worker 各 1 个"
+    assert len(set(built)) == len(built), f"每个线程只建一次、彼此不共享:{built}"
+    assert built[0] == threading.current_thread().name, "第一个 session 属于构造客户端的线程"
 
 
 def test_overpass_haversine_matches_known_distance() -> None:

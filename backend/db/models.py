@@ -19,6 +19,10 @@
 * :class:`StayQueryCache` —— 住宿检索的**负缓存**(TASK-6c,BUG-3/5):记"这个坐标这个半径
   查过了,结果是空/失败",6 小时内同坐标同半径直接回缓存态,不再重复打 Overpass;
   空结果分 ``no_data`` / ``datasource_error`` / ``timeout`` 三档 reason 透传给前端文案。
+* :class:`OriginCache` —— 城市名 → 起点坐标的**地理编码持久缓存**(TASK-7a):
+  ``/api/geocode`` 每次实调 Photon(德国)实测 2.7~3.4s,同一城市重复搜索重复付费;
+  城市中心坐标基本不变,所以落一行 ``city → name/lat/lng/geocoder``,
+  ``WHERE2GO_ORIGIN_CACHE_TTL_S``(缺省 7 天)内直接回缓存、**零网络**。
 * :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
   把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
   报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
@@ -678,3 +682,40 @@ class PlaceDetail(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
         return f"<PlaceDetail place={self.place_id} {len(self.text or '')}字>"
+
+
+# --------------------------------------------------------------------------- #
+# 地理编码持久缓存(TASK-7a):OriginCache
+# --------------------------------------------------------------------------- #
+
+GEOCODER_LEN = 16
+
+
+class OriginCache(Base):
+    """城市名 → 起点坐标的**地理编码持久缓存**:有这行且未过期 = 不必再问地理编码源。
+
+    ``/api/geocode`` 每次都实调 Photon(服务器在德国),实测 2.7~3.4s;而城市中心坐标
+    基本不变,同一个城市被反复搜索就是反复白等。于是把结果落一行,
+    ``WHERE2GO_ORIGIN_CACHE_TTL_S``(缺省 7 天)内命中直接返回、零网络
+    (读写口径见 :func:`db.repository.get_origin_cache` 与 app.api.places.geocode_city)。
+
+    键口径:``city`` 就是调用方传来的城市名(去空白后),String **主键** → 天然幂等 upsert
+    (重复写只刷新坐标与 ``updated_at``)。``geocoder`` 原样存 ``photon`` / ``nominatim``,
+    命中时按原值回报,响应形状与不走缓存时逐字段一致;**只缓存真的问到了地理编码源的
+    结果** —— 调用方直接给坐标(``geocoder="none"``)的退化路径不写行。坐标按
+    :data:`COORD_PRECISION` 定点入库,与其他表同一口径。
+    """
+
+    __tablename__ = "origin_cache"
+
+    city: Mapped[str] = mapped_column(String(CITY_LEN), primary_key=True)
+    name: Mapped[str] = mapped_column(String(NAME_LEN), nullable=False, default="")
+    lat: Mapped[float] = mapped_column(Float, nullable=False)
+    lng: Mapped[float] = mapped_column(Float, nullable=False)
+    geocoder: Mapped[str] = mapped_column(String(GEOCODER_LEN), nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<OriginCache {self.city} {self.lat:.7f},{self.lng:.7f} by {self.geocoder}>"

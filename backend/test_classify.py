@@ -462,11 +462,15 @@ def test_grouped_ring_query_keeps_every_group_budget_inside_the_ring() -> None:
     assert '["piste:type"]["name"](around:300000' in query, "require_name 口径不变"
 
 
-def test_nearby_places_ring_sends_one_difference_request_per_group() -> None:
+def test_nearby_places_ring_sends_one_difference_request_per_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """TASK-1d:环形差集**每组一次请求**,配额/去重口径与单圆并集完全一致。
 
     六组塞进一次请求会撞公共实例的单查询内存上限(实测 OOM / 504),拆开后单组可跑通。
     """
+    # 断言"第 i 条请求查第 i 组",钉在串行口径;并行见 test_overpass_ring_parallel(TASK-7a)。
+    monkeypatch.setenv(overpass.ENV_WORKERS, "1")
     payload = {"elements": [
         {"type": "node", "id": 1, "lat": 33.03, "lon": 121.47, "tags": {"name": "环内古镇", "historic": "town"}},
         {"type": "way", "id": 2, "center": {"lat": 32.9, "lon": 120.1}, "tags": {"name": "环内山峰", "natural": "peak"}},
@@ -498,12 +502,16 @@ def test_nearby_places_ring_sends_one_difference_request_per_group() -> None:
 OOM_REMARK = "runtime error: Query run out of memory using about 2048 MB of RAM."
 
 
-def test_ring_falls_back_to_per_selector_difference_for_the_heavy_ski_group() -> None:
+def test_ring_falls_back_to_per_selector_difference_for_the_heavy_ski_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """实测**滑雪场**组整条差集在公共实例上 OOM(2048 MB),必须能按选择器拆开重发。
 
     拆分只改"发几条查询",不改口径:每条仍是环形差集、仍带**该组**配额,合并后按
     ``(type, id)`` 去重并截到配额,归类优先级照旧由 :func:`classify_places` 决定。
     """
+    # 断言"第 i 条请求查第 i 个选择器",钉在串行口径(TASK-7a 起拆分降级也并行)。
+    monkeypatch.setenv(overpass.ENV_WORKERS, "1")
     ski = next(group for group in classify.search_groups() if group["category"] == CATEGORY_SKI)
     selectors = overpass.tags_to_selectors(ski["tags"])
     assert len(selectors) > 1, "滑雪场组本来就是多选择器并集,才需要拆分降级"

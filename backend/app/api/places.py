@@ -19,6 +19,9 @@
   并回报该城市哪些分段已入库(前端可提示"即时读库"还是"首次抓取")。
   响应里的 ``geocoder`` 标注这次是谁答的(``photon`` / ``nominatim``);两个源都失败
   才是错误 → **HTTP 400** 中文报错(消息里带上两边的失败原因)。
+  TASK-7a 起这条路由带**地理编码持久缓存**(:class:`db.models.OriginCache`):实调 Photon
+  每次 2.7~3.4s,而城市中心坐标基本不变,所以命中缓存(TTL 缺省 7 天)直接返回、
+  **零网络**,响应形状与不走缓存时逐字段一致。
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
   **逆**地理编码(同样 Photon 主 + Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
@@ -29,8 +32,10 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -82,6 +87,13 @@ OFFSET_MIN = 0
 # more 只认这几个写法(FastAPI 的 bool 解析口径更宽,但那样非法值会变成 422 而不是 400)
 TRUE_TOKENS = frozenset({"1", "true", "t", "yes", "y", "on"})
 FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off"})
+# 地理编码持久缓存(TASK-7a):TTL 缺省 7 天,``0`` = 每次都重新问地理编码源。
+ENV_ORIGIN_CACHE_TTL = "WHERE2GO_ORIGIN_CACHE_TTL_S"
+ORIGIN_CACHE_TTL_DEFAULT_S = 604800
+# 只缓存**真的问到了地理编码源**的结果:调用方直接给坐标 / 反查失败降级的 "none" 不写行。
+ORIGIN_CACHE_GEOCODERS = frozenset(
+    {place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
+)
 META_NOTE = (
     "分段:环形互斥,检索按 band 上限半径一次查四分类 tag 并集(每组独立配额);"
     "分类:四分类优先级归类的可选值(color/emoji 供前端 pin 使用);"
@@ -113,6 +125,30 @@ DETAILS_NOTE = (
 def _clean(text: Optional[str]) -> Optional[str]:
     value = (text or "").strip()
     return value or None
+
+
+def origin_cache_ttl_s() -> int:
+    """地理编码缓存的 TTL(秒):``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天。
+
+    非法值(空串、非整数)回落缺省值、负数按 0 处理;``0`` = 缓存永不当命中
+    (每次都走网络),与住宿负缓存的 TTL 口径一致(见 :data:`services.stays.NEG_CACHE_TTL_S`)。
+    """
+    raw = (os.environ.get(ENV_ORIGIN_CACHE_TTL) or "").strip()
+    try:
+        value = int(raw) if raw else ORIGIN_CACHE_TTL_DEFAULT_S
+    except ValueError:
+        value = ORIGIN_CACHE_TTL_DEFAULT_S
+    return max(0, value)
+
+
+def origin_cache_age_s(row: Any) -> Optional[float]:
+    """缓存行的年龄(秒);没有 ``updated_at`` → ``None``(视为不可用,不当命中)。"""
+    moment = getattr(row, "updated_at", None)
+    if moment is None:
+        return None
+    if moment.tzinfo is None:  # SQLite 读回的是 naive 时间,按 UTC 处理
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - moment).total_seconds()
 
 
 def resolve_intro_limit(limit: Optional[int]) -> Optional[int]:
@@ -531,16 +567,45 @@ def geocode_city(
 
     两个源都失败(Photon 挂/空结果 **且** Nominatim 也挂)才是错误:按本仓库路由口径
     抛 **HTTP 400** 中文报错,消息里同时带上两边的失败原因,便于判断是断网还是单源故障。
+
+    地理编码结果按城市名落 :class:`db.models.OriginCache`(TASK-7a):TTL
+    (``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天)内命中就直接拼响应、**零网络** ——
+    Photon 在德国,实调一次 2.7~3.4s,同一城市反复搜索没必要反复付费。命中与否
+    响应形状完全一致(``origin`` 四字段 + ``geocoder`` 原值 + ``bands`` + ``segments``);
+    未命中/过期才走 :func:`place_loader.resolve_origin_with_source`,并且只在
+    ``geocoder`` ∈ {photon, nominatim} 时写缓存(给了坐标的 ``none`` 退化路径不写)。
     """
     cleaned = _clean(city)
     if not cleaned:
         raise HTTPException(400, "城市名不能为空")
-    try:
-        origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except DataSourceError as exc:
-        raise HTTPException(400, f"无法解析城市 '{cleaned}':{exc}") from exc
+    ttl = origin_cache_ttl_s()
+    cached = repo.get_origin_cache(session, city=cleaned) if ttl > 0 else None
+    age = origin_cache_age_s(cached) if cached is not None else None
+    if cached is not None and age is not None and age <= ttl:
+        origin = {
+            "city": cleaned,
+            "name": cached.name or cleaned,
+            "lat": cached.lat,
+            "lng": cached.lng,
+        }
+        geocoder = cached.geocoder or place_loader.GEOCODER_NONE
+    else:
+        try:
+            origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except DataSourceError as exc:
+            raise HTTPException(400, f"无法解析城市 '{cleaned}':{exc}") from exc
+        if geocoder in ORIGIN_CACHE_GEOCODERS:
+            repo.upsert_origin_cache(
+                session,
+                city=cleaned,
+                name=origin.get("name") or cleaned,
+                lat=origin["lat"],
+                lng=origin["lng"],
+                geocoder=geocoder,
+            )
+            session.commit()
     return {
         "origin": origin,
         "geocoder": geocoder,

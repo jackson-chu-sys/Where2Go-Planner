@@ -13,6 +13,9 @@
 (Photon 抛错 / 空结果)、双失败口径(正向 400 中文、逆向仍 200 + ``resolved=false``)、
 以及 API 响应里的 ``geocoder`` 标注。
 
+TASK-7a 起 ``/api/geocode`` 还带**地理编码持久缓存**(:class:`db.models.OriginCache`,
+TTL 缺省 7 天):同一城市第二次搜索**零网络**、响应逐字段一致,过期/TTL=0 才重新问源。
+
 运行:``cd backend && ../.venv/bin/python -m pytest -q``
 """
 
@@ -22,6 +25,7 @@ import dataclasses
 import json
 import os
 import sys
+from datetime import timedelta
 from typing import Any, Callable, Optional
 
 import pytest
@@ -35,7 +39,8 @@ if BACKEND_DIR not in sys.path:
 from app.api import places as places_api  # noqa: E402
 from data_sources import DataSourceError, TransientDataSourceError  # noqa: E402
 from data_sources import _common, photon  # noqa: E402
-from db import init_db, make_engine, session_factory  # noqa: E402
+from db import init_db, make_engine, repository as repo, session_factory  # noqa: E402
+from db.models import utcnow  # noqa: E402
 from services import place_loader  # noqa: E402
 from services.bands import band_keys  # noqa: E402
 
@@ -667,6 +672,92 @@ def test_api_geocode_double_failure_is_400_in_chinese(session, monkeypatch: pyte
 
 def test_api_geocode_blank_city_is_still_400(session) -> None:
     expect_http_error(lambda: places_api.geocode_city(city="   ", session=session), 400, "城市名不能为空")
+
+
+def test_geocode_cache_hit(session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """TASK-7a:同一城市第二次 ``/api/geocode`` **零网络**,响应与第一次逐字段一致。
+
+    实调 Photon(德国)一次 2.7~3.4s,而城市中心坐标基本不变,所以按城市名落一行
+    :class:`~db.models.OriginCache`,TTL(``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天)内
+    命中直接拼响应;TTL=0 或 ``updated_at`` 超出 TTL 才重新走网络并刷新缓存行。
+    """
+    calls: list[str] = []
+
+    def fake_photon(query: str, *, limit: int = photon.DEFAULT_LIMIT) -> list[dict[str, Any]]:
+        calls.append(query)
+        return [{"lat": BEIJING["lat"], "lng": BEIJING["lng"], "display_name": "北京市, 中国"}]
+
+    def no_fallback(city: str) -> dict[str, Any]:
+        raise AssertionError(f"Photon 命中时不应降级到 Nominatim:{city}")
+
+    monkeypatch.setattr(place_loader, "ds_photon_geocode", fake_photon)
+    monkeypatch.setattr(place_loader, "ds_geocode", no_fallback)
+
+    first = places_api.geocode_city(city="北京", session=session)
+    assert calls == ["北京"], "第一次实调一次地理编码源"
+    assert first["geocoder"] == "photon"
+    assert first["origin"] == {"city": "北京", "name": "北京市, 中国", **BEIJING}
+
+    row = repo.get_origin_cache(session, city="北京")
+    assert row is not None, "photon 答的要写进持久缓存"
+    assert row.geocoder == "photon"
+    assert (row.lat, row.lng) == (BEIJING["lat"], BEIJING["lng"])
+    assert row.name == "北京市, 中国"
+
+    second = places_api.geocode_city(city="北京", session=session)
+    assert calls == ["北京"], "命中缓存不应再打网络"
+    assert second == first, "命中与否响应形状逐字段一致"
+
+    monkeypatch.setenv(places_api.ENV_ORIGIN_CACHE_TTL, "0")
+    third = places_api.geocode_city(city="北京", session=session)
+    assert calls == ["北京", "北京"], "TTL=0 = 缓存永不当命中"
+    assert third == first
+
+    monkeypatch.setenv(places_api.ENV_ORIGIN_CACHE_TTL, "60")
+    stale = repo.get_origin_cache(session, city="北京")
+    stale.updated_at = utcnow() - timedelta(seconds=61)
+    session.flush()
+    expired_at = stale.updated_at
+    fourth = places_api.geocode_city(city="北京", session=session)
+    assert calls == ["北京", "北京", "北京"], "updated_at 超出 TTL 视为过期"
+    assert fourth == first
+    assert repo.get_origin_cache(session, city="北京").updated_at > expired_at, "过期后刷新缓存行"
+
+
+def test_geocode_cache_hit_reports_the_original_geocoder(session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """命中缓存时 ``geocoder`` 按**原值**回报:谁答的就还写谁(nominatim 不被冒充成 photon)。"""
+    calls: list[str] = []
+
+    monkeypatch.setattr(place_loader, "ds_photon_geocode", lambda query, *, limit=5: [])
+    monkeypatch.setattr(place_loader, "ds_geocode", lambda city: calls.append(city) or {
+        "lat": BEIJING["lat"], "lng": BEIJING["lng"], "display_name": "北京市, 中国",
+    })
+
+    first = places_api.geocode_city(city="北京", session=session)
+    assert first["geocoder"] == "nominatim" and calls == ["北京"]
+    assert repo.get_origin_cache(session, city="北京").geocoder == "nominatim"
+
+    def boom(query: str, *, limit: int = 5) -> Any:
+        raise AssertionError("命中缓存不应再触网")
+
+    monkeypatch.setattr(place_loader, "ds_photon_geocode", boom)
+    monkeypatch.setattr(place_loader, "ds_geocode", boom)
+    second = places_api.geocode_city(city="北京", session=session)
+    assert second == first, "0 网络且响应一致"
+    assert calls == ["北京"]
+
+
+def test_geocode_cache_skips_rows_no_source_answered(session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``geocoder="none"``(没有地理编码源参与的退化结果)**不写缓存**,免得把兜底坐标钉死 7 天。"""
+    monkeypatch.setattr(
+        place_loader, "default_geocoder",
+        lambda city: {"city": city, "name": city, "lat": 1.5, "lng": 2.5,
+                      "geocoder": place_loader.GEOCODER_NONE},
+    )
+    payload = places_api.geocode_city(city="北京", session=session)
+    assert payload["geocoder"] == place_loader.GEOCODER_NONE
+    assert repo.get_origin_cache(session, city="北京") is None
+
 
 
 def test_api_reverse_geocode_reports_photon(session, monkeypatch: pytest.MonkeyPatch) -> None:

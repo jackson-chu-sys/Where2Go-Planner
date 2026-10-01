@@ -138,7 +138,8 @@ MIN_REQUEST_INTERVAL_S = 0.4     # env WHERE2GO_AMAP_MIN_INTERVAL_S; 实测 QPS 
 
 ### TASK-9d —— 前端地图切高德 JS API（Leaflet 退役）
 
-- `index.html`：Leaflet（CDN + OSM 瓦片）整体换 **高德 JS API 2.0**（`https://webapi.amap.com/maps?v=2.0&key=…`）。
+- `index.html`：Leaflet（CDN + OSM 瓦片）整体换 **高德 JS API 2.0**（`https://webapi.amap.com/maps?v=2.0&key=…`）**—— 神朱 2026-10-01 拍板的官方路径**。
+- **降级路径（神朱已授权，不必卡整晚）**：真机实测若因缺安全密钥报 `INVALID_USER_SCODE`（或 JS key 环境不通），**当轮直接降级为「Leaflet 保留 + 底图瓦片换高德无 key 栅格」**（`https://webrd0{1,2,3,4}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}`），实现完照样 commit + 真机 QA，并在「结果」段注明「已降级为栅格瓦片，待神朱补安全密钥后升级 JS API」；**不得就此停下或留 needs_review 空过**。
 - **JS key 不进 git**：新增后端 `GET /api/map-config` → `{"amap_js_key": <WHERE2GO_AMAP_JS_KEY 或 "">, "amap_security_js_code": <WHERE2GO_AMAP_SECURITY_JS_CODE 或 "">}`；前端**运行时**取 key 后动态注入 `<script>`，无 key 时页面给明确降级文案「地图未配置高德 JS key」。
   - 若实测 JS API 2.0 因缺**安全密钥**报 `INVALID_USER_SCODE`（地图/覆盖物是否受影响**必须在真机浏览器里验一发**），则进 `needs_review` 并在晨报里请神朱到高德控制台补「安全密钥」，同时把该值以 `WHERE2GO_AMAP_SECURITY_JS_CODE` 落 `.env`（**同样不进 git**）。
 - 地图元素一一对应：环形范围圈 → `AMap.Circle`（外圆实线 / 内圆虚线，样式沿用现有 CSS 变量）；POI pin → `AMap.Marker` + 现有分类色/emoji 的自绘 `content`；点 pin → `AMap.InfoWindow` 承载**现有 `popupHtml()` 内容**（含「⭐收藏」「🚗路线对比」「📄查看详情」按钮，为 TASK-8b 铺路）；路线画线 → `AMap.Polyline`（驾车实线/铁路虚线/飞机弧线，弧线沿用 `arcPoints`）；`fitView` 用环圈 bounds。

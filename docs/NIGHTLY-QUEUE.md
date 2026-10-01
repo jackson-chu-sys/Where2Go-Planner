@@ -11,6 +11,17 @@
 - **R10 二次熔断自动降级**:同一任务族 Codex 累计熔断 **2 次** → 第 2 次发生时不再 kill 后留案,当轮直接改由**执行器手写**;needs_review 只留给"手写也失败"或需要神朱拍板的口径问题。
 - **窗口扩容(2026-09-26 神朱拍板)**:`~/.codex/config.toml` 的 `model_context_window` 64K→**256K**、compact 线 48K→200K。复盘证实 qwen3.8-max 本体 1M 窗口,此前"读→压缩→重读"回圈是自设小窗口所致,**旧的 Codex 熔断史(含前端三连败)不再作为拒绝派发的依据**。验证路径:TASK-5a(后端,3a1/3a2 同款)先跑,稳定后 TASK-5b 重测前端;5b 若再熔断则按旧例转手写,不试第三次。
 
+## ⚠️ 当日生效口径通告(2026-10-01 神朱拍板,凡与 skill/旧条目冲突以本通告为准)
+
+**数据源全面切换高德**:①POI 检索 ②前端地图瓦片 ③地理编码 **全切高德**,**驾车一并切高德**;**Overpass 与 OSRM 彻底移除、不保留降级链**;渐进配额口径(首查 30/显示 15/加载更多 +30)与 `/api/places` 参数/响应形状**一律不变**(前端零改动)。Photon/Nominatim 保留为降级链。**TASK-7a 的冷抓墙钟/geocode 复验取消**(优化对象已被移除);TASK-8 全部排在 TASK-9 之后。
+执行 TASK-9 前**逐字读 `docs/TASK-9-CONTRACT.md`**,四条硬数字不许猜:
+1. **检索走 v3**(v5 `page=2` 与 `page=1` 返回完全相同的页,翻页是坏的);
+2. **单查询最多 200 条**(`page>=9` 返回 0,`count` 字段不可信)→ band ≥50km 必须分格查多边形;`radius` 实测被截断在 50000;
+3. **高德 `tolls` 恒 0、`cost` 恒 null** → 过路费改用 `toll_distance` × 区域费率,别用高德过路费字段;
+4. **前端 JS key 不进 git** → 走 `GET /api/map-config` 运行时注入;key 在 `/opt/data/.env`(0600);REST 用 `WHERE2GO_AMAP_KEY`、前端用 `WHERE2GO_AMAP_JS_KEY`,两 key 平台隔离(混用报 `USERKEY_PLAT_NOMATCH`);密集连打触发 `infocode=10021`(QPS)→ 单进程最小间隔 0.4s。
+
+---
+
 ---
 
 > 条目格式:
@@ -608,6 +619,50 @@
   - **Codex 256K 统计**:单次调用 37.9min(40min 止损线内自行完成全部实现+测试+全量绿),function_calls **71**,首轮写码启动后 **~12.4min**(R8 12min 线贴线略超,写入后一路正常),tokens **4.77M total**(含 cache 重放 4.54M)/output 73K+reasoning 47K,零 compact。
   - 备注:真机冒烟(新城市冷抓墙钟 + geocode 二连击)按契约留主会话白天做;uvicorn :8000 已重启(Python 有变)。仓库根发现未跟踪文件 `AzureMapsKey.txt`(明文 key 样态,9/30 09:56 UTC 落盘、非夜班产物、未 commit)——待神朱处置(建议 gitignore 或移出仓库)。
   - **2026-10-01 神朱裁定:本条待办复验取消,不再执行**——项目已切换到高德地图(POI 检索/地理编码/前端地图,详见 TASK-9),Overpass 冷抓链与 Photon 地理编码将整体移除,**TASK-7a 的「组间并行」与「OriginCache」两个优化点失去对象**:冷抓墙钟复验(383s→120-150s)与 geocode 二连击复验**一律不做**。本条代码在切换任务(TASK-9a)落地时按契约一并移除,勿单独回滚。
+
+## [TASK-9a] 高德数据源层:amap.py(geocode/regeo/around/polygon/driving)+ 四分类 typecode 映射
+
+- 状态: pending
+- 目标: 新建 `backend/data_sources/amap.py`(v3 REST:正向/逆地理编码、周边搜索、多边形搜索、驾车;归一化 POI 形状;`status/infocode` 错误翻译;0.4s 节流;直连代理口径)+ `backend/services/amap_categories.py`(四分类检索组 `AMAP_TYPE_GROUPS` + `classify_amap_poi` 优先级 滑雪>运动>人文美食>自然 + `dedupe_key=("amap", <高德POI id>)`)+ `_common.py` 加 `"amap": PROXY_OFF`。含分格纯函数 `grid_polygons` 与 `decode_polyline`。
+- 只读清单: `backend/data_sources/_common.py`、`backend/data_sources/photon.py`(写法样板)、`backend/db/models.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§1 实测数据 + §3「TASK-9a」逐字执行)。
+- 涉及: backend/data_sources/amap.py(新)、backend/services/amap_categories.py(新)、backend/data_sources/_common.py(加源)、backend/test_amap.py(新 ≥25 用例,全 mock 不触网)、backend/test_amap_categories.py
+- 验收: pytest 基线 792 零回归 + ≥25 新增;`status!="1"` 按 infocode 分派 `DataSourceError`/`TransientDataSourceError`(10021→Transient)有用例;缺 key 报中文错不崩;归一化 POI 键名与契约逐字一致;`grid_polygons` 格子数/坐标顺序有用例;节流有用例(两次调用间隔 ≥0.4s,monkeypatch 时钟)。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-9b] POI/住宿检索链切高德:入库身份改 amap + 分格多边形 + 渐进口径不变 + 清库脚本
+
+- 状态: pending
+- 目标: `services/classify.py` 检索组换 `AMAP_TYPE_GROUPS`(优先级/去重/预算语义保留);`services/place_loader.py` 的 `default_fetcher` 换高德:`low==0` → `search_around(radius=high)`,`low>0` → 包围盒 `grid_polygons` 分格 + `search_polygon` + 本地 haversine 收敛 `[low,high)`,扩格随 `fetch_rounds` 递增(口径同 `progressive_target_total`);入库 `osm_type="amap"`/`osm_id=<高德 id>`(表结构零改动)、`tags.source="高德"`、`place_source()` 加「高德」分支;`stays.py::search_stays` 换 `search_around(types="100000")`(半径阶梯/负缓存/估价口径全不变);新增 `tools/amap_cutover.py`(默认 --dry-run 报数,--apply 清派生行,**保留 Collection/CollectionCat/TripPlan**)。
+- 只读清单: `backend/services/place_loader.py`、`backend/services/classify.py`、`backend/services/stays.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§3「TASK-9b」逐字执行)。
+- 涉及: backend/services/(classify.py、place_loader.py、stays.py、amap_categories 已建)、backend/db/repository.py(place_source)、backend/app/api/(仅在不得已时改动,**响应键名必须零变化**)、tools/amap_cutover.py(新)、backend/test_places*.py/test_stays*.py/test_classify.py(改替身为 amap + 新增 ≥30 用例)
+- 验收: pytest 零回归 + ≥30 新增;**`/api/places`、`/api/places/meta`、`/api/places/intros`、`/api/stays` 响应键名/形状逐键断言零变化**(前端零改动的证据);同 (城市,band) 二次查询读库零网络;`page_size/offset/more` 行为与旧口径一致;清库脚本 `--dry-run`/`--apply` 各有用例且不删用户数据。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-9c] 地理编码切高德主链路 + 驾车切高德 + 删 overpass.py/osrm.py
+
+- 状态: pending
+- 目标: `resolve_origin_with_source` 主链路改 `amap.geocode`(`geocoder="amap"`),失败/无 key 回落 photon→nominatim(保留不删),`/api/geocode` 响应键与 `resolved` 语义不变;`OriginCache` **保留复用**(geocoder 存 amap,TTL 7 天不变;TASK-7a 的 Overpass 并行部分随 overpass.py 移除);`services/routes.py` 驾车改 `amap.driving`(真实 distance/duration,`kind="real"` 不变;**过路费 = `toll_distance_m` × 区域费率**,`cost_breakdown.mode="amap_toll_distance"`;油费/铁路/飞机估算/600km 阈值/机票公布价/人均/deep-link 全不变);geometry 用解码 polyline(抽稀口径不变);删除 `data_sources/overpass.py`、`data_sources/osrm.py` 及其直接引用。
+- 只读清单: `backend/services/place_loader.py`、`backend/services/routes.py`、`backend/app/api/routes.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§1.5/§1.6 + §3「TASK-9c」逐字执行)。
+- 涉及: backend/services/(place_loader.py、routes.py)、backend/app/api/(geocode/routes 透出)、backend/data_sources/(删 overpass.py、osrm.py)、backend/test_routes*.py/test_photon.py/test_data_sources.py(引用改 amap 替身 + 新增 ≥20 用例)
+- 验收: pytest 零回归 + ≥20 新增;`/api/geocode` 键名不变且 `geocoder=amap` 命中;OriginCache 命中零网络有用例;驾车 `toll_cny` 来自 `toll_distance` 而非高德 `tolls`(用例断言 tolls=0 时仍算出非零过路费);铁路/飞机/机票/deep-link 断言零回归;全仓 `grep -rn "overpass\|osrm" backend/` 仅剩历史注释/文档。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-9d] 前端地图切高德 JS API 2.0:Leaflet 退役 + /api/map-config 运行时注入 JS key(与本晚 9c 连做)
+
+- 状态: pending
+- 目标: `index.html` 移除 Leaflet(CDN+OSM 瓦片)改高德 JS API 2.0;新增后端 `GET /api/map-config` 返回 `{"amap_js_key","amap_security_js_code"}`(取自 env,**不进 git**),前端运行时取 key 后动态注入 `<script>`、无 key 给明确降级文案;环圈→`AMap.Circle`(外实内虚)、pin→`AMap.Marker`(保留分类色/emoji 自绘)、点 pin→`AMap.InfoWindow` 承载现有 `popupHtml()`(含收藏/路线/「📄 查看详情」按钮,为 TASK-8b 铺路)、路线→`AMap.Polyline`(驾车实线/铁路虚线/飞机 `arcPoints` 弧线)、`fitView` 用环圈 bounds;`identityHtml()` 改「来源:高德 · POI <id> · GCJ-02」,种子行加 WGS-84 偏差提示;状态栏数据源文案改高德口径。
+- 只读清单: `backend/app/static/index.html`、`backend/test_frontend_routes.py`、`backend/app/api/places.py`(加 map-config 的风格)、`docs/TASK-9-CONTRACT.md`(§3「TASK-9d」逐字执行)。
+- 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 新断言 + node --check)、backend/app/api/(新增 map-config 路由)
+- 验收: pytest 零回归 + ≥12 新增断言(`/api/map-config` 调用、`AMap.` 使用、`AMap.InfoWindow`、**index.html 内不得出现 32 位 key 样态字符串**);browser_exec 真机 QA:开页 0 error → 高德地图渲染 → pin+环圈 → 点 pin 出 InfoWindow → 点路线出面板并画线;若 JS API 因缺安全密钥报 `INVALID_USER_SCODE` → 记 needs_review 并在晨报请神朱补「安全密钥」,不得自行绕过。
+- 结果: (待夜班回填)
+
+---
 
 ## [TASK-8a1] 目的地图片链路:高德 POI 图(主) + 维基百科/Commons(兜底) + PlaceMedia 缓存 + /api/places/media
 

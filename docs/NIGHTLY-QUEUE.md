@@ -607,12 +607,14 @@
   - 测试:新增 7 例(4 并行:峰值并发/墙钟<串行/端点轮转/每线程独立 session + 嵌套拆分并行/workers 钳制;3 缓存:命中零网络、geocoder 原值透出、none 不写)+ 2 例既有串行断言 monkeypatch WORKERS=1 钉旧口径。执行器复跑 pytest backend/ = **792 passed**(785 基线零回归 + 7 净增,33s)。index.html/SEARCH_GROUPS/渐进口径/nearby_places/端点链成员均未动。
   - **Codex 256K 统计**:单次调用 37.9min(40min 止损线内自行完成全部实现+测试+全量绿),function_calls **71**,首轮写码启动后 **~12.4min**(R8 12min 线贴线略超,写入后一路正常),tokens **4.77M total**(含 cache 重放 4.54M)/output 73K+reasoning 47K,零 compact。
   - 备注:真机冒烟(新城市冷抓墙钟 + geocode 二连击)按契约留主会话白天做;uvicorn :8000 已重启(Python 有变)。仓库根发现未跟踪文件 `AzureMapsKey.txt`(明文 key 样态,9/30 09:56 UTC 落盘、非夜班产物、未 commit)——待神朱处置(建议 gitignore 或移出仓库)。
+  - **2026-10-01 神朱裁定:本条待办复验取消,不再执行**——项目已切换到高德地图(POI 检索/地理编码/前端地图,详见 TASK-9),Overpass 冷抓链与 Photon 地理编码将整体移除,**TASK-7a 的「组间并行」与「OriginCache」两个优化点失去对象**:冷抓墙钟复验(383s→120-150s)与 geocode 二连击复验**一律不做**。本条代码在切换任务(TASK-9a)落地时按契约一并移除,勿单独回滚。
 
 ## [TASK-8a1] 目的地图片链路:高德 POI 图(主) + 维基百科/Commons(兜底) + PlaceMedia 缓存 + /api/places/media
 
 - 状态: pending
 - 目标: 落地点详情弹窗的「相关图片」后端:新建 `data_sources/amap.py`(高德 Web 服务 place/text 取 `pois[0].photos`,带坐标门控防海外误配)与 `data_sources/wikimedia.py`(zh.wikipedia geosearch 优先、search 兜底 + Commons 相册补图);新服务 `services/place_media.py`(高德优先→维基兜底→无图占位,命中缓存 7 天/空结果负缓存 6h);新表 `PlaceMedia`;新 API `GET /api/places/media?place_ids=`(batch ≤20,读库优先、仅 miss 触网,单条失败不影响其余)。
 - 只读清单: `backend/data_sources/_common.py`、`backend/data_sources/photon.py`、`backend/db/models.py`、`backend/db/repository.py`、`docs/TASK-8-CONTRACT.md`(§1~§3.8a1 逐字执行;参考只读 `backend/app/api/places.py` 的 details 批量形态)。
+  - ⚠️ 前置依赖(2026-10-01 神朱裁定切换高德后补记):`data_sources/amap.py` 由 **TASK-9a(高德数据源层)** 首个创建;本条**不得新建第二个 amap.py**,改为「往既有 `amap.py` 追加 `search_poi_photos`」。执行顺序:排在 TASK-9a 之后;其余(place/text 取 photos、坐标门控、维基兜底、PlaceMedia、/api/places/media)口径不变。
 - 涉及: backend/data_sources/(新增 amap.py、wikimedia.py、改 _common.py 加 amap 源)、backend/services/place_media.py(新)、backend/db/(models.py 加 PlaceMedia 表、repository.py 加读写)、backend/app/api/places.py(加 /api/places/media)、backend/test_*.py(≥22 新用例,全 mock 不触网)
 - 验收: pytest baseline 792 零回归 + ≥22 新增;契约文档 §3「TASK-8a1」全部字段/响应键/ENV 名逐字照做;真机冒烟 `/api/places/media?place_ids=<西湖>` 出图并标注 source;缺 key 时降级不报错(返回 source=none/reason=no_key)。
 - 结果: (待夜班回填)
@@ -633,6 +635,7 @@
 ## [TASK-8b] 前端目的地详情弹窗:pin「查看详情」+ 列表行整行可点 + 图片区 + 类别要点 + 路线/住宿按钮(依赖 8a1/8a2)
 
 - 状态: pending
+- 前置依赖: 排在 TASK-9c(前端地图切高德 JS API)之后 —— 弹窗直接建在高德地图上,避免 Leaflet→高德 对同一段 pin/弹窗代码重写两次。
 - 目标: `index.html` 新增居中详情弹窗 `#placeModal`(role=dialog/aria-modal,Esc+点遮罩+✕ 关闭):标题/类别/距离 → 图片区(打开时才调 `/api/places/media`,骨架态,空/失败给「暂无图片」+**图源标注**「高德/维基百科」+ page_url 外链) → 详细介绍(复用 `detailTextOf` + `/api/places/details` 生成入口) → 类别专属要点(`/api/places/highlights`,骨架+「待核实」弱化样式) → `🚗 路线 / 🛏️ 住宿`(复用 `openRoutePanel`)+ ⭐收藏 → `identityHtml` 脚注。入口:①`popupHtml()` 加「📄 查看详情」按钮(pin 仍先出小 popup);②列表 `.pl-row` 整行可点开同一弹窗,行内既有按钮 `stopPropagation` 不回归。不新增前端 key。
 - 只读清单: `backend/app/static/index.html`、`backend/test_frontend_routes.py`、`docs/TASK-8-CONTRACT.md`(§3「TASK-8b」逐字执行)。
 - 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 静态断言 + node --check)

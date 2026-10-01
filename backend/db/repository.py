@@ -324,7 +324,7 @@ def record_segment(
     band: str,
     origin: Mapping[str, Any],
     place_count: int,
-    source: str = "overpass",
+    source: str = "amap",
 ) -> SegmentFetch:
     """记录/刷新 (城市, band) 的抓取水位(含起点坐标,读库时按同一原点算距离)。"""
     city = _clean_city(origin_city)
@@ -336,14 +336,14 @@ def record_segment(
     record.origin_lat = round(float(origin["lat"]), COORD_PRECISION)
     record.origin_lng = round(float(origin["lng"]), COORD_PRECISION)
     record.place_count = int(place_count)
-    record.source = str(source or "overpass")
+    record.source = str(source or "amap")
     record.fetched_at = utcnow()
     session.flush()
     return record
 
 
 def bump_fetch_rounds(session: Session, record: SegmentFetch) -> int:
-    """抓取轮数 +1 并返回新值(渐进抓取 TASK-6b:每完成**一轮** Overpass 抓取记一次)。
+    """抓取轮数 +1 并返回新值(渐进抓取 TASK-6b:每完成**一轮**抓取记一次)。
 
     下一轮扩抓的目标总量由它推出来(``30 × (fetch_rounds + 1)``,见
     :func:`services.place_loader.progressive_target_total`),所以计数必须落库。
@@ -390,7 +390,7 @@ def segment_overview(
 # 路线收藏(阶段2c,TASK-2c):Collection / CollectionCat 的读写
 # --------------------------------------------------------------------------- #
 
-# 收藏是"快照摘要",不是整条路线:上千点的 OSRM 折线主动丢掉,要看线请重新调 /api/routes
+# 收藏是"快照摘要",不是整条路线:上千点的路网折线主动丢掉,要看线请重新调 /api/routes
 SUMMARY_DROP_KEYS: tuple[str, ...] = ("geometry",)
 SUMMARY_PRECISION = 2
 
@@ -439,7 +439,7 @@ def _resolve_osm(osm_type: Any, osm_id: Any) -> tuple[Optional[str], Optional[in
 def _number_or_none(value: Any) -> Any:
     """快照里的数字字段归一:没给 / 空串 / 非数字 / NaN / inf → ``None``(**不瞎造数字**)。
 
-    OSRM 降级时 ``duration_min``/``cost_cny`` 本来就是 ``null``(见 :mod:`services.routes`),
+    路线数据源降级时 ``duration_min``/``cost_cny`` 本来就是 ``null``(见 :mod:`services.routes`),
     收藏照实存 ``None``;整数值保持 ``int``,JSON 来回一趟仍是 ``50`` 而不是 ``50.0``。
     """
     if value is None or isinstance(value, bool):
@@ -464,7 +464,7 @@ def collection_summary(
 ) -> dict[str, Any]:
     """快照摘要归一:``mode`` 与三个数字键(``duration_min``/``cost_cny``/``distance_km``)**恒在**。
 
-    收藏存的是"当时看到的数字":之后价格系数改了、OSRM 降级了,列表仍显示收藏那一刻的口径
+    收藏存的是"当时看到的数字":之后价格系数改了、路线数据源降级了,列表仍显示收藏那一刻的口径
     (M4 对比总账要的正是这个)。缺的键写成 ``None``(前端显示"—"),其余键
     (``kind=real|estimate``、``degraded``、``links`` 等)原样保留;只有 ``geometry`` 主动丢掉。
     显式给了 ``mode`` 就以它为准(``place`` 收藏恒为空串),没给则沿用 ``summary`` 里的。

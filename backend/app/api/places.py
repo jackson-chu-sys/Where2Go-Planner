@@ -16,15 +16,15 @@
   LLM 简介配置的元信息(前端下拉/图例/状态栏的唯一出处,**不含任何 key**)。
 * ``GET /api/places/intros?origin=&band=`` —— 给已入库但还没有简介的 POI 补 LLM 一句话简介
   (DB 即缓存,已有简介的不再调用;失败降级为空简介)。
-* ``GET /api/geocode?city=`` —— 起点城市搜索(**Photon 主 + Nominatim 降级**,TASK-6a),
+* ``GET /api/geocode?city=`` —— 起点城市搜索(**高德主 + Photon/Nominatim 降级**,TASK-9c),
   并回报该城市哪些分段已入库(前端可提示"即时读库"还是"首次抓取")。
-  响应里的 ``geocoder`` 标注这次是谁答的(``photon`` / ``nominatim``);两个源都失败
-  才是错误 → **HTTP 400** 中文报错(消息里带上两边的失败原因)。
-  TASK-7a 起这条路由带**地理编码持久缓存**(:class:`db.models.OriginCache`):实调 Photon
-  每次 2.7~3.4s,而城市中心坐标基本不变,所以命中缓存(TTL 缺省 7 天)直接返回、
-  **零网络**,响应形状与不走缓存时逐字段一致。
+  响应里的 ``geocoder`` 标注这次是谁答的(``amap`` / ``photon`` / ``nominatim``);三个源
+  都失败才是错误 → **HTTP 400** 中文报错(消息里带上三边的失败原因)。
+  TASK-7a 起这条路由带**地理编码持久缓存**(:class:`db.models.OriginCache`):城市中心坐标
+  基本不变,所以命中缓存(TTL 缺省 7 天)直接返回、**零网络**(省下高德配额),
+  响应形状与不走缓存时逐字段一致。
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
-  **逆**地理编码(同样 Photon 主 + Nominatim 降级)反查城市起点。反查失败**不报错**,
+  **逆**地理编码(同样高德主 + Photon/Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
 
 ``/api/places`` 的返回里带 ``seeded`` 与 ``counts_by_source``:OSM 国内滑雪/运动覆盖差,
@@ -94,7 +94,7 @@ ENV_ORIGIN_CACHE_TTL = "WHERE2GO_ORIGIN_CACHE_TTL_S"
 ORIGIN_CACHE_TTL_DEFAULT_S = 604800
 # 只缓存**真的问到了地理编码源**的结果:调用方直接给坐标 / 反查失败降级的 "none" 不写行。
 ORIGIN_CACHE_GEOCODERS = frozenset(
-    {place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
+    {place_loader.GEOCODER_AMAP, place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
 )
 META_NOTE = (
     "分段:环形互斥,检索按 band 分组打高德 v3(下限 0 走 place/around 单圆,下限 > 0 走"
@@ -106,8 +106,8 @@ INTROS_NOTE = (
     "只给 intro 为空的 POI 调 LLM(DB 即缓存);网络/额度失败降级为空简介,下次可重试。"
 )
 REVERSE_NOTE = (
-    "浏览器定位(GPS 坐标)→ 逆地理编码反查城市起点(Photon 主 + Nominatim 降级,"
-    "geocoder 字段标注这次是谁答的,none = 两个源都没答上);"
+    "浏览器定位(GPS 坐标)→ 逆地理编码反查城市起点(高德主 + Photon/Nominatim 降级,"
+    "geocoder 字段标注这次是谁答的,none = 三个源都没答上);"
     "范围圈始终以传入的 GPS 坐标为圆心,不用行政区中心。"
     "反查失败/限流时 resolved=false,起点名降级为『我的位置(纬度,经度)』——"
     "仍是 HTTP 200,前端照常画环查库,不报错。"
@@ -568,17 +568,18 @@ def geocode_city(
     city: str = Query(..., min_length=1, description="城市名,如:北京"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """起点城市搜索(Photon 主 + Nominatim 降级),并回报该城市已入库的分段。
+    """起点城市搜索(高德主 + Photon/Nominatim 降级),并回报该城市已入库的分段。
 
-    两个源都失败(Photon 挂/空结果 **且** Nominatim 也挂)才是错误:按本仓库路由口径
-    抛 **HTTP 400** 中文报错,消息里同时带上两边的失败原因,便于判断是断网还是单源故障。
+    三个源都失败(高德没 key/超配额 **且** Photon 挂/空结果 **且** Nominatim 也挂)才是错误:
+    按本仓库路由口径抛 **HTTP 400** 中文报错,消息里同时带上三边的失败原因,
+    便于判断是断网还是单源故障。
 
     地理编码结果按城市名落 :class:`db.models.OriginCache`(TASK-7a):TTL
     (``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天)内命中就直接拼响应、**零网络** ——
-    Photon 在德国,实调一次 2.7~3.4s,同一城市反复搜索没必要反复付费。命中与否
-    响应形状完全一致(``origin`` 四字段 + ``geocoder`` 原值 + ``bands`` + ``segments``);
+    既省下高德的 QPS/日配额(§1.1),也免掉降级到 Photon(在德国,实调 2.7~3.4s)的等待。
+    命中与否响应形状完全一致(``origin`` 四字段 + ``geocoder`` 原值 + ``bands`` + ``segments``);
     未命中/过期才走 :func:`place_loader.resolve_origin_with_source`,并且只在
-    ``geocoder`` ∈ {photon, nominatim} 时写缓存(给了坐标的 ``none`` 退化路径不写)。
+    ``geocoder`` ∈ {amap, photon, nominatim} 时写缓存(给了坐标的 ``none`` 退化路径不写)。
     """
     cleaned = _clean(city)
     if not cleaned:
@@ -628,12 +629,12 @@ def reverse_geocode(
     ),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """浏览器"我的位置" → 起点城市(Photon 主 + Nominatim 降级逆地理编码),**失败也返回 200**。
+    """浏览器"我的位置" → 起点城市(高德主 + Photon/Nominatim 降级逆地理编码),**失败也返回 200**。
 
     与 ``/api/geocode`` 的区别:坐标已知,只需反查名字;``origin`` 里的 ``lat``/``lng``
     一律沿用传入的 GPS 坐标,范围圈要以用户真实位置为圆心。``resolved=false`` 时
     起点名降级为 ``我的位置(31.23,121.47)``,前端给个提示即可,不必当错误处理
-    (所以这里**双失败也不报 400**,只把 ``geocoder`` 标成 ``none``)。
+    (所以这里**三腿全失败也不报 400**,只把 ``geocoder`` 标成 ``none``)。
     """
     origin, geocoder = place_loader.resolve_reverse_origin_with_source(
         lat, lng, zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom))

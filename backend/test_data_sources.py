@@ -1,8 +1,12 @@
-"""三个免费数据源(OSRM / Nominatim / Overpass)的纯 mock 单测。
+"""数据源公共层与 Nominatim(地理编码降级链末腿)的纯 mock 单测。
 
 不触网:用 :class:`FakeSession` 替身断言**请求 URL、参数、请求头、超时**与
 **真实响应形状下的解析逻辑**(真实响应样本取自 2026-09-08 实测)。
-真实网络的可达性验证由 ``data_sources/verify_poc.py`` 负责。
+
+TASK-9c:Overpass 与 OSRM 已随全仓切高德**物理删除**,它们那两节用例一并移除
+(高德数据源层的用例见 :mod:`backend.test_amap`,驾车/地理编码切链见
+:mod:`backend.test_amap_geocode_driving`);``data_sources/verify_poc.py`` 同步删除,
+真实网络的可达性验证改由 ``docs/TASK-9-CONTRACT.md`` §4 的真机冒烟口径负责。
 
 运行方式(二选一)::
 
@@ -12,14 +16,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import os
 import sys
-import threading
-import time
-from collections.abc import Iterator
 from typing import Any, Callable, Optional
 
 import requests
@@ -29,7 +29,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 import data_sources as ds  # noqa: E402
-from data_sources import nominatim, osrm, overpass  # noqa: E402
+from data_sources import nominatim  # noqa: E402
 from data_sources._common import normalize_timeout  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -100,40 +100,6 @@ class FakeClock:
         return value
 
 
-@contextlib.contextmanager
-def workers_env(value: Optional[str]) -> Iterator[None]:
-    """临时设定 ``WHERE2GO_OVERPASS_WORKERS``(``None`` = 清掉,走缺省值),退出即还原。"""
-    previous = os.environ.get(overpass.ENV_WORKERS)
-    if value is None:
-        os.environ.pop(overpass.ENV_WORKERS, None)
-    else:
-        os.environ[overpass.ENV_WORKERS] = str(value)
-    try:
-        yield
-    finally:
-        if previous is None:
-            os.environ.pop(overpass.ENV_WORKERS, None)
-        else:
-            os.environ[overpass.ENV_WORKERS] = previous
-
-
-def serial_ring(func: Callable[[], Any]) -> Callable[[], Any]:
-    """把环形抓取钉在**串行口径**(``WHERE2GO_OVERPASS_WORKERS=1``)再跑这个用例。
-
-    TASK-7a 起 ``nearby_places_ring`` 组间并行、组内选择器降级也并行,请求的**条数与先后**
-    不再确定;下面几个用例断言的正是"发了几条、第几条查哪个选择器、第一组失败就不白跑后面",
-    所以钉在串行口径逐字保留原断言(并行口径见 :func:`test_overpass_ring_parallel`)。
-    写成装饰器而不是 fixture:本文件还带一个不依赖 pytest 的 ``_run_all`` 直接运行入口。
-    """
-    def wrapper() -> Any:
-        with workers_env("1"):
-            return func()
-
-    wrapper.__name__ = func.__name__
-    wrapper.__doc__ = func.__doc__
-    return wrapper
-
-
 def expect_error(func: Callable[[], Any], exc_type: type, *fragments: str) -> Exception:
     """断言 ``func()`` 抛出 ``exc_type``,且错误信息包含全部 ``fragments``。"""
     try:
@@ -149,22 +115,8 @@ def expect_error(func: Callable[[], Any], exc_type: type, *fragments: str) -> Ex
 
 
 # --------------------------------------------------------------------------- #
-# 真实响应样本(2026-09-08 实测,已裁剪)
+# 真实响应样本(2026-09-08 实测,已裁剪;Overpass/OSRM 样本随模块一并退役)
 # --------------------------------------------------------------------------- #
-
-OSRM_OK = {
-    "code": "Ok",
-    "routes": [
-        {
-            "legs": [{"duration": 5638.8, "distance": 122376.1, "summary": "", "steps": []}],
-            "weight_name": "routability",
-            "weight": 5638.8,
-            "duration": 5638.8,
-            "distance": 122376.1,
-        }
-    ],
-    "waypoints": [{"name": "台基厂头条", "location": [116.407381, 39.904421], "distance": 24.59}],
-}
 
 NOMINATIM_SEARCH = [
     {
@@ -190,121 +142,6 @@ NOMINATIM_REVERSE = {
     "display_name": "台基厂头条14号院-10号院, 台基厂头条, 东城区, 北京市, 100010, 中国",
     "address": {"road": "台基厂头条", "city": "东城区", "country": "中国", "country_code": "cn"},
 }
-
-# Overpass 实测特征:node 带 lat/lon;way/relation 只有 `out center` 时才有 center;
-# 部分山峰没有 name;结果顺序不按距离。
-OVERPASS_PAYLOAD = {
-    "version": 0.6,
-    "generator": "Overpass API 0.7.62.11 87bfad18",
-    "elements": [
-        {
-            "type": "node",
-            "id": 1,
-            "lat": 39.99,
-            "lon": 116.50,
-            "tags": {"natural": "peak", "ele": "1200", "name": "远山"},
-        },
-        {
-            "type": "way",
-            "id": 2,
-            "center": {"lat": 39.92, "lon": 116.42},  # way/relation 仅在 `out center` 下带 center
-            "tags": {"tourism": "attraction", "name:zh": "近景点"},
-        },
-        {"type": "node", "id": 3, "lat": 39.93, "lon": 116.43, "tags": {"natural": "peak"}},
-        {"type": "relation", "id": 4, "tags": {"name": "无坐标的元素"}},
-        {"type": "node", "id": 5, "lat": 39.95, "lon": 116.45, "tags": {"natural": "peak", "name:en": "Middle Hill"}},
-    ],
-}
-
-OVERPASS_BUSY_HTML = (
-    '<?xml version="1.0" encoding="UTF-8"?><html><body><p><strong>Error</strong>: runtime error: '
-    "open64: 0 Success /osm3s_osm_base Dispatcher_Client::request_read_and_idx::timeout. "
-    "The server is probably too busy to handle your request.</p></body></html>"
-)
-
-BEIJING_START = (116.4074, 39.9042)  # (lng, lat)
-BEIJING_END = (116.4815, 39.9907)
-
-
-# --------------------------------------------------------------------------- #
-# OSRM
-# --------------------------------------------------------------------------- #
-
-
-def test_osrm_builds_url_params_and_converts_units() -> None:
-    session = FakeSession(FakeResponse(OSRM_OK))
-    result = osrm.OsrmClient(osrm.DEFAULT_ENDPOINT, session=session).route(BEIJING_START, BEIJING_END)
-
-    call = session.last
-    assert call.method == "GET"
-    # OSRM 坐标顺序是 lng,lat;两点用 ";" 连接
-    assert call.url == (
-        "https://router.project-osrm.org/route/v1/driving/"
-        "116.407400,39.904200;116.481500,39.990700"
-    )
-    assert call.params == {
-        "overview": "false",
-        "alternatives": "false",
-        "steps": "false",
-        "annotations": "false",
-    }
-    assert call.headers["User-Agent"] == "Where2Go-POC/0.1 (dev)"
-    assert 0 < call.timeout <= 20
-    # 米→公里、秒→分钟
-    assert result == {"distance_km": 122.376, "duration_min": 94.0}
-
-
-def test_osrm_supports_alt_endpoint_and_string_coordinates() -> None:
-    session = FakeSession(FakeResponse(OSRM_OK))
-    osrm.OsrmClient(osrm.ALT_ENDPOINT, session=session).route("116.4074,39.9042", [116.4815, 39.9907])
-    assert session.last.url.startswith("https://routing.openstreetmap.de/routed-car/route/v1/driving/")
-    assert session.last.url.endswith("116.407400,39.904200;116.481500,39.990700")
-
-
-def test_osrm_rejects_invalid_coordinates() -> None:
-    for bad in [(200.0, 39.9), (116.4, 99.0), (116.4,), "116.4", "abc,def", 42]:
-        expect_error(lambda value=bad: osrm.format_lnglat(value), ValueError)
-    expect_error(lambda: osrm.OsrmClient(session=FakeSession()).route((116.4,), BEIJING_END), ValueError)
-
-
-def test_osrm_non_ok_code_raises_chinese_error() -> None:
-    payload = {"code": "NotFound", "message": "Not found"}
-    session = FakeSession(FakeResponse(payload))
-    exc = expect_error(
-        lambda: osrm.OsrmClient(session=session).route(BEIJING_START, BEIJING_END),
-        ds.DataSourceError,
-        "[OSRM]",
-        "路线规划失败",
-        "NotFound",
-    )
-    assert isinstance(exc, ds.DataSourceError) and exc.source == "OSRM"
-
-
-def test_osrm_rejects_empty_routes_and_bad_numbers() -> None:
-    cases = [
-        ({"code": "Ok", "routes": []}, "routes"),
-        ({"code": "Ok", "routes": [{"distance": None, "duration": 100.0}]}, "distance/duration"),
-        ({"code": "Ok", "routes": [{"distance": 0.0, "duration": 0.0}]}, "非正数"),
-        ({"code": "Ok"}, "routes"),
-        ([], "应为 JSON 对象"),
-    ]
-    for payload, fragment in cases:
-        session = FakeSession(FakeResponse(payload))
-        expect_error(
-            lambda s=session: osrm.OsrmClient(session=s).route(BEIJING_START, BEIJING_END),
-            ds.DataSourceError,
-            fragment,
-        )
-
-
-def test_osrm_timeout_is_transient_and_retryable() -> None:
-    session = FakeSession(requests.exceptions.ReadTimeout("read timed out"))
-    expect_error(
-        lambda: osrm.OsrmClient(session=session).route(BEIJING_START, BEIJING_END),
-        ds.TransientDataSourceError,
-        "请求超时",
-    )
-
 
 # --------------------------------------------------------------------------- #
 # Nominatim
@@ -397,527 +234,56 @@ def test_nominatim_connection_error_is_transient() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Overpass
-# --------------------------------------------------------------------------- #
-
-
-def test_overpass_build_query_shape() -> None:
-    query = overpass.build_query(
-        39.9042, 116.4074, 50_000, {"tourism": "attraction"}, limit=5, element_types="node", query_timeout=18
-    )
-    assert query.startswith("[out:json][timeout:18];")
-    assert 'node["tourism"="attraction"](around:50000,39.904200,116.407400);' in query
-    # around 结果不按距离排序,所以服务端多取、本地排序后截断
-    assert "out center 60;" in query
-
-
-def test_overpass_tag_union_and_escaping() -> None:
-    query = overpass.build_query(
-        39.9, 116.4, 1_000, [{"natural": "peak"}, {"name": 'say "hi"'}, {"leisure": None}], limit=20
-    )
-    assert query.count("(around:1000,39.900000,116.400000);") == 9  # 3 组 tag × nwr
-    assert 'node["natural"="peak"]' in query and 'relation["natural"="peak"]' in query
-    assert 'way["name"="say \\"hi\\""]' in query
-    assert 'way["leisure"]' in query  # value 为 None → 只判断 tag 是否存在
-
-
-def test_overpass_rejects_bad_inputs() -> None:
-    expect_error(lambda: overpass.build_query(39.9, 116.4, 0, {"natural": "peak"}), ValueError, "radius_m")
-    expect_error(lambda: overpass.tags_to_selectors({}), ValueError, "不能为空")
-    expect_error(lambda: overpass.tags_to_selectors([]), ValueError, "不能为空")
-    expect_error(lambda: overpass.tags_to_selectors("natural=peak"), ValueError, "'['")
-    expect_error(lambda: overpass.normalize_element_types("point"), ValueError, "element_types")
-
-
-def test_overpass_build_grouped_ring_query_shape() -> None:
-    """TASK-1d:每组 ``( 上限圆; - 下限圆; ); out center N;``,配额只花在环内。"""
-    groups = [{"tags": [{"historic": None}], "element_types": "nw", "budget": 40}]
-    query = overpass.build_grouped_ring_query(
-        39.9042, 116.4074, 300_000, 200_000, groups, query_timeout=240
-    )
-    assert query == (
-        "[out:json][timeout:240];\n"
-        "(\n"
-        "  (\n"
-        '    node["historic"]["name"](around:300000,39.904200,116.407400);\n'
-        '    way["historic"]["name"](around:300000,39.904200,116.407400);\n'
-        "  );\n"
-        "  -\n"
-        "  (\n"
-        '    node["historic"]["name"](around:200000,39.904200,116.407400);\n'
-        '    way["historic"]["name"](around:200000,39.904200,116.407400);\n'
-        "  );\n"
-        ");\n"
-        "out center 40;\n"
-    )
-
-
-def test_overpass_ring_query_defaults_to_a_wider_server_timeout() -> None:
-    groups = [{"tags": [{"sport": None}], "budget": 10}]
-    ring = overpass.build_grouped_ring_query(39.9042, 116.4074, 300_000, 200_000, groups)
-    # 差集要在服务端扫两个圆,默认超时比单圆分组查询放宽一档
-    assert ring.startswith(f"[out:json][timeout:{overpass.DEFAULT_RING_QUERY_TIMEOUT}];")
-    assert overpass.DEFAULT_RING_QUERY_TIMEOUT > overpass.DEFAULT_GROUP_QUERY_TIMEOUT
-    assert overpass.DEFAULT_RING_REQUEST_TIMEOUT_S > overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
-    assert overpass.DEFAULT_RING_REQUEST_TIMEOUT_S <= overpass.MAX_GROUP_REQUEST_TIMEOUT_S
-
-
-def test_overpass_ring_query_degrades_to_single_circle_without_inner_radius() -> None:
-    """下限为 0(或缺省)时退化成普通 around 查询,与单圆分组查询逐字一致。"""
-    groups = [{"tags": [{"natural": "peak"}], "budget": 60}]
-    plain = overpass.build_grouped_query(39.9042, 116.4074, 100_000, groups, query_timeout=120)
-    for inner in (0, 0.0, None):
-        ring = overpass.build_grouped_ring_query(39.9042, 116.4074, 100_000, inner, groups, query_timeout=120)
-        assert ring == plain
-    assert "\n  -\n" not in plain, "退化路径不应出现集合差运算符"
-    assert plain.count("around:100000,39.904200,116.407400") == 3  # nwr × 1 组 tag
-
-
-def test_overpass_ring_query_rejects_bad_radii() -> None:
-    groups = [{"tags": [{"natural": "peak"}], "budget": 60}]
-    expect_error(
-        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 300_000, groups),
-        ValueError, "inner_radius_m", "radius_m",
-    )
-    expect_error(
-        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 200_000, groups),
-        ValueError, "inner_radius_m",
-    )
-    expect_error(
-        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, -1, groups),
-        ValueError, "inner_radius_m",
-    )
-    expect_error(
-        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 0, 0, groups), ValueError, "radius_m"
-    )
-    expect_error(
-        lambda: overpass.build_grouped_ring_query(39.9, 116.4, 200_000, 100_000, []),
-        ValueError, "groups",
-    )
-
-
-def test_overpass_parse_places_sorts_and_falls_back_names() -> None:
-    places = overpass.parse_places(OVERPASS_PAYLOAD, 39.9042, 116.4074, limit=None)
-    # 无坐标的 relation 被丢弃;剩下的按大圆距离升序
-    assert [place["name"] for place in places] == ["近景点", "", "Middle Hill", "远山"]
-    assert set(places[0]) == {"lat", "lng", "name", "tags"}
-    assert places[0]["tags"]["name:zh"] == "近景点"
-
-    named = overpass.parse_places(OVERPASS_PAYLOAD, 39.9042, 116.4074, limit=None, require_name=True)
-    assert [place["name"] for place in named] == ["近景点", "Middle Hill", "远山"]
-    assert len(overpass.parse_places(OVERPASS_PAYLOAD, 39.9042, 116.4074, limit=2)) == 2
-
-
-def test_overpass_nearby_places_posts_query_and_parses() -> None:
-    session = FakeSession(FakeResponse(OVERPASS_PAYLOAD))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
-    places = client.nearby_places(
-        39.9042, 116.4074, 50_000, {"tourism": "attraction"}, limit=3, require_name=True
-    )
-
-    call = session.last
-    assert call.method == "POST"
-    assert call.url == "https://overpass-api.de/api/interpreter"
-    assert call.data["data"].startswith("[out:json][timeout:")
-    assert "around:50000,39.904200,116.407400" in call.data["data"]
-    assert call.headers["User-Agent"] == "Where2Go-POC/0.1 (dev)"
-    assert 0 < call.timeout <= 20
-    assert client.used_endpoint == overpass.DEFAULT_ENDPOINT
-    assert [place["name"] for place in places] == ["近景点", "Middle Hill", "远山"]
-
-
-def test_overpass_falls_back_to_mirror_when_primary_busy() -> None:
-    busy = FakeResponse(None, status_code=504, text=OVERPASS_BUSY_HTML)
-    session = FakeSession(busy, FakeResponse(OVERPASS_PAYLOAD))
-    slept: list[float] = []
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0.5, sleep=slept.append)
-
-    places = client.nearby_places(39.9042, 116.4074, 50_000, {"tourism": "attraction"}, limit=2, require_name=True)
-    assert len(session.calls) == 2
-    assert client.used_endpoint == "https://z.overpass-api.de/api/interpreter"
-    assert [place["name"] for place in places] == ["近景点", "Middle Hill"]
-    assert slept and all(item > 0 for item in slept), f"降级前应有退避等待,实际:{slept}"
-
-
-def test_overpass_reports_error_when_all_endpoints_fail() -> None:
-    session = FakeSession(FakeResponse(None, status_code=504, text=OVERPASS_BUSY_HTML))
-    client = overpass.OverpassClient(session=session, retries=2, retry_backoff_s=0, sleep=lambda _: None)
-    expect_error(
-        lambda: client.nearby_places(39.9042, 116.4074, 50_000, {"tourism": "attraction"}),
-        ds.DataSourceError,
-        "所有 Overpass 端点均不可用",
-        "overpass-api.de",
-        "maps.mail.ru",
-        "too busy",
-    )
-    assert len(session.calls) == len(client.endpoints) * 2
-
-
-def test_overpass_bad_query_fails_fast_without_fallback() -> None:
-    session = FakeSession(FakeResponse(None, status_code=400, text='{"remark": "unknown query type"}'))
-    client = overpass.OverpassClient(session=session, retries=3, retry_backoff_s=0, sleep=lambda _: None)
-    expect_error(
-        lambda: client.nearby_places(39.9042, 116.4074, 50_000, {"tourism": "attraction"}),
-        ds.DataSourceError,
-        "HTTP 状态码 400",
-    )
-    assert len(session.calls) == 1, "查询本身有误时不应重试或换端点"
-
-
-def test_overpass_rejects_payload_without_elements() -> None:
-    session = FakeSession(FakeResponse({"version": 0.6, "generator": "Overpass API"}))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
-    expect_error(
-        lambda: client.nearby_places(39.9042, 116.4074, 50_000, {"tourism": "attraction"}),
-        ds.DataSourceError,
-        "elements",
-    )
-
-
-OOM_REMARK = "runtime error: Query run out of memory using about 2048 MB of RAM."
-TIMEOUT_REMARK = 'runtime error: Query timed out in "nwr" at line 4 after 240 seconds.'
-RING_GROUP = [{"group": "小城古镇", "tags": ['["place"~"^(town|village)$"]'],
-               "element_types": "nwr", "budget": 40}]
-# 实测**滑雪场**组的整条差集在 overpass-api.de / maps.mail.ru 都撞 2048 MB 上限,
-# 这里用两个选择器 + 配额 2 复现同一形态(便于断言去重与配额截断)。
-HEAVY_GROUP = [{"group": "滑雪场", "tags": ['["piste:type"]', '["ski"~"^(yes)$"]'],
-                "element_types": "nwr", "budget": 2}]
-
-
-def test_overpass_runtime_error_remark_tells_oom_from_timeout() -> None:
-    """OOM 是致命 remark;超时只是"服务端到点中止 + 仍回部分分组",按既有口径收下。"""
-    assert overpass.runtime_error_remark({"remark": OOM_REMARK, "elements": []}) == OOM_REMARK
-    assert overpass.runtime_error_remark({"remark": TIMEOUT_REMARK, "elements": []}) == ""
-    assert overpass.runtime_error_remark({"elements": []}) == ""
-    assert overpass.runtime_error_remark("不是 JSON 对象") == ""
-
-
-def test_overpass_execute_raises_on_out_of_memory_remark_without_failover() -> None:
-    """OOM remark 是 HTTP 200 + 合法 JSON,病根在查询太重:换端点只会再撞同一内存上限。"""
-    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
-    client = overpass.OverpassClient(session=session, retries=2, retry_backoff_s=0, sleep=lambda _: None)
-    expect_error(
-        lambda: client.execute("[out:json][timeout:240];out;", reject_runtime_errors=True),
-        overpass.OverpassRuntimeError,
-        "服务端致命错误",
-        "out of memory",
-    )
-    assert len(session.calls) == 1, "致命 remark 不原地重试、也不换端点(交给调用方拆小查询)"
-    assert client.used_endpoint is None
-
-
-@serial_ring
-def test_overpass_ring_splits_a_too_heavy_group_by_selector() -> None:
-    """整组差集 OOM → **按选择器拆开**重发同样的差集(每条小得多,实测 27-58s 跑通)。"""
-    piste = {"type": "way", "id": 9, "center": {"lat": 41.5, "lon": 117.0},
-             "tags": {"name": "环内雪道", "piste:type": "downhill"}}
-    resort = {"type": "node", "id": 8, "lat": 41.2, "lon": 116.9,
-              "tags": {"name": "环内雪场", "ski": "yes"}}
-    session = FakeSession(
-        FakeResponse({"remark": OOM_REMARK, "elements": []}),
-        FakeResponse({"elements": [piste]}),
-        FakeResponse({"elements": [resort]}),
-    )
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, HEAVY_GROUP)
-
-    assert len(session.calls) == 3, "整组 1 次 + 每个选择器各 1 次"
-    for call in session.calls:
-        sent = call.data["data"]
-        assert sent.count("[out:json]") == 1
-        assert sent.count("out center 2;") == 1, "拆分后该组配额不变"
-        assert "around:300000,39.904200,116.407400" in sent
-        assert "around:200000,39.904200,116.407400" in sent and "\n  -\n" in sent, "拆分后仍是环形差集"
-        assert call.timeout == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
-    assert '["piste:type"]["name"]' in session.calls[1].data["data"], "第一个选择器单独一条差集"
-    assert '["ski"~"^(yes)$"]["name"]' in session.calls[2].data["data"]
-    assert [(row["name"], row["osm_type"], row["osm_id"]) for row in rows] == [
-        ("环内雪场", "node", 8), ("环内雪道", "way", 9)
-    ], "跨选择器合并后仍按由近及远排序"
-
-
-@serial_ring
-def test_overpass_ring_split_rows_are_deduped_and_capped_by_group_budget() -> None:
-    """拆分后每组仍受配额约束:``(type, id)`` 去重 + 由近及远取前 ``budget`` 条。"""
-
-    def node(osm_id: int, lat: float, name: str) -> dict[str, Any]:
-        return {"type": "node", "id": osm_id, "lat": lat, "lon": 116.4074,
-                "tags": {"name": name, "piste:type": "downhill", "ski": "yes"}}
-
-    session = FakeSession(
-        FakeResponse({"remark": OOM_REMARK, "elements": []}),
-        FakeResponse({"elements": [node(3, 42.0, "最远"), node(2, 41.0, "中间"), node(1, 40.4, "最近")]}),
-        FakeResponse({"elements": [node(1, 40.4, "最近"), node(3, 42.0, "最远")]}),
-    )
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, HEAVY_GROUP)
-
-    assert [(row["name"], row["osm_id"]) for row in rows] == [("最近", 1), ("中间", 2)], (
-        "两个选择器命中同一地物只留一条,并按该组配额(2)由近及远截断"
-    )
-
-
-@serial_ring
-def test_overpass_ring_fails_loud_when_the_selector_split_also_fails() -> None:
-    """拆到选择器粒度仍全灭 → 抛错带组名,且不白跑后面的分组(不写残缺水位)。"""
-    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    groups = HEAVY_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
-    expect_error(
-        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, groups),
-        ds.DataSourceError, "滑雪场", "服务端致命错误", "out of memory",
-    )
-    assert len(session.calls) == 3, "整组 1 次 + 两个选择器各 1 次,第一组失败即中止"
-
-
-def test_overpass_ring_does_not_split_a_single_selector_group() -> None:
-    """只有一个选择器时无从再拆:直接失败,不把同一条查询原样重发一遍。"""
-    session = FakeSession(FakeResponse({"remark": OOM_REMARK, "elements": []}))
-    client = overpass.OverpassClient(session=session, retries=2, retry_backoff_s=0, sleep=lambda _: None)
-    expect_error(
-        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_GROUP),
-        ds.DataSourceError, "小城古镇", "服务端致命错误",
-    )
-    assert len(session.calls) == 1
-
-
-def test_overpass_ring_accepts_partial_groups_on_timeout_remark() -> None:
-    """超时 remark(带已完成的结果)不算失败:照旧入库,下次 refresh 再补齐。"""
-    session = FakeSession(FakeResponse({
-        "remark": TIMEOUT_REMARK,
-        "elements": [{"type": "node", "id": 3, "lat": 40.5, "lon": 116.9,
-                      "tags": {"name": "环内村落", "place": "village"}}],
-    }))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
-    rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_GROUP)
-    assert len(session.calls) == 1, "超时不换端点、不重试"
-    assert [row["name"] for row in rows] == ["环内村落"]
-
-
-@serial_ring
-def test_overpass_ring_reports_the_group_that_exhausted_the_endpoint_chain() -> None:
-    """某组把端点链跑完仍失败 → 抛错并带组名(不返回残缺结果,免得被记成"已抓取")。"""
-    session = FakeSession(FakeResponse(None, status_code=504, text=OVERPASS_BUSY_HTML))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    groups = RING_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
-    expect_error(
-        lambda: client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, groups),
-        ds.DataSourceError, "小城古镇", "所有 Overpass 端点均不可用", "too busy",
-    )
-    assert len(session.calls) == len(client.endpoints), "第一组失败即中止,不白跑后面几组"
-
-
-def test_overpass_ring_without_inner_radius_delegates_to_single_circle() -> None:
-    """下限为 0 → 退化成单圆并集:一次请求、单圆超时、无差集运算符(TASK-1b 行为不变)。"""
-    session = FakeSession(FakeResponse({"elements": []}))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
-    groups = RING_GROUP + [{"group": "自然风光", "tags": [{"natural": "peak"}], "budget": 140}]
-    client.nearby_places_ring(39.9042, 116.4074, 100_000, 0, groups)
-
-    assert len(session.calls) == 1, "单圆仍然一次请求查完所有分组"
-    sent = session.last.data["data"]
-    assert sent.startswith(f"[out:json][timeout:{overpass.DEFAULT_GROUP_QUERY_TIMEOUT}];")
-    assert session.last.timeout == overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
-    assert sent.count("out center ") == len(groups)
-    assert "around:100000,39.904200,116.407400" in sent
-    assert "\n  -\n" not in sent, "退化路径不应出现集合差运算符"
-
-
-# --------------------------------------------------------------------------- #
-# TASK-7a:环形抓取组间并行 + 端点错峰
-# --------------------------------------------------------------------------- #
-
-# 替身 execute 每条查询"跑"这么久:足够让线程真的重叠起来,又不至于拖慢单测。
-RING_PARALLEL_SLEEP_S = 0.12
-RING_PARALLEL_GROUPS = [
-    {"group": "小城古镇", "tags": [{"historic": "town"}], "element_types": "nwr", "budget": 10},
-    {"group": "自然风光", "tags": [{"natural": "peak"}], "element_types": "nwr", "budget": 11},
-    {"group": "运动场所", "tags": [{"sport": "climbing"}], "element_types": "nwr", "budget": 12},
-]
-SKI_SELECTORS = ['["piste:type"]', '["ski"~"^(yes)$"]', '["landuse"="winter_sports"]',
-                 '["sport"~"^(ski|skiing)$"]']
-
-
-class TimedRecorder:
-    """给 :meth:`OverpassClient.execute` 套一层计时:记录进入/离开时间与错峰起点。
-
-    并发度看**时间区间重叠**得到的峰值(``peak``),串行累加耗时 = 各次调用耗时之和
-    (``serial_total``);两者一比就知道"组间并行"有没有真的把墙钟压下来。
-    """
-
-    def __init__(self, original: Callable[..., Any], sleep_s: float = RING_PARALLEL_SLEEP_S) -> None:
-        self.original = original
-        self.sleep_s = sleep_s
-        self.lock = threading.Lock()
-        self.spans: list[tuple[float, float, int]] = []
-        self.live = 0
-        self.peak = 0
-
-    def run(self, client: Any, query: str, **kwargs: Any) -> Any:
-        entered = time.monotonic()
-        with self.lock:
-            self.live += 1
-            self.peak = max(self.peak, self.live)
-        try:
-            time.sleep(self.sleep_s)
-            return self.original(client, query, **kwargs)
-        finally:
-            with self.lock:
-                self.live -= 1
-                self.spans.append((entered, time.monotonic(), int(kwargs.get("start_index", 0))))
-
-    @property
-    def serial_total(self) -> float:
-        return sum(end - start for start, end, _ in self.spans)
-
-    def install(self) -> Callable[..., Any]:
-        """返回可直接挂到类属性上的替身函数(函数才会被描述符协议绑定 ``self``)。"""
-        def timed_execute(client: Any, query: str, **kwargs: Any) -> Any:
-            return self.run(client, query, **kwargs)
-
-        overpass.OverpassClient.execute = timed_execute
-        return timed_execute
-
-
-def test_overpass_ring_parallel() -> None:
-    """TASK-7a:环形差集**组间并行** + 端点错峰 —— 墙钟从"逐组累加"降到"最慢一组"。
-
-    实测成都 50-100km 环六组串行合计 383s(114.8 / 42.8 / 65.9 / 5.3 / 68.2 / 86.3),
-    而各组 elements 只有 2~8 条:成本在服务端扫两个圆的几何,只有并行能减墙钟。
-    这里用替身 ``execute``(每条睡 0.12s)复现同一形态,断言 ①峰值并发 ≥2、
-    ②总墙钟 < 各组耗时之和、③第 i 组从 ``endpoints[i % len]`` 起头。
-    """
-    session = FakeSession(FakeResponse({"elements": []}))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    endpoints = client.endpoints
-    recorder = TimedRecorder(overpass.OverpassClient.execute)
-    try:
-        recorder.install()
-        with workers_env("3"):
-            started = time.monotonic()
-            rows = client.nearby_places_ring(
-                39.9042, 116.4074, 300_000, 200_000, RING_PARALLEL_GROUPS
-            )
-            wall = time.monotonic() - started
-    finally:
-        overpass.OverpassClient.execute = recorder.original
-
-    assert rows == []
-    assert len(recorder.spans) == len(RING_PARALLEL_GROUPS), "并行只换墙钟,请求条数不变"
-    assert recorder.peak >= 2, f"组间应并行,实际峰值并发 {recorder.peak}"
-    assert wall < recorder.serial_total, (
-        f"总墙钟 {wall:.3f}s 应小于串行累加 {recorder.serial_total:.3f}s"
-    )
-    assert sorted(index for _, _, index in recorder.spans) == [0, 1, 2], "每组一个错峰起点"
-    # 错峰要落到真实 URL 上:按各组配额认出自己的那条查询,再看它打的是哪个端点。
-    used: dict[str, str] = {}
-    for call in session.calls:
-        sent = call.data["data"]
-        group = next(
-            item for item in RING_PARALLEL_GROUPS if f"out center {item['budget']};" in sent
-        )
-        used[group["group"]] = call.url
-    assert len(endpoints) >= 2, "端点链至少两个成员才谈得上错峰"
-    for index, group in enumerate(RING_PARALLEL_GROUPS):
-        wanted = endpoints[index % len(endpoints)]
-        assert used[group["group"]] == wanted, (
-            f"{group['group']}(第 {index} 组)应从 {wanted} 起头,实际 {used[group['group']]}"
-        )
-
-
-def test_overpass_ring_selector_split_runs_in_parallel() -> None:
-    """组内「按选择器拆开」的降级也并行(嵌套 ≤2):四条查询不必逐条累加。
-
-    实测滑雪场组四个选择器 27/29/44/58s 串行累加 158s;并行后合并口径不变 ——
-    仍按**选择器原序**合并 → ``(type, id)`` 去重 → 由近及远取前 ``budget`` 条。
-    """
-    ski = {"group": "滑雪场", "tags": list(SKI_SELECTORS), "element_types": "nwr", "budget": 3}
-    node = {"type": "node", "id": 7, "lat": 41.0, "lon": 116.9,
-            "tags": {"name": "环内雪场", "ski": "yes"}}
-    session = FakeSession(
-        FakeResponse({"remark": OOM_REMARK, "elements": []}),
-        FakeResponse({"elements": [node]}),
-    )
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0, sleep=lambda _: None)
-    recorder = TimedRecorder(overpass.OverpassClient.execute)
-    try:
-        recorder.install()
-        with workers_env(None):  # 缺省并发:单组没有"组间"可并行,拆分降级仍要并行
-            started = time.monotonic()
-            rows = client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, [ski])
-            wall = time.monotonic() - started
-    finally:
-        overpass.OverpassClient.execute = recorder.original
-
-    assert len(recorder.spans) == 1 + len(SKI_SELECTORS), "整组 1 次 + 每个选择器各 1 次"
-    assert recorder.peak >= 2, f"拆分后的几条查询应并行,实际峰值并发 {recorder.peak}"
-    assert recorder.peak <= overpass.MAX_RING_REQUESTS, "同时在飞的请求不超过并发闸门"
-    assert wall < recorder.serial_total, (
-        f"总墙钟 {wall:.3f}s 应小于串行累加 {recorder.serial_total:.3f}s"
-    )
-    assert [(row["name"], row["osm_id"]) for row in rows] == [("环内雪场", 7)], (
-        "四条查询命中同一地物 → 按 (type, id) 去重后只剩一条"
-    )
-
-
-def test_overpass_ring_workers_env_is_clamped() -> None:
-    """并发数只认 1~4,非法值回落缺省 3(并发是性能旋钮,不该因写错环境变量就挂)。"""
-    cases = {
-        "": overpass.DEFAULT_RING_WORKERS,
-        "1": 1,
-        "2": 2,
-        "3": 3,
-        "4": 4,
-        "0": overpass.MIN_RING_WORKERS,
-        "-3": overpass.MIN_RING_WORKERS,
-        "9": overpass.MAX_RING_WORKERS,
-        "很多": overpass.DEFAULT_RING_WORKERS,
-    }
-    for raw, expected in cases.items():
-        with workers_env(raw):
-            assert overpass.ring_workers() == expected, f"{raw!r} 应收敛到 {expected}"
-    with workers_env(None):
-        assert overpass.ring_workers() == overpass.DEFAULT_RING_WORKERS, "不设 env = 缺省 3"
-    assert overpass.NESTED_SPLIT_WORKERS <= 2, "嵌套并发 ≤2"
-    assert overpass.MAX_RING_REQUESTS <= 4, "总并发 ≤4"
-
-
-def test_overpass_ring_uses_one_session_per_worker_thread() -> None:
-    """``requests.Session`` 不保证线程安全 → 每个 worker 线程用自己的 session。"""
-    built: list[str] = []
-    lock = threading.Lock()
-    original_build = overpass.build_session
-
-    def fake_build_session(user_agent: str = overpass.USER_AGENT, *, source: Optional[str] = None) -> Any:
-        with lock:
-            built.append(threading.current_thread().name)
-        return FakeSession(FakeResponse({"elements": []}))
-
-    recorder = TimedRecorder(overpass.OverpassClient.execute)
-    overpass.build_session = fake_build_session
-    try:
-        client = overpass.OverpassClient(retries=1, retry_backoff_s=0, sleep=lambda _: None)
-        recorder.install()  # 每条查询"跑" 0.12s:三个 worker 真的同时在飞,才会各建各的 session
-        with workers_env("3"):
-            client.nearby_places_ring(39.9042, 116.4074, 300_000, 200_000, RING_PARALLEL_GROUPS)
-    finally:
-        overpass.OverpassClient.execute = recorder.original
-        overpass.build_session = original_build
-
-    assert len(built) == 1 + len(RING_PARALLEL_GROUPS), "构造线程 1 个 + 每个 worker 各 1 个"
-    assert len(set(built)) == len(built), f"每个线程只建一次、彼此不共享:{built}"
-    assert built[0] == threading.current_thread().name, "第一个 session 属于构造客户端的线程"
-
-
-def test_overpass_haversine_matches_known_distance() -> None:
-    # 与实测样本一致:福寿岭(39.9454069,116.1562855) 距北京市中心约 21.9 km
-    assert abs(overpass.haversine_km(39.9042, 116.4074, 39.9454069, 116.1562855) - 21.9) < 0.1
-    assert overpass.haversine_km(39.9, 116.4, 39.9, 116.4) == 0.0
-
-
-# --------------------------------------------------------------------------- #
 # 公共层与包导出
 # --------------------------------------------------------------------------- #
+
+
+def test_haversine_matches_known_distance() -> None:
+    """大圆距离:TASK-9c 起住 :mod:`data_sources._common`(原 overpass.py),口径不变。"""
+    # 与实测样本一致:福寿岭(39.9454069,116.1562855) 距北京市中心约 21.9 km
+    assert abs(ds.haversine_km(39.9042, 116.4074, 39.9454069, 116.1562855) - 21.9) < 0.1
+    assert ds.haversine_km(39.9, 116.4, 39.9, 116.4) == 0.0
+    assert ds.EARTH_RADIUS_KM == 6371.0088
+
+
+def test_package_exports_amap_and_geocoders() -> None:
+    """包导出面(TASK-9c):高德 + Nominatim + 公共层;Overpass/OSRM 的名字一律退役。"""
+    assert ds.USER_AGENT == "Where2Go-POC/0.1 (dev)"
+    for name in (
+        "amap",
+        "geocode",
+        "reverse",
+        "haversine_km",
+        "NominatimClient",
+        "DataSourceError",
+        "TransientDataSourceError",
+    ):
+        assert name in ds.__all__, f"{name} 未在 __all__ 中导出"
+        assert hasattr(ds, name), f"{name} 未导出"
+    assert ds.NOMINATIM_ENDPOINT in ds.NominatimClient().endpoint
+    for retired in (
+        "route", "nearby_places", "OsrmClient", "OverpassClient",
+        "OSRM_ENDPOINT", "OSRM_ALT_ENDPOINT",
+        "OVERPASS_ENDPOINT", "OVERPASS_FALLBACK_ENDPOINTS",
+    ):
+        assert retired not in ds.__all__, f"{retired} 应随 Overpass/OSRM 一并退役"
+        assert not hasattr(ds, retired), f"{retired} 不该再被导出"
+
+
+def test_module_level_functions_accept_injected_session() -> None:
+    assert ds.geocode("北京", session=FakeSession(FakeResponse(NOMINATIM_SEARCH)), min_interval=0)[
+        "display_name"
+    ] == "北京市, 中国"
+    assert ds.reverse(39.9042, 116.4074, session=FakeSession(FakeResponse(NOMINATIM_REVERSE)), min_interval=0)[
+        "lng"
+    ] == 116.4075123
+
+
+def test_endpoint_can_be_overridden_per_call() -> None:
+    session = FakeSession(FakeResponse(NOMINATIM_SEARCH))
+    ds.geocode("北京", endpoint="https://nominatim.internal.example.com", session=session, min_interval=0)
+    assert session.last.url.startswith("https://nominatim.internal.example.com/")
+
 
 
 def test_normalize_timeout_caps_at_20s() -> None:
@@ -926,69 +292,6 @@ def test_normalize_timeout_caps_at_20s() -> None:
     assert normalize_timeout(3) == 3.0
     expect_error(lambda: normalize_timeout(0), ValueError, "timeout")
     expect_error(lambda: normalize_timeout(-1), ValueError, "timeout")
-
-
-def test_package_exports_all_sources() -> None:
-    assert ds.USER_AGENT == "Where2Go-POC/0.1 (dev)"
-    for name in (
-        "route",
-        "geocode",
-        "reverse",
-        "nearby_places",
-        "haversine_km",
-        "OsrmClient",
-        "NominatimClient",
-        "OverpassClient",
-        "DataSourceError",
-        "TransientDataSourceError",
-    ):
-        assert name in ds.__all__, f"{name} 未在 __all__ 中导出"
-        assert hasattr(ds, name), f"{name} 未导出"
-    assert ds.OSRM_ENDPOINT == "https://router.project-osrm.org"
-    assert ds.OSRM_ALT_ENDPOINT == "https://routing.openstreetmap.de/routed-car"
-    assert ds.OVERPASS_ENDPOINT in ds.OverpassClient().endpoints[0]
-
-
-def test_module_level_functions_accept_injected_session() -> None:
-    assert ds.route(BEIJING_START, BEIJING_END, session=FakeSession(FakeResponse(OSRM_OK))) == {
-        "distance_km": 122.376,
-        "duration_min": 94.0,
-    }
-    assert ds.geocode("北京", session=FakeSession(FakeResponse(NOMINATIM_SEARCH)), min_interval=0)[
-        "display_name"
-    ] == "北京市, 中国"
-    assert ds.reverse(39.9042, 116.4074, session=FakeSession(FakeResponse(NOMINATIM_REVERSE)), min_interval=0)[
-        "lng"
-    ] == 116.4075123
-    places = ds.nearby_places(
-        39.9042,
-        116.4074,
-        50_000,
-        {"tourism": "attraction"},
-        session=FakeSession(FakeResponse(OVERPASS_PAYLOAD)),
-        retries=1,
-        require_name=True,
-        limit=2,
-    )
-    assert [place["name"] for place in places] == ["近景点", "Middle Hill"]
-
-
-def test_endpoint_can_be_overridden_per_call() -> None:
-    session = FakeSession(FakeResponse(OSRM_OK))
-    ds.route(BEIJING_START, BEIJING_END, endpoint="https://routing.openstreetmap.de/routed-car", session=session)
-    assert session.last.url.startswith("https://routing.openstreetmap.de/routed-car/")
-
-    session = FakeSession(FakeResponse(OVERPASS_PAYLOAD))
-    ds.nearby_places(
-        39.9042,
-        116.4074,
-        1_000,
-        {"natural": "peak"},
-        endpoint="https://z.overpass-api.de/api/interpreter",
-        session=session,
-        retries=1,
-    )
-    assert session.last.url == "https://z.overpass-api.de/api/interpreter"
 
 
 # --------------------------------------------------------------------------- #

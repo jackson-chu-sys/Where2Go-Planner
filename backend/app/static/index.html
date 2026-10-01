@@ -681,8 +681,9 @@ function routeLinksHtml(links){
 //   机票:flight_low_cny ~ flight_high_cny 的公布价锚定区间(标「浮动」);为 null 时**不编数字**,
 //         只留 deep-link 看实时价(宁可不估、不瞎估)。
 // --------------------------------------------------------------------------- //
-const TOLL_MODE_LABEL={osrm_refs:"高速里程取 OSRM 路段编号(G/S 开头)",
-  heuristic:"高速里程按 里程 × 0.55 估算"};
+const TOLL_MODE_LABEL={amap_toll_distance:"收费里程取高德驾车路线 toll_distance",
+  heuristic:"高速里程按 里程 × 0.55 估算",
+  osrm_refs:"高速里程取 OSRM 路段编号(历史口径)"};
 const RAIL_PRICE_SOURCE_LABEL={seed:"参考真实票价",estimate:"分档费率估算"};
 const FLIGHT_RANGE_LABEL="浮动";
 const FLIGHT_NO_PRICE_TEXT="不出票价,以跳转实时为准";

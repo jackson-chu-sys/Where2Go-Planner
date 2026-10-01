@@ -5,16 +5,16 @@
 
     {"mode": "driving|rail|flight", "label": "驾车", "duration_min": 94,
      "cost_cny": 884, "distance_km": 122.4, "geometry": [[lat, lng], ...] | None,
-     "kind": "real|estimate", "degraded": False, "source": "OSRM",
+     "kind": "real|estimate", "degraded": False, "source": "amap",
      "note": "...", "links": [{"provider", "label", "url", "note"}, ...]}
 
 口径与**诚实标注**(ADR-007:公共交通/OTA 不抓实时数据,只做估算 + deep-link):
 
-* **驾车**:走现有 OSRM 数据源(:func:`data_sources.route` 带 ``with_geometry=True``),
-  时长/里程/折线都是真实路网 → ``kind="real"``;**费用仍是估算**(油耗 + 高速过路费系数),
-  note 里写明。OSRM 失败(公共实例繁忙、两点不连通)时**不抛错**:该条降级成
+* **驾车**:走**高德 v3** 驾车路线(:func:`data_sources.amap.driving`,TASK-9c 起替代 OSRM),
+  时长/里程/折线都是真实路网 → ``kind="real"``;**费用仍是估算**(油耗 + 收费里程费率),
+  note 里写明。高德失败(没配 key、超配额、两点不连通)时**不抛错**:该条降级成
   ``kind="estimate"`` + ``degraded=True``、时长/费用/geometry 为 ``None``,
-  note 说明原因,deep-link 照给(跳转导航不依赖 OSRM)。
+  note 说明原因,deep-link 照给(跳转导航不依赖路线接口)。
 * **铁路 / 飞机**:耗时沿用 POC ``app/api/discover.py`` 的 ``_est_mode`` 口径
   (直线距离 × 绕行系数 / 均速 + 地面接驳),费用按里程 × 单价 → 全是估算,
   ``kind="estimate"``,note 一律带「估算·非实时·以官方为准」。
@@ -27,10 +27,10 @@
 
 * 驾车给出**构成明细** ``cost_breakdown{toll, fuel, mode}`` + **整车/人均双标**
   (``vehicle_label`` / ``per_person_cny``):油费 = 里程 × :data:`FUEL_L_PER_KM` × 油价
-  (env ``WHERE2GO_FUEL_PRICE_CNY_L``);过路费 = **高速里程** × 区域费率
-  (东/中/西 = 0.45/0.40/0.35 元/km),高速里程优先取 OSRM ``steps`` 里 ref 以 G/S
-  开头的段距离之和(``mode="osrm_refs"``),拿不到就退化成 里程 × 0.55
-  (``mode="heuristic"``)。
+  (env ``WHERE2GO_FUEL_PRICE_CNY_L``);过路费 = **收费里程** × 区域费率
+  (东/中/西 = 0.45/0.40/0.35 元/km),收费里程取高德 ``toll_distance``(**真实值**,
+  ``mode="amap_toll_distance"``;高德的 ``tolls`` 恒 0、``cost`` 恒 null,**不能用**,
+  见契约 §1.5),该字段缺失才退化成 里程 × 0.55(``mode="heuristic"``)。
 * 铁路按**运营里程**(直线 × :data:`RAIL_FARE_DETOUR`)× **分档费率**(350km/h 线
   0.46、250km/h 线 0.31 元/km,按两端是否"双高铁枢纽"判档);命中
   :data:`RAIL_SEED_FARES`(人工校录的热门城市对真实票价)时直接用种子价并标
@@ -61,8 +61,8 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 from data_sources import DataSourceError
+from data_sources import amap
 from data_sources import haversine_km
-from data_sources import route as ds_route
 from db.models import iso_utc, utcnow
 
 # --------------------------------------------------------------------------- #
@@ -102,10 +102,10 @@ FUEL_L_PER_KM = 0.08                     # 油耗(L/km)
 FUEL_L_PER_100KM = FUEL_L_PER_KM * 100.0  # 展示口径(8L/100km)
 ENV_FUEL_PRICE = "WHERE2GO_FUEL_PRICE_CNY_L"  # 油价环境变量名
 FUEL_PRICE_CNY_PER_L = 8.0               # 油价默认值(元/L);env 缺失/非法时用它
-HIGHWAY_REF_PREFIXES = ("G", "S")        # OSRM steps[].ref 里认作高速/国省道的前缀
-HEURISTIC_HIGHWAY_RATIO = 0.55           # 拿不到 steps/ref 时:高速里程 ≈ 总里程 × 0.55
-TOLL_MODE_OSRM_REFS = "osrm_refs"        # cost_breakdown.mode:高速里程来自 OSRM ref
-TOLL_MODE_HEURISTIC = "heuristic"        # cost_breakdown.mode:高速里程是系数估的
+HEURISTIC_HIGHWAY_RATIO = 0.55           # 高德没给 toll_distance 时:收费里程 ≈ 总里程 × 0.55
+# cost_breakdown.mode:收费里程来自高德 ``toll_distance``(真实值) / 系数估的
+TOLL_MODE_AMAP_TOLL_DISTANCE = "amap_toll_distance"
+TOLL_MODE_HEURISTIC = "heuristic"
 
 REGION_EAST = "east"
 REGION_CENTRAL = "central"
@@ -211,12 +211,13 @@ AIRPORT_CITIES: frozenset[str] = frozenset({
 COST_PRECISION = 0       # 费用取整到元
 DISTANCE_PRECISION = 1   # 里程保留 1 位小数
 COORD_LABEL_PRECISION = 4  # 没有地名时,用坐标当展示名的精度
-# geometry 抽稀上限:OSRM overview=full 长路线动辄上万点,服务端先抽到画线够用的量级,
-# 前端要更平滑可自行再插值(见 STAGE2-PLAN 第 6 节风险 3)
+# geometry 抽稀上限:长路线的 steps[].polyline 动辄上万点,服务端先抽到画线够用的量级,
+# 前端要更平滑可自行再插值(见 STAGE2-PLAN 第 6 节风险 3)。
+# :mod:`data_sources.amap` 解析 polyline 时已按同值抽稀一次,这里是二次保险(替身/旧数据)。
 GEOMETRY_MAX_POINTS = 1200
 
 # 绕行系数(**耗时**口径,与 POC ``_est_mode`` 同源):铁路 1.20、机票航段 1.10;
-# 驾车直接用 OSRM 的真实里程,不用系数。
+# 驾车直接用高德的真实里程,不用系数。
 # 注意:铁路**票价**另用 :data:`RAIL_FARE_DETOUR`(1.15,运营里程口径),两者故意分开。
 BILLABLE_DETOUR = {MODE_RAIL: RAIL_DETOUR, MODE_FLIGHT: FLIGHT_DETOUR}
 
@@ -234,25 +235,25 @@ RAIL_SEED_INDEX: dict[frozenset[str], tuple[str, str, float]] = {
 
 KIND_REAL = "real"
 KIND_ESTIMATE = "estimate"
-SOURCE_OSRM = "OSRM"
+SOURCE_AMAP = "amap"
 SOURCE_ESTIMATE = "estimate"
 SOURCE_UNAVAILABLE = "unavailable"
 ESTIMATE_DISCLAIMER = "估算·非实时·以官方为准"
 
 DRIVING_NOTE = (
-    "时长/里程为 OSRM 真实路网(非实时路况,不含拥堵与休息);费用为估算,"
+    "时长/里程为高德真实路网(非实时路况,不含拥堵与休息);费用为估算,"
     f"口径 {VEHICLE_LABEL}(人均 = 整车 ÷ {DRIVING_SEATS} 人):"
     f"油费 = 里程 × {FUEL_L_PER_KM:g}L/km × 油价(env {ENV_FUEL_PRICE},"
-    f"默认 {FUEL_PRICE_CNY_PER_L:g}元/L);过路费 = 高速里程 × 区域费率"
+    f"默认 {FUEL_PRICE_CNY_PER_L:g}元/L);过路费 = 收费里程 × 区域费率"
     f"(东部 {TOLL_CNY_PER_KM_BY_REGION[REGION_EAST]:g}/"
     f"中部 {TOLL_CNY_PER_KM_BY_REGION[REGION_CENTRAL]:g}/"
-    f"西部 {TOLL_CNY_PER_KM_BY_REGION[REGION_WEST]:g} 元/km);高速里程优先取 OSRM steps 中"
-    f" ref 以 {'/'.join(HIGHWAY_REF_PREFIXES)} 开头的段距离之和"
-    f"(cost_breakdown.mode={TOLL_MODE_OSRM_REFS}),取不到则按 里程 ×"
+    f"西部 {TOLL_CNY_PER_KM_BY_REGION[REGION_WEST]:g} 元/km);收费里程取高德"
+    f" toll_distance(真实收费路段里程,cost_breakdown.mode={TOLL_MODE_AMAP_TOLL_DISTANCE};"
+    f"高德的 tolls/cost 字段个人 key 恒为 0/null,不用),该字段缺失则按 里程 ×"
     f" {HEURISTIC_HIGHWAY_RATIO:g} 估算(mode={TOLL_MODE_HEURISTIC})。{ESTIMATE_DISCLAIMER}"
 )
 DRIVING_DEGRADED_NOTE = (
-    "OSRM 驾车路线暂不可用(公共实例繁忙,或两点不在同一路网/坐标离路网太远):"
+    "高德驾车路线暂不可用(未配置 key、配额/限流,或两点不在同一路网/坐标离路网太远):"
     f"时长与费用本次给不出,不做瞎估;可直接用下方导航链接跳转官方。{ESTIMATE_DISCLAIMER}"
 )
 
@@ -339,63 +340,56 @@ def driving_region(*, from_name: Optional[str] = None, to_name: Optional[str] = 
     return region_by_longitude(0.0 if mid_lng is None else mid_lng)
 
 
-def highway_km_from_steps(steps: Optional[Sequence[Mapping[str, Any]]]) -> Optional[float]:
-    """OSRM ``steps`` 里 ref 以 :data:`HIGHWAY_REF_PREFIXES` 开头的段距离之和(高速里程 km)。
+def resolve_toll_km(
+    distance_km: float,
+    toll_distance_km: Optional[float],
+) -> tuple[float, str]:
+    """收费里程(km)+ 它的口径标签(``cost_breakdown.mode`` 的值)。
 
-    **拿不到就返回 ``None``**:没有 steps、steps 为空、或没有任何一段带 G/S 编号都算"拿不到"。
-    国内 OSRM 的 ``ref`` 覆盖稀疏,"一段都没匹配上"更可能是缺编号而不是真没上高速,
-    所以交给调用方退化成 :data:`HEURISTIC_HIGHWAY_RATIO` 启发式,而不是把过路费直接算成 0。
+    高德 v3 驾车的 ``tolls`` 恒 ``0``、``cost`` 恒 ``null``(个人 key 不出过路费数值,
+    契约 §1.5),但 ``toll_distance``(收费路段米数)是**真实值** → 过路费按
+    收费里程 × 区域费率算,标 :data:`TOLL_MODE_AMAP_TOLL_DISTANCE`。
+
+    ``toll_distance`` 缺失/非法(``None``、负数、非数字)时退回
+    :data:`HEURISTIC_HIGHWAY_RATIO` 启发式并标 :data:`TOLL_MODE_HEURISTIC` ——
+    而不是把过路费直接算成 0(全程无高速才是 0,而高德会给 ``toll_distance=0``)。
+    收费里程夹在 ``[0, 总里程]`` 内(高德偶有重复计数)。
     """
-    if isinstance(steps, (str, bytes)) or not isinstance(steps, Sequence) or not steps:
-        return None
-    total = 0.0
-    matched = False
-    for step in steps:
-        if not isinstance(step, Mapping):
-            continue
-        distance = step.get("distance_km")
-        if isinstance(distance, bool) or not isinstance(distance, (int, float)) or distance < 0:
-            continue
-        ref = step.get("ref")
-        if isinstance(ref, str) and ref.strip().upper().startswith(HIGHWAY_REF_PREFIXES):
-            total += float(distance)
-            matched = True
-    return total if matched else None
+    km = _km(distance_km)
+    value = toll_distance_km
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return min(km * HEURISTIC_HIGHWAY_RATIO, km), TOLL_MODE_HEURISTIC
+    return min(float(value), km), TOLL_MODE_AMAP_TOLL_DISTANCE
 
 
 def driving_cost_breakdown(
     distance_km: float,
     *,
-    steps: Optional[Sequence[Mapping[str, Any]]] = None,
+    toll_distance_km: Optional[float] = None,
     region: Optional[str] = None,
     fuel_price: Optional[float] = None,
 ) -> dict[str, Any]:
-    """驾车费用构成(**未取整**):油费 + 高速过路费,外加算这两项用到的口径。
+    """驾车费用构成(**未取整**):油费 + 过路费,外加算这两项用到的口径。
 
     * ``fuel_cny`` = 里程 × :data:`FUEL_L_PER_KM` × 油价(env 可覆盖);
-    * ``toll_cny`` = 高速里程 × 区域费率;高速里程来自 OSRM ref 时
-      ``toll_mode="osrm_refs"``,拿不到就按 里程 × 0.55 估并标 ``"heuristic"``;
+    * ``toll_cny`` = 收费里程 × 区域费率;收费里程来自高德 ``toll_distance`` 时
+      ``toll_mode="amap_toll_distance"``,拿不到就按 里程 × 0.55 估并标 ``"heuristic"``
+      (判定见 :func:`resolve_toll_km`);
     * ``region`` 非法/缺失 → :data:`DEFAULT_REGION`(取最高档,宁可高估不少估)。
     """
     resolved_region = region if region in TOLL_CNY_PER_KM_BY_REGION else DEFAULT_REGION
     km = _km(distance_km)
     price = fuel_price_cny_per_l() if fuel_price is None else float(fuel_price)
     fuel = km * FUEL_L_PER_KM * price
-    highway_km = highway_km_from_steps(steps)
-    if highway_km is None:
-        highway_km = km * HEURISTIC_HIGHWAY_RATIO
-        toll_mode = TOLL_MODE_HEURISTIC
-    else:
-        toll_mode = TOLL_MODE_OSRM_REFS
-    highway_km = min(highway_km, km)  # 高速里程不该超过总里程(ref 偶有重复计数)
+    toll_km, toll_mode = resolve_toll_km(km, toll_distance_km)
     rate = TOLL_CNY_PER_KM_BY_REGION[resolved_region]
-    toll = highway_km * rate
+    toll = toll_km * rate
     return {
         "total_cny": toll + fuel,
         "toll_cny": toll,
         "fuel_cny": fuel,
         "toll_mode": toll_mode,
-        "highway_km": highway_km,
+        "toll_km": toll_km,
         "toll_rate_cny_per_km": rate,
         "region": resolved_region,
         "fuel_price_cny_per_l": price,
@@ -403,7 +397,7 @@ def driving_cost_breakdown(
 
 
 def driving_cost_cny(distance_km: float, **kwargs: Any) -> float:
-    """驾车整车费用(元,未取整)= 油费 + 高速过路费;里程用 OSRM 的真实公里数。"""
+    """驾车整车费用(元,未取整)= 油费 + 过路费;里程用高德的真实公里数。"""
     return driving_cost_breakdown(distance_km, **kwargs)["total_cny"]
 
 
@@ -411,7 +405,7 @@ def driving_money(distance_km: float, **kwargs: Any) -> dict[str, Any]:
     """取整后的驾车金额(**先各项四舍五入再相加**,所以 ``toll + fuel == cost`` 恒成立)。
 
     返回响应里那三个 v2 字段(``cost_cny`` / ``per_person_cny`` / ``cost_breakdown``),
-    外加 note 里要复述的口径明细(``region``、``highway_km``、费率、油价)。
+    外加 note 里要复述的口径明细(``region``、``toll_km``、费率、油价)。
     """
     breakdown = driving_cost_breakdown(distance_km, **kwargs)
     toll = round_cost(breakdown["toll_cny"])
@@ -423,7 +417,7 @@ def driving_money(distance_km: float, **kwargs: Any) -> dict[str, Any]:
         "cost_breakdown": {"toll": toll, "fuel": fuel, "mode": breakdown["toll_mode"]},
         "toll_cny": toll,
         "fuel_cny": fuel,
-        "highway_km": breakdown["highway_km"],
+        "toll_km": breakdown["toll_km"],
         "toll_rate_cny_per_km": breakdown["toll_rate_cny_per_km"],
         "region": breakdown["region"],
         "fuel_price_cny_per_l": breakdown["fuel_price_cny_per_l"],
@@ -659,21 +653,21 @@ def cost_for(
     *,
     straight_km: float,
     driving_km: Optional[float] = None,
-    steps: Optional[Sequence[Mapping[str, Any]]] = None,
+    toll_distance_km: Optional[float] = None,
     region: Optional[str] = None,
     from_name: Optional[str] = None,
     to_name: Optional[str] = None,
 ) -> Optional[int]:
     """按方式取整后的费用(元)—— v2 口径:
 
-    * 驾车:缺 OSRM 里程 → ``None``(不瞎估);否则 = 过路费 + 油费(各自四舍五入再相加);
+    * 驾车:缺高德里程 → ``None``(不瞎估);否则 = 过路费 + 油费(各自四舍五入再相加);
     * 铁路:种子价或运营里程 × 分档费率;
     * 飞机:公布价区间中值;区间给不出(距离不足 / 没有机场)→ ``None``。
     """
     if mode == MODE_DRIVING:
         if driving_km is None:
             return None
-        return driving_money(driving_km, steps=steps, region=region)["cost_cny"]
+        return driving_money(driving_km, toll_distance_km=toll_distance_km, region=region)["cost_cny"]
     if mode == MODE_RAIL:
         return round_cost(rail_cost_cny(straight_km, from_name=from_name, to_name=to_name))
     if mode == MODE_FLIGHT:
@@ -688,7 +682,7 @@ def estimate_duration_min(mode: str, straight_km: float) -> int:
     elif mode == MODE_FLIGHT:
         speed, ground = FLIGHT_SPEED_KMH, FLIGHT_GROUND_MIN
     else:
-        raise ValueError(f"仅铁路/飞机有经验估算耗时:{mode!r}(驾车请用 OSRM 真实时长)")
+        raise ValueError(f"仅铁路/飞机有经验估算耗时:{mode!r}(驾车请用高德真实时长)")
     return int(round(billable_km(mode, straight_km) / speed * 60.0 + ground))
 
 
@@ -706,16 +700,17 @@ def cost_coefficients() -> dict[str, Any]:
             "fuel_price_env": ENV_FUEL_PRICE,
             "toll_cny_per_km_by_region": dict(TOLL_CNY_PER_KM_BY_REGION),
             "region_labels": dict(REGION_LABELS),
-            "highway_ref_prefixes": list(HIGHWAY_REF_PREFIXES),
+            "toll_distance_field": "amap.toll_distance",
             "heuristic_highway_ratio": HEURISTIC_HIGHWAY_RATIO,
-            "toll_modes": [TOLL_MODE_OSRM_REFS, TOLL_MODE_HEURISTIC],
+            "toll_modes": [TOLL_MODE_AMAP_TOLL_DISTANCE, TOLL_MODE_HEURISTIC],
             "vehicle_label": VEHICLE_LABEL,
             "seats": DRIVING_SEATS,
             "formula": (
                 "油费 = 里程 × 0.08L/km × 油价(env WHERE2GO_FUEL_PRICE_CNY_L,默认 8 元/L);"
-                "过路费 = 高速里程 × 区域费率(东部0.45/中部0.40/西部0.35 元/km);"
-                "高速里程优先取 OSRM steps 中 ref 以 G/S 开头的段距离之和(osrm_refs),"
-                "取不到按 里程 × 0.55 估算(heuristic);人均 = 整车 ÷ 4 人"
+                "过路费 = 收费里程 × 区域费率(东部0.45/中部0.40/西部0.35 元/km);"
+                "收费里程取高德 toll_distance 真实值(amap_toll_distance;"
+                "高德 tolls/cost 个人 key 恒为 0/null,不用),"
+                "该字段缺失按 里程 × 0.55 估算(heuristic);人均 = 整车 ÷ 4 人"
             ),
         },
         MODE_RAIL: {
@@ -777,7 +772,7 @@ def _driving_note(money: Mapping[str, Any]) -> str:
     breakdown = money["cost_breakdown"]
     return (
         f"{DRIVING_NOTE} 本次:{REGION_LABELS[money['region']]}费率 "
-        f"{money['toll_rate_cny_per_km']:g}元/km × 高速 {money['highway_km']:.1f}km"
+        f"{money['toll_rate_cny_per_km']:g}元/km × 收费里程 {money['toll_km']:.1f}km"
         f"(cost_breakdown.mode={breakdown['mode']}) → 过路费 {breakdown['toll']} 元"
         f" + 油费 {breakdown['fuel']} 元(油价 {money['fuel_price_cny_per_l']:g}元/L)"
         f" = {VEHICLE_LABEL} {money['cost_cny']} 元、人均 {money['per_person_cny']} 元。"
@@ -1113,13 +1108,38 @@ def require_coordinates(
 # --------------------------------------------------------------------------- #
 
 
-def default_router(start_lnglat: Sequence[float], end_lnglat: Sequence[float]) -> Mapping[str, Any]:
-    """默认取 OSRM 驾车路线(``with_geometry=True`` 画线、``with_steps=True`` 认高速里程)。
+def amap_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
+    """高德驾车结果(:data:`data_sources.amap.DRIVING_KEYS`)→ 本模块的 leg 口径。
 
-    单测注入替身即可不触网;替身返回的 leg 里没有 ``steps`` 键时,费用引擎自动退化成
-    ``toll_mode="heuristic"``,不影响时长/里程/折线。
+    高德给的是**米/秒**与 ``toll_distance``(收费路段米),这里换成
+    ``distance_km`` / ``duration_min`` / ``toll_distance_km``,并把已解码抽稀的
+    ``polyline``(``[[lat, lng], …]``)挪到 ``geometry`` 键 —— 下游
+    (:func:`driving_route`)只认这一种形状,注入替身也因此不必知道高德。
     """
-    return ds_route(start_lnglat, end_lnglat, with_geometry=True, with_steps=True)
+    distance_m = leg.get("distance_m")
+    duration_s = leg.get("duration_s")
+    toll_m = leg.get("toll_distance_m")
+    return {
+        "distance_km": float(distance_m) / 1000.0,
+        "duration_min": float(duration_s) / 60.0,
+        "toll_distance_km": None if toll_m is None else float(toll_m) / 1000.0,
+        "traffic_lights": leg.get("traffic_lights"),
+        "steps_n": leg.get("steps_n"),
+        "geometry": [list(point) for point in (leg.get("polyline") or [])],
+    }
+
+
+def default_router(start_lnglat: Sequence[float], end_lnglat: Sequence[float]) -> Mapping[str, Any]:
+    """默认取**高德**驾车路线(v3 ``direction/driving``,含 polyline 与 ``toll_distance``)。
+
+    入参是 ``(lng, lat)`` 二元组(与既有 :data:`RouterFn` 口径一致),高德要的是
+    纬度在前,这里换序。单测注入替身即可不触网;替身返回的 leg 里没有
+    ``toll_distance_km`` 键时,费用引擎自动退化成 ``toll_mode="heuristic"``,
+    不影响时长/里程/折线。
+    """
+    start_lng, start_lat = float(start_lnglat[0]), float(start_lnglat[1])
+    end_lng, end_lat = float(end_lnglat[0]), float(end_lnglat[1])
+    return amap_leg(amap.driving(start_lat, start_lng, end_lat, end_lng))
 
 
 def driving_route(
@@ -1134,9 +1154,9 @@ def driving_route(
     router: Optional[RouterFn] = None,
     geometry_max_points: Optional[int] = GEOMETRY_MAX_POINTS,
 ) -> dict[str, Any]:
-    """驾车路线:OSRM 真实时长/里程/折线 + 估算费用(构成明细 + 整车/人均双标)。
+    """驾车路线:高德真实时长/里程/折线 + 估算费用(构成明细 + 整车/人均双标)。
 
-    **OSRM 失败只降级、不抛错**:降级时 ``duration_min``/``cost_cny``/``cost_breakdown``/
+    **高德失败只降级、不抛错**:降级时 ``duration_min``/``cost_cny``/``cost_breakdown``/
     ``per_person_cny``/``geometry`` 全是 ``None``,deep-link 照给。
     """
     meta = MODE_META[MODE_DRIVING]
@@ -1149,7 +1169,7 @@ def driving_route(
     except (DataSourceError, ValueError):
         leg = None
 
-    if leg is None:  # OSRM 不可用:降级成"没有数字",不瞎估、也不 500
+    if leg is None:  # 高德不可用:降级成"没有数字",不瞎估、也不 500
         duration_min: Optional[int] = None
         cost_cny: Optional[int] = None
         cost_breakdown: Optional[dict[str, Any]] = None
@@ -1164,7 +1184,7 @@ def driving_route(
         duration_min = int(round(float(leg["duration_min"])))
         money = driving_money(
             distance_km,
-            steps=leg.get("steps"),
+            toll_distance_km=leg.get("toll_distance_km"),
             region=driving_region(
                 from_name=from_name, to_name=to_name, mid_lng=(float(from_lng) + float(to_lng)) / 2.0
             ),
@@ -1173,7 +1193,7 @@ def driving_route(
         cost_breakdown = money["cost_breakdown"]
         per_person_cny = money["per_person_cny"]
         geometry = thin_geometry(leg.get("geometry"), geometry_max_points)
-        kind, degraded, source, note = KIND_REAL, False, SOURCE_OSRM, _driving_note(money)
+        kind, degraded, source, note = KIND_REAL, False, SOURCE_AMAP, _driving_note(money)
 
     return {
         "mode": MODE_DRIVING,
@@ -1278,9 +1298,9 @@ def plan_routes(
     now: Optional[datetime] = None,
     geometry_max_points: Optional[int] = GEOMETRY_MAX_POINTS,
 ) -> RoutePlan:
-    """编排三种方式:驾车始终出现(OSRM),铁路 ≥100km、飞机 ≥600km 才出现(估算)。
+    """编排三种方式:驾车始终出现(高德),铁路 ≥100km、飞机 ≥600km 才出现(估算)。
 
-    坐标非法抛 :class:`ValueError`(API 层转 400);OSRM 失败**不抛**,驾车条目降级。
+    坐标非法抛 :class:`ValueError`(API 层转 400);高德失败**不抛**,驾车条目降级。
     铁路票价优先用 :data:`RAIL_SEED_FARES` 种子价;机票按民航公布价锚定区间,
     直线 <400km 或任一端没有民航机场时不给票价(条目仍带 deep-link)。
     """

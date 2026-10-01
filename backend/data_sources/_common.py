@@ -1,8 +1,8 @@
-"""数据源层公共工具:统一 User-Agent、超时与中文错误处理。
+"""数据源层公共工具:统一 User-Agent、超时、代理口径与中文错误处理。
 
-四个免费数据源(OSRM / Nominatim / Photon / Overpass)共用这里的 HTTP 封装,保证:
+所有数据源(高德 / Nominatim / Photon / LLM)共用这里的 HTTP 封装,保证:
 
-* 每个请求都带 ``User-Agent``(Nominatim / Overpass 的礼貌要求);
+* 每个请求都带 ``User-Agent``(Nominatim 的礼貌要求);
 * 每个请求都有 timeout,且不超过 ``MAX_TIMEOUT``(20s);
 * 失败时抛出带明确中文说明的 :class:`DataSourceError`;其中可临时重试的
   (超时、连接失败、限流、5xx、服务器繁忙返回的 HTML 错误页)再细分成
@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from typing import Any, Mapping, Optional
@@ -27,16 +28,14 @@ SNIPPET_LEN: int = 240
 # 代理口径(2026-09-27 实测后新增)
 # --------------------------------------------------------------------------- #
 # 背景:数据源层用 requests.Session,默认读环境变量里的 HTTP_PROXY/HTTPS_PROXY。
-# 本机(绿联 NAS 容器)配了全局代理 http://192.168.1.210:7892,三个数据源的网络
-# 可达性却**不一致**(2026-09-27 实测):
-#   * Overpass:走代理 HTTP 504(10.2s)/读超时(37s);**直连 2.4s 正常**
-#     —— 抓取慢(BUG-1)/住宿查不到(BUG-5)的主因之一
-#   * OSRM:走代理 2.7s、直连 0.7s(都能通,直连更快)
+# 本机(绿联 NAS 容器)配了全局代理 http://192.168.1.210:7892,各数据源的网络
+# 可达性却**不一致**(2026-09-27 / 2026-10-01 实测):
+#   * 高德(TASK-9 起的主数据源):REST **国内直连**稳定 0.1~0.2s,走代理反而慢
 #   * Nominatim:**直连连接失败**(15s),必须走代理(1.4s)
-#   * Photon(TASK-6a 新增,地理编码主路径):**直连 1.1s 正常**,走代理 5s 挂
-#     —— 产品环境没有 mihomo 代理,所以 Photon 必须 off;Nominatim 只作降级
+#   * Photon(TASK-6a 新增,地理编码降级链):**直连 1.1s 正常**,走代理 5s 挂
+#     —— 产品环境没有 mihomo 代理,所以 Photon 必须 off;Nominatim 只作末腿降级
 # 所以"一刀切走代理/一刀切不走代理"都不对。这里按**数据源**决定代理口径,可用
-# ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:OVERPASS / OSRM / NOMINATIM / AMAP / LLM):
+# ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:AMAP / NOMINATIM / PHOTON / LLM):
 #   * ``off``  → 强制直连(忽略环境变量里的全局代理)
 #   * ``env``  → 沿用环境变量(HTTP_PROXY/HTTPS_PROXY/NO_PROXY,requests 默认行为)
 #   * 其他值   → 当作该数据源专用代理 URL(如 ``http://192.168.1.210:7892``)
@@ -44,11 +43,9 @@ PROXY_OFF: str = "off"
 PROXY_ENV: str = "env"
 ENV_PROXY_PREFIX: str = "WHERE2GO_PROXY_"
 DEFAULT_SOURCE_PROXY: dict[str, str] = {
-    "overpass": PROXY_OFF,   # 实测走代理 504/超时,直连才通
-    "osrm": PROXY_OFF,       # 直连更快(0.7s vs 2.7s),且目标站点不受限
+    "amap": PROXY_OFF,       # 高德 REST 国内直连(2026-10-01 实测),TASK-9 起的主数据源
     "nominatim": PROXY_ENV,  # 实测直连不通,必须走代理
     "photon": PROXY_OFF,     # 实测直连 1.1s、走代理 5s 挂(产品环境无代理)
-    "amap": PROXY_OFF,       # 高德 REST 国内直连(2026-10-01 实测),TASK-9a 起的主数据源
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
 }
 
@@ -97,7 +94,7 @@ def build_session(user_agent: str = USER_AGENT, *, source: Optional[str] = None)
     """创建带统一 User-Agent 与 JSON Accept 头的 :class:`requests.Session`。
 
     ``source`` 给定时按 :func:`apply_proxy_policy` 应用该数据源的代理口径
-    (``overpass`` / ``osrm`` / ``nominatim`` / ``photon`` / ``amap`` / ``llm``);不传 = 维持 requests 默认
+    (``amap`` / ``nominatim`` / ``photon`` / ``llm``);不传 = 维持 requests 默认
     (读环境变量代理),现有调用与单测行为不变。
     """
     session = requests.Session()
@@ -149,7 +146,7 @@ def http_json(
     try:
         return json.loads(response.text)
     except (TypeError, ValueError) as exc:
-        # Overpass 繁忙时会返回 504 + HTML 错误页;这里也兜住 200 + 非 JSON 的情况。
+        # 公共实例繁忙时可能返回 504 + HTML 错误页;这里也兜住 200 + 非 JSON 的情况。
         raise TransientDataSourceError(
             source, f"响应不是合法 JSON(可能是 HTML 错误页):{_snippet(response)}"
         ) from exc
@@ -161,7 +158,7 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 def _snippet(response: Any, limit: int = SNIPPET_LEN) -> str:
     """截取响应正文片段用于排错:去掉 HTML 标签、压掉换行与多余空白。
 
-    Overpass 繁忙时返回的是 HTML 错误页,原样截取只会看到一堆 XML 声明,
+    公共数据源繁忙时可能返回 HTML 错误页,原样截取只会看到一堆标记声明,
     去标签后才能读到真正的原因(如 "The server is probably too busy")。
     """
     text = getattr(response, "text", "") or ""
@@ -173,3 +170,19 @@ def _snippet(response: Any, limit: int = SNIPPET_LEN) -> str:
 def _exc_text(exc: BaseException, limit: int = SNIPPET_LEN) -> str:
     """异常信息单行化,便于打印中文报错。"""
     return " ".join(str(exc).split())[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# 大圆距离(TASK-9c 起住这里:原先在 overpass.py,该模块随 Overpass 一并退役)
+# --------------------------------------------------------------------------- #
+
+EARTH_RADIUS_KM = 6371.0088
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """两点间大圆距离(公里):POI 排序、环带收敛与直线里程估算共用这一个口径。"""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = phi2 - phi1
+    d_lambda = math.radians(lng2 - lng1)
+    h = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))

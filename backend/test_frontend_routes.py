@@ -1207,7 +1207,7 @@ def test_driving_card_shows_vehicle_and_per_person(html: str, payload: dict[str,
 def test_toll_modes_and_price_sources_cover_backend(html: str) -> None:
     toll = js_map(html, "TOLL_MODE_LABEL")
     toll_modes = route_service.cost_coefficients()["driving"]["toll_modes"]
-    assert toll_modes == [route_service.TOLL_MODE_OSRM_REFS, route_service.TOLL_MODE_HEURISTIC]
+    assert toll_modes == [route_service.TOLL_MODE_AMAP_TOLL_DISTANCE, route_service.TOLL_MODE_HEURISTIC]
     for mode in toll_modes:
         assert mode in toll, f"cost_breakdown.mode 文案缺 {mode}"
     rail = js_map(html, "RAIL_PRICE_SOURCE_LABEL")

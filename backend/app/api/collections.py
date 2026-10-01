@@ -12,7 +12,7 @@
 
 存的是**快照**:收藏那一刻的 ``mode``/``duration_min``/``cost_cny``/``distance_km``
 (``/api/routes`` 返回什么就存什么,``geometry`` 主动丢掉不占库)。之后价格系数变了、
-OSRM 降级了,列表仍显示用户当时看到的数字(M4 对比总账要的正是"当时口径");
+数据源降级了,列表仍显示用户当时看到的数字(M4 对比总账要的正是"当时口径");
 要看最新数字请重新调 ``/api/routes``。
 
 校验口径与 ``/api/places``、``/api/routes`` 一致:缺参 / 非法一律 **400 + 中文报错**。
@@ -44,7 +44,7 @@ PARENT_KEY = "parent"
 
 COLLECTIONS_NOTE = (
     "收藏存的是快照:收藏那一刻的方式/时长/费用/里程(即 /api/routes 的返回,geometry 不入库),"
-    "之后价格系数变了、OSRM 降级了也不回填,要看最新数字请重新调 /api/routes。"
+    "之后价格系数变了、路线数据源降级了也不回填,要看最新数字请重新调 /api/routes。"
     "唯一键 (kind, ref_key, mode) 让重复收藏幂等:同一对起终点 + 同一方式只有一行,"
     "再次收藏刷新快照并返回原行(created=false),id 与 created_at 保持第一次收藏的值;"
     "place 收藏没有出行方式(mode 恒为空串),同一目的地收藏两次同样幂等。"

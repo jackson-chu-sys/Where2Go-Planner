@@ -1,13 +1,13 @@
 """环形距离分段:0-50 / 50-100 / 100-200 / 200-300 / 300-500 km。
 
-抓取口径(docs/STAGE1-PLAN.md 第 3 节):入库批量路径按分段查 Overpass **环形差集**
-(上限圆 - 下限圆,TASK-1d,见 :func:`band_inner_radius_m`),每组配额只花在环内;
-再用大圆距离(haversine)在本地复核收敛到 ``[low, high)``。POC 的交互路径
-``app/api/discover.py`` 仍是单圆上限半径 + 本地收敛,两条路径共用这一套分段定义,
-所以分段只在这里出一份。
+抓取口径(docs/STAGE1-PLAN.md 第 3 节 + TASK-9b):入库批量路径按分段查**高德**环形带
+——高德没有"环形差集"查询,于是「外半径包围盒分格 :func:`data_sources.amap.grid_polygons`
++ 逐格 ``place/polygon``」,再用大圆距离(haversine)在本地收敛到 ``[low, high)``
+(下限口径见 :func:`band_inner_radius_m`)。POC 的交互路径 ``app/api/discover.py``
+共用同一套工具,所以分段只在这里出一份。
 
 ``0_50``(神朱 2026-09-27 要求重新添加)是唯一 ``low == 0`` 的分段:**含城市内部**,
-环形差集退化成单圆 ``around``(见 :func:`band_inner_radius_m` 的 0 分支)。
+不需要分格,退化成单圆 ``place/around``(见 :func:`band_inner_radius_m` 的 0 分支)。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from data_sources import haversine_km
 
 DISTANCE_BANDS: list[dict[str, Any]] = [
     # 0-50 km:神朱 2026-09-27 要求"重新添加"。与其余四档口径不同 —— **含城市内部**
-    # (low=0 时 band_inner_radius_m 给 0,Overpass 退化成单圆 around 查询),
+    # (low=0 时 band_inner_radius_m 给 0,高德退化成单圆 place/around 查询),
     # 前端下拉/图例/范围圈都从 /api/places/meta 读,这里加一条即全链路生效。
     {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50},
     {"key": "50_100", "label": "50-100 km", "low": 50, "high": 100},
@@ -50,15 +50,15 @@ def require_band(key: Optional[str]) -> dict[str, Any]:
 
 
 def band_radius_m(band: Mapping[str, Any]) -> float:
-    """该分段的 Overpass 检索半径(米)= 上限半径。"""
+    """该分段的检索半径(米)= 上限半径(高德 ``radius`` 会被钳到 50km,超出走分格)。"""
     return float(band["high"]) * 1000.0
 
 
 def band_inner_radius_m(band: Mapping[str, Any]) -> float:
     """该分段环形差集的**下限半径**(米)= 下限半径;下限为 0 时返回 ``0.0``。
 
-    返回 ``0.0`` 表示"没有内圈可减",:func:`data_sources.overpass.build_grouped_ring_query`
-    会退化成普通 ``around`` 单圆查询(当前四个分段下限都 > 0,这一支只是留作兼容)。
+    返回 ``0.0`` 表示"没有内圈可减",:func:`services.place_loader.default_fetcher`
+    会退化成普通 ``place/around`` 单圆查询(当前四个分段下限都 > 0,这一支只是留作兼容)。
     """
     return float(band["low"]) * 1000.0
 

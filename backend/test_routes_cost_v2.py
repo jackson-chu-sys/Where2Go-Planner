@@ -1,13 +1,14 @@
 """TASK-6d 单测:**费用引擎 v2**(驾车构成明细 + 整车/人均、铁路分档 + 种子价、机票公布价区间)。
 
 全程离线、全 mock(与 :mod:`backend.test_routes` 一个套路):``no_network`` 把
-:meth:`requests.Session.request` 换成直接抛错,任何偷偷联网都会当场失败;OSRM 两层都有替身
-(服务层注入 ``router=``,数据源层用 :class:`FakeSession` 断言请求参数与 steps 解析)。
+:meth:`requests.Session.request` 换成直接抛错,任何偷偷联网都会当场失败;驾车在服务层
+注入 ``router=`` 替身(TASK-9c 起真实实现是 :func:`data_sources.amap.driving`,
+其请求/解析用例见 :mod:`backend.test_amap` 与 :mod:`backend.test_amap_geocode_driving`)。
 
 覆盖任务契约逐条:
 
 * 杭州 → 崇儒乡 驾车给出 ``per_person_cny`` 与 ``cost_breakdown``,且 ``toll_mode`` 的
-  两条路径(``osrm_refs`` 拿到 steps/ref、``heuristic`` 拿不到)都测;
+  两条路径(``amap_toll_distance`` 拿到高德 ``toll_distance``、``heuristic`` 拿不到)都测;
 * 上海 → 北京 铁路命中种子价 **553**、``price_source="seed"``;未命中走分档费率
   (双高铁枢纽 0.46、其余 0.31 元/km,运营里程 = 直线 × 1.15)并标 ``"estimate"``;
 * 直线 <400km 的城市对**不出机票价**;任一端没有民航机场的城市对也不出机票价
@@ -34,12 +35,11 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 from app.api import routes as routes_api  # noqa: E402
-from data_sources import osrm  # noqa: E402
-from data_sources.overpass import EARTH_RADIUS_KM  # noqa: E402
+from data_sources import EARTH_RADIUS_KM  # noqa: E402
 from services import routes as route_service  # noqa: E402
 
 # --------------------------------------------------------------------------- #
-# 样本坐标与 OSRM 替身数据
+# 样本坐标与驾车替身数据
 # --------------------------------------------------------------------------- #
 
 SHANGHAI = {"lat": 31.2304, "lng": 121.4737, "name": "上海"}
@@ -47,37 +47,19 @@ HANGZHOU = {"lat": 30.2741, "lng": 120.1551, "name": "杭州"}
 CHONGRU = {"lat": 26.9536, "lng": 119.9021, "name": "崇儒乡"}   # 霞浦县崇儒畲族乡:无机场、非枢纽
 DEG_PER_KM = 180.0 / (math.pi * EARTH_RADIUS_KM)
 
-# 杭州 → 崇儒乡 的 OSRM leg:带 steps/ref(高速 G15 + 省道 S203,其余段没有编号)
-CHONGRU_STEPS = [
-    {"distance_km": 12.4, "ref": None},
-    {"distance_km": 386.2, "ref": "G15"},
-    {"distance_km": 41.0, "ref": "S203"},
-    {"distance_km": 13.0, "ref": None},
-]
+# 杭州 → 崇儒乡 的高德 leg:``toll_distance`` 427.2km(G15 + S203 收费路段),
+# 里程/时长是高德真实值(米/秒在 :func:`services.routes.amap_leg` 里换成 km/分钟)。
+CHONGRU_TOLL_KM = 427.2
 CHONGRU_LEG = {
     "distance_km": 452.6,
     "duration_min": 331.4,
     "geometry": [[30.2741, 120.1551], [28.6, 120.0], [26.9536, 119.9021]],
-    "steps": CHONGRU_STEPS,
+    "toll_distance_km": CHONGRU_TOLL_KM,
 }
-PLAIN_LEG = {  # 没有 steps 的 leg(公共实例/替身常见)→ 过路费只能走启发式
+PLAIN_LEG = {  # 没有 toll_distance 的 leg(替身/字段缺失)→ 过路费只能走启发式
     "distance_km": 452.6,
     "duration_min": 331.4,
     "geometry": [[30.2741, 120.1551], [26.9536, 119.9021]],
-}
-
-OSRM_WITH_STEPS = {
-    "code": "Ok",
-    "routes": [{
-        "distance": 122376.1,
-        "duration": 5638.8,
-        "legs": [{"steps": [
-            {"distance": 60000.0, "ref": "G60"},
-            {"distance": 12500.0, "ref": "S328"},
-            {"distance": 49876.1, "name": "某市区道路"},          # 没有 ref
-            {"distance": 0.0, "ref": "G2"},                       # 0 长度段也算命中
-        ]}],
-    }],
 }
 
 
@@ -89,7 +71,7 @@ def point_north(km: float, *, lat: float = SHANGHAI["lat"], lng: float = SHANGHA
 
 def plan_between(origin: dict[str, Any], dest: dict[str, Any], *,
                  leg: Optional[dict[str, Any]] = None, **kwargs: Any):
-    """两点之间规划路线(OSRM 用替身 leg,不触网)。"""
+    """两点之间规划路线(驾车用替身 leg,不触网)。"""
     return route_service.plan_routes(
         from_lat=origin["lat"], from_lng=origin["lng"],
         to_lat=dest["lat"], to_lng=dest["lng"],
@@ -124,7 +106,7 @@ def only(plan: Any, mode: str) -> dict[str, Any]:
 
 
 class FakeRouter:
-    """OSRM 替身:返回预设 leg(可带 ``steps``)或抛预设异常。"""
+    """驾车路由替身:返回预设 leg(可带 ``toll_distance_km``)或抛预设异常。"""
 
     def __init__(self, leg: Optional[dict[str, Any]] = None,
                  error: Optional[BaseException] = None) -> None:
@@ -137,29 +119,6 @@ class FakeRouter:
         if self.error is not None:
             raise self.error
         return dict(self.leg)
-
-
-class FakeResponse:
-    def __init__(self, payload: Any, *, status_code: int = 200) -> None:
-        self.status_code = status_code
-        self.text = json.dumps(payload, ensure_ascii=False)
-
-
-class FakeSession:
-    """记录请求参数并返回预设响应的 session 替身(不触网)。"""
-
-    def __init__(self, payload: Any) -> None:
-        self.payload = payload
-        self.calls: list[dict[str, Any]] = []
-
-    def request(self, method: str, url: str, params: Optional[dict[str, Any]] = None,
-                **kwargs: Any) -> FakeResponse:
-        self.calls.append({"method": method, "url": url, "params": params})
-        return FakeResponse(self.payload)
-
-    @property
-    def last_params(self) -> dict[str, Any]:
-        return self.calls[-1]["params"] or {}
 
 
 @pytest.fixture(autouse=True)
@@ -179,57 +138,67 @@ def default_fuel_price(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 1. 驾车:高速里程两条路径(osrm_refs / heuristic)+ 区域费率 + 油价
+# 1. 驾车:收费里程两条路径(amap_toll_distance / heuristic)+ 区域费率 + 油价
 # --------------------------------------------------------------------------- #
 
 
-def test_driving_toll_uses_osrm_refs_when_steps_present() -> None:
-    """拿到 steps 的高速段(G15 + S203)→ 过路费按实际高速里程算,mode=osrm_refs。"""
-    money = route_service.driving_money(452.6, steps=CHONGRU_STEPS, region="east")
+def test_driving_toll_uses_amap_toll_distance_when_present() -> None:
+    """拿到高德 ``toll_distance`` → 过路费按真实收费里程算,mode=amap_toll_distance。"""
+    money = route_service.driving_money(452.6, toll_distance_km=CHONGRU_TOLL_KM, region="east")
 
-    assert money["cost_breakdown"]["mode"] == route_service.TOLL_MODE_OSRM_REFS
-    assert money["highway_km"] == pytest.approx(427.2), "只算 ref 以 G/S 开头的段"
+    assert money["cost_breakdown"]["mode"] == route_service.TOLL_MODE_AMAP_TOLL_DISTANCE
+    assert money["toll_km"] == pytest.approx(427.2), "收费里程就是高德给的 toll_distance"
     assert money["cost_breakdown"]["toll"] == 192, "427.2km × 0.45 = 192.24 → 192"
     assert money["cost_breakdown"]["fuel"] == 290, "452.6km × 0.08L/km × 8 元/L = 289.66 → 290"
     assert money["cost_cny"] == 482 == 192 + 290
     assert money["per_person_cny"] == 121, "482 ÷ 4 = 120.5 → 四舍五入 121(半进位)"
 
 
-def test_driving_toll_falls_back_to_heuristic_without_steps() -> None:
-    """拿不到 steps → 高速里程按 总里程 × 0.55 估,mode=heuristic。"""
+def test_driving_toll_falls_back_to_heuristic_without_toll_distance() -> None:
+    """拿不到 ``toll_distance`` → 收费里程按 总里程 × 0.55 估,mode=heuristic。"""
     money = route_service.driving_money(452.6, region="east")
 
     assert money["cost_breakdown"]["mode"] == route_service.TOLL_MODE_HEURISTIC
-    assert money["highway_km"] == pytest.approx(452.6 * 0.55)
+    assert money["toll_km"] == pytest.approx(452.6 * 0.55)
     assert money["cost_breakdown"]["toll"] == 112, "248.93km × 0.45 = 112.02 → 112"
     assert money["cost_breakdown"]["fuel"] == 290
     assert money["cost_cny"] == 402 and money["per_person_cny"] == 101
 
 
-def test_driving_toll_falls_back_when_steps_carry_no_highway_ref() -> None:
-    """有 steps 但一段 G/S 编号都没有 → 仍按启发式(国内 ref 覆盖稀疏,不能当成"没上高速")。"""
-    city_steps = [{"distance_km": 30.0, "ref": None}, {"distance_km": 20.0, "name": "市区道路"}]
-    money = route_service.driving_money(50.0, steps=city_steps, region="east")
+def test_driving_toll_zero_toll_distance_means_no_toll_road() -> None:
+    """高德给了 ``toll_distance=0``(全程无收费路段)→ 过路费 0,但**仍标真实口径**。
+
+    与"字段缺失"必须区分开:缺失才退化启发式,否则市区短途会被凭空估出 55% 高速费。
+    """
+    money = route_service.driving_money(50.0, toll_distance_km=0.0, region="east")
+
+    assert money["cost_breakdown"] == {"toll": 0, "fuel": 32, "mode": "amap_toll_distance"}
+    assert money["toll_km"] == 0.0 and money["cost_cny"] == 32
+
+
+@pytest.mark.parametrize("junk", [None, -1.0, "427.2", {}, [], True])
+def test_driving_toll_ignores_bad_toll_distance(junk: Any) -> None:
+    """``toll_distance`` 非法(负数/字符串/布尔/容器)→ 当"拿不到",退化启发式而不是崩。"""
+    money = route_service.driving_money(50.0, toll_distance_km=junk, region="east")
 
     assert money["cost_breakdown"]["mode"] == route_service.TOLL_MODE_HEURISTIC
-    assert money["highway_km"] == pytest.approx(27.5)
-    assert route_service.highway_km_from_steps(city_steps) is None
+    assert money["toll_km"] == pytest.approx(27.5)
 
 
-def test_highway_km_from_steps_only_counts_g_and_s_refs() -> None:
-    steps = [
-        {"distance_km": 10.0, "ref": "G4"},        # 高速 ✓
-        {"distance_km": 5.5, "ref": "S101"},       # 省道 ✓
-        {"distance_km": 3.0, "ref": " g15 "},      # 大小写/空白都认 ✓
-        {"distance_km": 7.0, "ref": "X009"},       # 县道 ✗
-        {"distance_km": 4.0, "ref": None},         # 无编号 ✗
-        {"distance_km": "9", "ref": "G6"},         # 距离非数字 → 跳过
-        {"distance_km": -2.0, "ref": "G6"},        # 负距离 → 跳过
-        "垃圾数据",                                  # 非 dict → 跳过
-    ]
-    assert route_service.highway_km_from_steps(steps) == pytest.approx(18.5)
-    for empty in (None, [], (), "G15", {}):
-        assert route_service.highway_km_from_steps(empty) is None, f"{empty!r} 应视为拿不到"
+def test_driving_toll_clamps_toll_distance_to_total_km() -> None:
+    """收费里程不该超过总里程(高德偶有重复计数)→ 夹到总里程。"""
+    money = route_service.driving_money(50.0, toll_distance_km=999.0, region="east")
+
+    assert money["toll_km"] == pytest.approx(50.0)
+    assert money["cost_breakdown"]["mode"] == route_service.TOLL_MODE_AMAP_TOLL_DISTANCE
+    assert money["cost_breakdown"]["toll"] == 23, "50km × 0.45 = 22.5 → 半进位 23"
+
+
+def test_resolve_toll_km_reports_mode_alongside_value() -> None:
+    assert route_service.resolve_toll_km(100.0, 60.0) == (60.0, "amap_toll_distance")
+    km, mode = route_service.resolve_toll_km(100.0, None)
+    assert km == pytest.approx(55.0) and mode == "heuristic"
+    assert route_service.resolve_toll_km(-100.0, None) == (0.0, "heuristic"), "负里程按 0 处理"
 
 
 def test_driving_region_rates_are_east_central_west() -> None:
@@ -269,31 +238,31 @@ def test_driving_fuel_price_reads_env_and_ignores_junk(monkeypatch: pytest.Monke
 
 
 def test_hangzhou_to_chongru_driving_reports_breakdown_and_per_person() -> None:
-    """契约样例:杭州 → 崇儒乡 驾车给出 cost_breakdown(osrm_refs 路径)+ 人均。"""
+    """契约样例:杭州 → 崇儒乡 驾车给出 cost_breakdown(amap_toll_distance 路径)+ 人均。"""
     plan = plan_between(HANGZHOU, CHONGRU, leg=CHONGRU_LEG)
     driving = only(plan, "driving")
 
     assert driving["kind"] == "real" and driving["degraded"] is False
     assert driving["vehicle_label"] == "整车≤4人"
     assert set(driving["cost_breakdown"]) == {"toll", "fuel", "mode"}
-    assert driving["cost_breakdown"]["mode"] == "osrm_refs"
+    assert driving["cost_breakdown"]["mode"] == "amap_toll_distance"
     assert driving["cost_cny"] == 482
     assert driving["cost_breakdown"]["toll"] + driving["cost_breakdown"]["fuel"] == driving["cost_cny"]
     assert driving["per_person_cny"] == 121
     assert driving["duration_min"] == 331 and driving["distance_km"] == 452.6
-    assert "cost_breakdown.mode=osrm_refs" in driving["note"], "note 要写清本次走的是哪条口径"
+    assert "cost_breakdown.mode=amap_toll_distance" in driving["note"], "note 要写清本次走的是哪条口径"
     assert "人均" in driving["note"] and route_service.ESTIMATE_DISCLAIMER in driving["note"]
 
 
 def test_hangzhou_to_chongru_driving_heuristic_path() -> None:
-    """同一条线路拿不到 steps → 退化启发式,金额变化但字段/口径标注照样齐。"""
+    """同一条线路拿不到 toll_distance → 退化启发式,金额变化但字段/口径标注照样齐。"""
     plan = plan_between(HANGZHOU, CHONGRU, leg=PLAIN_LEG)
     driving = only(plan, "driving")
 
     assert driving["cost_breakdown"] == {"toll": 112, "fuel": 290, "mode": "heuristic"}
     assert driving["cost_cny"] == 402 and driving["per_person_cny"] == 101
     assert driving["vehicle_label"] == "整车≤4人"
-    assert "heuristic" in driving["note"] and "高速" in driving["note"]
+    assert "heuristic" in driving["note"] and "收费里程" in driving["note"]
 
 
 def test_driving_degraded_gives_no_money_but_keeps_label() -> None:
@@ -302,7 +271,7 @@ def test_driving_degraded_gives_no_money_but_keeps_label() -> None:
     plan = plan_between(HANGZHOU, CHONGRU,
                         leg=None)  # 占位,下面用抛错的替身覆盖
     del plan
-    router = FakeRouter(error=DataSourceError("OSRM", "所有端点均不可用"))
+    router = FakeRouter(error=DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)"))
     degraded = route_service.plan_routes(
         from_lat=HANGZHOU["lat"], from_lng=HANGZHOU["lng"],
         to_lat=CHONGRU["lat"], to_lng=CHONGRU["lng"],
@@ -315,45 +284,6 @@ def test_driving_degraded_gives_no_money_but_keeps_label() -> None:
     assert driving["per_person_cny"] is None
     assert driving["vehicle_label"] == "整车≤4人"
     assert driving["links"], "降级也要能跳转导航"
-
-
-def test_osrm_client_asks_steps_only_when_requested() -> None:
-    session = FakeSession(OSRM_WITH_STEPS)
-    result = osrm.OsrmClient(session=session).route(
-        (120.1551, 30.2741), (119.9021, 26.9536), with_steps=True
-    )
-
-    assert session.last_params["steps"] == "true"
-    assert result["steps"] == [
-        {"distance_km": 60.0, "ref": "G60"},
-        {"distance_km": 12.5, "ref": "S328"},
-        {"distance_km": 49.876, "ref": None},
-        {"distance_km": 0.0, "ref": "G2"},
-    ]
-    assert result["distance_km"] == 122.376 and result["duration_min"] == 94.0
-
-
-def test_osrm_default_call_keeps_steps_off_and_shape_unchanged() -> None:
-    """默认(以及只开 geometry)仍是 steps=false、不带 steps 键 —— 既有调用方零影响。"""
-    session = FakeSession(OSRM_WITH_STEPS)
-    result = osrm.OsrmClient(session=session).route((120.1551, 30.2741), (119.9021, 26.9536))
-
-    assert session.last_params["steps"] == "false"
-    assert set(result) == {"distance_km", "duration_min"}, "默认返回形状不能变"
-
-    with_geometry = osrm.OsrmClient(session=FakeSession(OSRM_WITH_STEPS)).route(
-        (120.1551, 30.2741), (119.9021, 26.9536), with_geometry=True
-    )
-    assert "steps" not in with_geometry
-
-
-def test_osrm_parse_steps_survives_malformed_payload() -> None:
-    assert osrm.parse_steps(None) == [] and osrm.parse_steps("legs") == []
-    assert osrm.parse_steps([{"steps": "不是列表"}]) == []
-    assert osrm.parse_steps([{"steps": [{"ref": "G2"}, {"distance": "12"}, {"distance": -5, "ref": "G2"}]}]) == []
-    assert osrm.parse_steps([{"steps": [{"distance": 1500, "ref": "  G60  "}]}]) == [
-        {"distance_km": 1.5, "ref": "G60"}
-    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -601,7 +531,7 @@ def test_api_payload_carries_v2_fields_and_stays_serializable(
     )
     driving = payload["routes"][0]
 
-    assert driving["cost_breakdown"] == {"toll": 192, "fuel": 290, "mode": "osrm_refs"}
+    assert driving["cost_breakdown"] == {"toll": 192, "fuel": 290, "mode": "amap_toll_distance"}
     assert driving["vehicle_label"] == "整车≤4人" and driving["per_person_cny"] == 121
     assert payload["routes"][1]["price_source"] == "estimate"
     assert payload["mode_rules"]["flight_min_km"] == 600.0
@@ -623,7 +553,7 @@ def test_api_note_documents_v2_cost_rules(monkeypatch: pytest.MonkeyPatch) -> No
         to_name="北京", from_name="上海",
     )
     note = payload["note"]
-    for fragment in ("cost_breakdown", "osrm_refs", "heuristic", "整车≤4人", "per_person_cny",
+    for fragment in ("cost_breakdown", "amap_toll_distance", "heuristic", "整车≤4人", "per_person_cny",
                      "price_source", "seed", "flight_low_cny", "flight_high_cny",
                      "动态定价·浮动大·实时价以跳转为准", "600km", "400km",
                      route_service.ESTIMATE_DISCLAIMER):

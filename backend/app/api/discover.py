@@ -2,8 +2,13 @@
 
 阶段0 POC 路由,阶段1 保留不动;TASK-1b 只修一处**已知缺陷**:原先按 OSM 原始 tag
 把结果二分成"自然风光/旅游景点",同一地物两个 tag 并存时在两类里重复出现。现在结果
-先过 :func:`services.classify.categorize`(四分类优先级,一地只归一类),只在其真正
+先过 :func:`services.classify.amap_category`(四分类优先级,一地只归一类),只在其真正
 所属的分类下返回,响应形状与字段不变。地图模式的四分类走 ``/api/places``。
+
+TASK-9c:数据源随全仓切**高德**(Overpass / OSRM 已物理删除)——POI 检索走
+``place/around``(下限 0)或包围盒分格 ``place/polygon``(下限 > 0,高德单查询
+``radius`` 被截断在 50km),驾车走 ``direction/driving``,地理编码走主链
+(高德 → Photon → Nominatim)。**响应键名、阈值与 600s 缓存口径一律不变**。
 """
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
@@ -11,22 +16,20 @@ import time
 from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from data_sources import (
-    DataSourceError,
-    geocode as ds_geocode,
-    haversine_km,
-    nearby_places as ds_nearby,
-    route as ds_route,
-)
+from data_sources import DataSourceError, amap, haversine_km
+from services import place_loader
 from services.bands import DISTANCE_BANDS as BANDS
-from services.classify import CATEGORY_CULTURE, CATEGORY_NATURE, categorize
+from services.classify import CATEGORY_CULTURE, CATEGORY_NATURE, amap_category
 
 router = APIRouter()
 
+# 高德检索线索(§1.4 实测 typecode):``110000`` 风景名胜(公园/广场/旅游景点)、
+# ``050000`` 餐饮服务。两类**共用** 110000 粗筛,再靠 :func:`amap_category` 按四分类
+# 优先级把每条 POI 只归一类(与 TASK-1b 修掉的"一地物两类重复"同一口径)。
 CATEGORIES: dict[str, dict[str, Any]] = {
-    "自然风光": {"tags": [{"natural": "peak"}, {"natural": "waterfall"}], "element_types": "node",
+    "自然风光": {"types": ("110000",), "keywords": None,
               "label": "山峰 / 瀑布", "canonical": CATEGORY_NATURE},
-    "旅游景点": {"tags": [{"tourism": "attraction"}, {"tourism": "viewpoint"}], "element_types": "nwr",
+    "旅游景点": {"types": ("110000", "050000"), "keywords": None,
               "label": "景点 / 观景点", "canonical": CATEGORY_CULTURE},
 }
 
@@ -34,6 +37,10 @@ CATEGORIES: dict[str, dict[str, Any]] = {
 DISTANCE_BANDS: list[dict[str, Any]] = BANDS
 FETCH_LIMIT = 400
 SHOW_TOP = 8
+# POC 路由不做渐进扩格:分格数封顶 4×4(每格是一次 0.6s 节流的请求),格子按"离起点最近"
+# 优先(:func:`place_loader.ring_cells` 已排序),够 POC 展示用量即可。
+POC_GRID_SIDE = 4
+POC_MAX_CELLS = POC_GRID_SIDE ** 2
 
 # 交通方式估算阈值(km,按 POI 直线距离)与经验系数 —— 无真实班次源,纯估算
 RAIL_MIN_KM = 100.0   # >= 触发铁路估算
@@ -81,23 +88,45 @@ def categories():
             "bands": DISTANCE_BANDS}
 
 
+def ds_geocode(city: str) -> dict[str, Any]:
+    """POC 口径的城市地理编码:走**主链**(高德 → Photon → Nominatim)。
+
+    返回形状与旧 Nominatim 单源版一致(``{lat, lng, display_name}``),所以调用方零改动;
+    三腿全失败抛 :class:`DataSourceError`,由 ``/api/discover`` 转成 502 中文报错。
+    """
+    geo, _geocoder = place_loader.geocode_with_fallback(city)
+    return dict(geo)
+
+
+def ds_nearby(lat: float, lng: float, band: dict, cat: dict, *, limit: int = FETCH_LIMIT) -> list[dict[str, Any]]:
+    """高德 POI 检索(POC 口径):下限 0 → ``place/around`` 单圆;下限 > 0 → 分格 ``place/polygon``。
+
+    复用 :mod:`services.place_loader` 的分格工具(高德单查询 200 条上限、``radius`` 钳 50km、
+    环带 haversine 收敛都在里面),所以 ``50_100`` 这类外环照样取得到数据。
+    """
+    group = {"group": cat["label"], "budget": int(limit),
+             "types": tuple(cat.get("types") or ()), "keywords": cat.get("keywords")}
+    if float(band["low"]) <= 0:
+        return place_loader.fetch_group_around(lat, lng, float(band["high"]) * 1000.0, group)
+    cells = place_loader.ring_cells(lat, lng, band, side=POC_GRID_SIDE)[:POC_MAX_CELLS]
+    return place_loader.fetch_group_polygon(cells, lat, lng, band, group)
+
+
 def _find_places(origin: dict, band: dict, cat: dict) -> list[dict[str, Any]]:
     ck = (origin.get("city", ""), band["key"], cat["label"])
     cached = _cache.get(ck)
     now = time.time()
     if cached and (now - cached[1]) < CACHE_TTL_S:
         return cached[0]
-    upper_m = band["high"] * 1000.0
-    raw = ds_nearby(origin["lat"], origin["lng"], upper_m,
-                    cat["tags"], limit=FETCH_LIMIT, require_name=True,
-                    element_types=cat["element_types"])
+    raw = ds_nearby(origin["lat"], origin["lng"], band, cat, limit=FETCH_LIMIT)
     low, high = band["low"], band["high"]
     filtered = []
     for p in raw:
-        # 修复 POC 的"自然风光/旅游景点"重复:POC 直接拿 OSM tag 当分类,同一地物
-        # 同时带 natural=peak 与 tourism=attraction 就会在两类各出现一次。这里用
-        # 四分类引擎(优先级 + 一地只归一类)判定它**真正**属于哪类,只在该类下返回。
-        if categorize(p.get("tags")) != cat.get("canonical"):
+        # 修复 POC 的"自然风光/旅游景点"重复:POC 直接拿检索线索当分类,同一地物
+        # 同时带 natural=peak 与 tourism=attraction(高德侧则是同一条 POI 被两组 typecode
+        # 命中)就会在两类各出现一次。这里用四分类引擎(优先级 + 一地只归一类)判定它
+        # **真正**属于哪类,只在该类下返回。
+        if amap_category(p) != cat.get("canonical"):
             continue
         d = haversine_km(origin["lat"], origin["lng"], p["lat"], p["lng"])
         if low <= d < high:
@@ -109,18 +138,20 @@ def _find_places(origin: dict, band: dict, cat: dict) -> list[dict[str, Any]]:
 
 
 def _driving_route(origin: dict, p: dict) -> dict[str, Any]:
+    """高德驾车真实时长/里程(米/秒 → 分钟/公里);失败**不抛**,照实标"获取失败"。"""
     try:
-        leg = ds_route((origin["lng"], origin["lat"]), (p["lng"], p["lat"]))
+        leg = amap.driving(origin["lat"], origin["lng"], p["lat"], p["lng"])
         return {"mode": "driving", "label": "驾车",
-                "duration_min": round(leg["duration_min"]), "distance_km": round(leg["distance_km"]),
-                "note": "OSRM 免费估算(非实时路况)"}
-    except (DataSourceError, ValueError):
+                "duration_min": round(float(leg["duration_s"]) / 60.0),
+                "distance_km": round(float(leg["distance_m"]) / 1000.0),
+                "note": "高德真实路网(非实时路况)"}
+    except (DataSourceError, ValueError, KeyError, TypeError):
         return {"mode": "driving", "label": "驾车", "duration_min": None,
                 "distance_km": None, "note": "驾车路线获取失败"}
 
 
 def _enrich_modes(origin: dict, places: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """给每个目的地生成交通方式列表:驾车(始终,并行 OSRM) + 铁路/飞机(估算,按阈值)。"""
+    """给每个目的地生成交通方式列表:驾车(始终,并行打高德) + 铁路/飞机(估算,按阈值)。"""
     shown = places[:SHOW_TOP]
     result: list[dict[str, Any]] = []
 
@@ -172,5 +203,6 @@ def discover(req: DiscoverReq):
         "results": enriched, "total_found": len(places),
         "elapsed_s": round(time.monotonic() - started, 1),
         "mode_rules": {"rail_min_km": RAIL_MIN_KM, "flight_min_km": FLIGHT_MIN_KM},
-        "note": "驾车为 OSRM 估算;铁路/飞机为经验估算(无实时班次);距离为环形分段,不含城市内部。",
+        "note": "驾车为高德真实路网(非实时路况);铁路/飞机为经验估算(无实时班次);"
+                "距离为环形分段,不含城市内部。",
     }

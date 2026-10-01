@@ -5,7 +5,7 @@
 1. 查 ``SegmentFetch`` 水位 —— 有记录说明该 (城市, band) 已入库 →
    直接 :func:`db.repository.list_places` 读库返回,**不发任何网络请求**
    (读库路径也不会调 LLM,保证"二次查询秒出");
-2. 没记录 → 解析起点(Photon 主 + Nominatim 降级;TASK-9c 起主链路走高德)→ 按分段
+2. 没记录 → 解析起点(高德主 + Photon/Nominatim 降级)→ 按分段
    **分组打高德 v3 检索**(:data:`SEARCH_GROUPS` = 高德 typecode/keywords 组,每组独立配额,
    见 :mod:`services.amap_categories`):分段下限 = 0 走 ``place/around`` 单圆;下限 > 0 走
    「外半径包围盒 :func:`data_sources.amap.grid_polygons` 分格 + 逐格 ``place/polygon``」,
@@ -30,10 +30,12 @@
 由 :func:`resolve_reverse_origin` 用**逆**地理编码反查城市;反查失败不报错,
 降级成"我的位置(纬度,经度)"这样的坐标起点,地图照样能用。
 
-地理编码是**降级链**(TASK-6a):Photon 公共实例直连可用且快(实测 1.1s),作主路径;
-Nominatim 在没有代理的产品环境直连不通(实测 15s 超时),只作兜底。两条链见
-:func:`geocode_with_fallback` 与 :func:`reverse_with_fallback`,谁答的会以 ``geocoder``
-字段一路报到 API 响应,方便排查"这次是哪个源在兜底"。
+地理编码是**三腿降级链**(TASK-9c 起):**高德**作主路径(与 POI/瓦片同一坐标系 GCJ-02,
+国内直连 0.1~0.2s);Photon 公共实例直连可用且快(实测 1.1s),作第一降级(高德没配 key /
+超配额时顶上);Nominatim 在没有代理的产品环境直连不通(实测 15s 超时),只作末腿兜底。
+两条链见 :func:`geocode_with_fallback` 与 :func:`reverse_with_fallback`,谁答的会以
+``geocoder``(``amap`` / ``photon`` / ``nominatim``)字段一路报到 API 响应,方便排查
+"这次是哪个源在兜底";:class:`db.models.OriginCache` 会把结果缓存 7 天省配额。
 
 分类过滤只作用在**读取**阶段:一次抓取入库的数据覆盖全部分类,所以换分类查询
 同样命中库、不触网。网络调用全部可注入(``fetcher`` / ``geocoder`` / ``reverse_geocoder``),
@@ -57,6 +59,9 @@ from data_sources import amap
 from data_sources import geocode as ds_geocode
 from data_sources import haversine_km
 from data_sources import reverse as ds_reverse
+from data_sources.amap import SOURCE_NAME as AMAP_DS_SOURCE
+from data_sources.amap import geocode as ds_amap_geocode
+from data_sources.amap import reverse_geocode as ds_amap_reverse
 from data_sources.nominatim import SOURCE_NAME as NOMINATIM_SOURCE
 from data_sources.photon import SOURCE_NAME as PHOTON_SOURCE
 from data_sources.photon import geocode as ds_photon_geocode
@@ -131,11 +136,16 @@ UNNAMED_COORD_PRECISION = 2
 # 正向检索时向 Photon 要几条候选(只用最相关的第一条,其余留作日志排查)
 PHOTON_LIMIT = 5
 # ``geocoder`` 字段的取值:谁答的就是谁;给了坐标/反查失败时没有地理编码源参与 = "none"
+GEOCODER_AMAP = "amap"
 GEOCODER_PHOTON = "photon"
 GEOCODER_NOMINATIM = "nominatim"
 GEOCODER_NONE = "none"
-# 双失败时报错的数据源名(两个源都写进消息,便于运维判断是全站断网还是单源挂了)
-GEOCODER_CHAIN_SOURCE = f"{PHOTON_SOURCE}/{NOMINATIM_SOURCE}"
+# 全链失败时报错的数据源名(三个源都写进消息,便于运维判断是全站断网还是单源挂了)
+GEOCODER_CHAIN_SOURCE = f"{AMAP_DS_SOURCE}/{PHOTON_SOURCE}/{NOMINATIM_SOURCE}"
+# 高德地理编码结果拼 ``display_name`` 用的行政区字段(**由细到粗**,与 Photon/Nominatim
+# 的 "区, 市, 省" 顺序对齐):高德的 ``formatted_address`` 是不带逗号的一整串,
+# :func:`city_from_display_name` 挑不出城市名,所以逆地理必须用这几个字段自己拼。
+AMAP_DISPLAY_KEYS: tuple[str, ...] = ("township", "district", "city", "province")
 # display_name 里判定城市的后缀(Nominatim 中文结果形如 "浦东新区, 上海市, 中国")
 CITY_SUFFIXES = ("市", "州", "地区", "盟")
 COUNTRY_TOKENS = frozenset({"中国", "中华人民共和国", "china"})
@@ -173,6 +183,62 @@ def _failure_text(exc: BaseException) -> str:
     return " ".join(str(text).split())
 
 
+def amap_display_name(row: Mapping[str, Any], *, reverse: bool = False) -> str:
+    """高德地理编码结果 → 与 Photon/Nominatim 同形状的 ``display_name``。
+
+    * 正向(``reverse=False``)优先用 ``formatted_address``(信息最全:"浙江省杭州市西湖区
+      西湖风景名胜区"),行政区字段只作兜底;
+    * 逆向(``reverse=True``)按 :data:`AMAP_DISPLAY_KEYS` **由细到粗**拼成逗号分隔串
+      ("灵隐街道, 西湖区, 杭州市, 浙江省")——:func:`city_from_display_name` 要靠逗号切分
+      才能挑出"杭州市",直接用不带逗号的 ``formatted_address`` 会把整条地址当成城市名。
+
+    空段跳过(直辖市的 ``city`` 高德返回空)、重复段只留一次(省 == 市 的直辖市口径)。
+    """
+    parts: list[str] = []
+    for key in AMAP_DISPLAY_KEYS:
+        token = str(row.get(key) or "").strip()
+        if token and token not in parts:
+            parts.append(token)
+    formatted = str(row.get("formatted_address") or "").strip()
+    if not parts:
+        return formatted
+    return ", ".join(parts) if reverse else (formatted or ", ".join(parts))
+
+
+def amap_geocode(city: str) -> dict[str, Any]:
+    """高德正向地理编码:取最相关的一条,形状对齐 Photon/Nominatim 的 ``{lat,lng,display_name}``。
+
+    **空结果也当失败**(抛 :class:`DataSourceError`),好让降级链接管;未配
+    ``WHERE2GO_AMAP_KEY`` 时 :func:`data_sources.amap.geocode` 自己就抛
+    :class:`DataSourceError`,同样落到 Photon。坐标是 GCJ-02 —— 与高德 POI/瓦片自洽
+    (§1.6,全链不做坐标转换)。
+    """
+    rows = ds_amap_geocode(city)
+    if not rows:
+        raise DataSourceError(AMAP_DS_SOURCE, f"未找到与 {city!r} 匹配的地名(结果为空)")
+    first = dict(rows[0])
+    return {
+        "lat": float(first["lat"]),
+        "lng": float(first["lng"]),
+        "display_name": amap_display_name(first),
+    }
+
+
+def amap_reverse(lat: float, lng: float) -> dict[str, Any]:
+    """高德逆地理编码 → ``{lat, lng, display_name}``;无结果(``{}``)同样当失败降级。"""
+    row = ds_amap_reverse(float(lat), float(lng))
+    if not row:
+        raise DataSourceError(
+            AMAP_DS_SOURCE, f"未反查到 ({float(lat):.6f},{float(lng):.6f}) 的地名(结果为空)"
+        )
+    parsed = dict(row)
+    return {
+        "lat": float(parsed.get("lat") if parsed.get("lat") is not None else lat),
+        "lng": float(parsed.get("lng") if parsed.get("lng") is not None else lng),
+        "display_name": amap_display_name(parsed, reverse=True),
+    }
+
+
 def photon_geocode(city: str) -> dict[str, Any]:
     """Photon 正向地理编码:取最相关的一条;**空结果也当失败**,好让降级链接管。"""
     places = ds_photon_geocode(city, limit=PHOTON_LIMIT)
@@ -182,40 +248,43 @@ def photon_geocode(city: str) -> dict[str, Any]:
 
 
 def geocode_with_fallback(city: str) -> tuple[dict[str, Any], str]:
-    """正向地理编码降级链:**Photon 主 → Nominatim 备**。
+    """正向地理编码降级链:**高德主 → Photon → Nominatim**(TASK-9c)。
 
-    返回 ``({"lat", "lng", "display_name"}, "photon"|"nominatim")``。Photon 抛
-    :class:`DataSourceError`(网络/格式)或**结果为空**都算失败,原样降级到 Nominatim;
-    两个源都失败时抛 :class:`DataSourceError`,消息里同时给出两边的中文原因
+    返回 ``({"lat", "lng", "display_name"}, "amap"|"photon"|"nominatim")``。任一腿抛
+    :class:`DataSourceError`(网络/格式/未配 key)或**结果为空**都算失败,原样降到下一腿;
+    三腿全失败时抛 :class:`DataSourceError`,消息里同时给出三边的中文原因
     (API 层转成 HTTP 400)。
 
-    Photon 那一段刻意用宽 ``except Exception``:它只是"尽力而为的主路径",任何异常
-    (包括单测 ``no_network`` 兜底抛的 ``AssertionError``)都只该让它让位给 Nominatim,
-    而不是把整条起点解析打挂 —— 真正的失败判定交给 Nominatim 那一段。
+    前两腿刻意用宽 ``except Exception``:它们只是"尽力而为的主路径",任何异常
+    (包括单测 ``no_network`` 兜底抛的 ``AssertionError``)都只该让它让位给下一腿,
+    而不是把整条起点解析打挂 —— 真正的失败判定交给末腿 Nominatim。
     """
     cleaned = (city or "").strip()
     if not cleaned:
         raise ValueError("起点城市不能为空")
+    reasons: list[str] = []
     try:
-        geo = photon_geocode(cleaned)
+        return amap_geocode(cleaned), GEOCODER_AMAP
     except Exception as exc:  # noqa: BLE001 - 主路径失败只降级,不上抛(见 docstring)
-        photon_reason = _failure_text(exc)
-    else:
-        return geo, GEOCODER_PHOTON
+        reasons.append(f"{AMAP_DS_SOURCE}={_failure_text(exc)}")
+    try:
+        return photon_geocode(cleaned), GEOCODER_PHOTON
+    except Exception as exc:  # noqa: BLE001 - 同上:降级链中间腿只让位,不上抛
+        reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
     try:
         return dict(ds_geocode(cleaned)), GEOCODER_NOMINATIM
     except DataSourceError as exc:
+        reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
         raise DataSourceError(
             GEOCODER_CHAIN_SOURCE,
-            f"两个地理编码源都失败,无法解析 {cleaned!r}:"
-            f"{PHOTON_SOURCE}={photon_reason};{NOMINATIM_SOURCE}={_failure_text(exc)}",
+            f"三个地理编码源都失败,无法解析 {cleaned!r}:" + ";".join(reasons),
         ) from exc
 
 
 def default_geocoder(city: str) -> dict[str, Any]:
     """起点解析的默认实现:城市名 → ``{city, name, lat, lng, geocoder}``。
 
-    走 :func:`geocode_with_fallback`(Photon 主 + Nominatim 降级);``geocoder`` 只是
+    走 :func:`geocode_with_fallback`(高德主 + Photon/Nominatim 降级);``geocoder`` 只是
     给 API 层标注"谁答的",:func:`resolve_origin` 会把它摘掉,origin 形状不变。
     """
     geo, geocoder = geocode_with_fallback(city)
@@ -249,7 +318,7 @@ def resolve_origin_with_source(
 ) -> tuple[dict[str, Any], str]:
     """同 :func:`resolve_origin`,另外回报这次是哪个地理编码源答的。
 
-    ``geocoder``(``"photon"|"nominatim"|"none"``)只作为**第二个返回值**给 API 用,
+    ``geocoder``(``"amap"|"photon"|"nominatim"|"none"``)只作为**第二个返回值**给 API 用,
     不进 origin 字典 —— origin 的 city/name/lat/lng 四字段是前端与既有单测认定的唯一形状。
     调用方直接给了坐标时没有源参与,报 ``"none"``。
     """
@@ -281,31 +350,35 @@ def reverse_with_fallback(
     *,
     zoom: int = REVERSE_ZOOM,
 ) -> tuple[dict[str, Any], str]:
-    """逆地理编码降级链:**Photon 主 → Nominatim 备**。
+    """逆地理编码降级链:**高德主 → Photon → Nominatim**(TASK-9c)。
 
-    返回 ``({"lat", "lng", "display_name"}, "photon"|"nominatim")``。``zoom`` 只有
-    Nominatim 用得上(Photon 的 reverse 固定返回最近地点,不收 zoom);宽 ``except``
-    的理由同 :func:`geocode_with_fallback`。两个源都失败时抛 :class:`DataSourceError`,
+    返回 ``({"lat", "lng", "display_name"}, "amap"|"photon"|"nominatim")``。``zoom`` 只有
+    Nominatim 用得上(高德与 Photon 的 reverse 固定返回最近地点,不收 zoom);宽 ``except``
+    的理由同 :func:`geocode_with_fallback`。三腿全失败时抛 :class:`DataSourceError`,
     由 :func:`resolve_reverse_origin` 兜成坐标起点(**不是** HTTP 错误)。
     """
+    reasons: list[str] = []
     try:
-        geo = dict(ds_photon_reverse(float(lat), float(lng)))
+        return amap_reverse(float(lat), float(lng)), GEOCODER_AMAP
     except Exception as exc:  # noqa: BLE001 - 主路径失败只降级,不上抛(见 geocode_with_fallback)
-        photon_reason = _failure_text(exc)
-    else:
-        return geo, GEOCODER_PHOTON
+        reasons.append(f"{AMAP_DS_SOURCE}={_failure_text(exc)}")
+    try:
+        return dict(ds_photon_reverse(float(lat), float(lng))), GEOCODER_PHOTON
+    except Exception as exc:  # noqa: BLE001 - 同上:降级链中间腿只让位,不上抛
+        reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
     try:
         return dict(ds_reverse(float(lat), float(lng), zoom=int(zoom))), GEOCODER_NOMINATIM
     except DataSourceError as exc:
+        reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
         raise DataSourceError(
             GEOCODER_CHAIN_SOURCE,
-            f"两个逆地理编码源都失败,无法反查 ({float(lat):.6f},{float(lng):.6f}):"
-            f"{PHOTON_SOURCE}={photon_reason};{NOMINATIM_SOURCE}={_failure_text(exc)}",
+            f"三个逆地理编码源都失败,无法反查 ({float(lat):.6f},{float(lng):.6f}):"
+            + ";".join(reasons),
         ) from exc
 
 
 def default_reverse_geocoder(lat: float, lng: float, zoom: int = REVERSE_ZOOM) -> dict[str, Any]:
-    """默认的**逆**地理编码:坐标 → ``{lat, lng, display_name, geocoder}``(Photon 主 + Nominatim 降级)。"""
+    """默认的**逆**地理编码:坐标 → ``{lat, lng, display_name, geocoder}``(高德主 + Photon/Nominatim 降级)。"""
     geo, geocoder = reverse_with_fallback(lat, lng, zoom=zoom)
     return {**geo, "geocoder": geocoder}
 
@@ -371,7 +444,7 @@ def resolve_reverse_origin_with_source(
     城市名,所以 ``lat``/``lng`` 一律沿用**传入的 GPS 坐标**(范围圈要以用户真实
     位置为圆心,而不是地理编码源返回的行政区中心)。
 
-    Photon 与 Nominatim 都挂了、被限流、或返回的 ``display_name`` 里挑不出城市时,
+    高德、Photon 与 Nominatim 都挂了/被限流、或返回的 ``display_name`` 里挑不出城市时,
     返回 ``resolved=False`` + :func:`unnamed_origin` 兜底名 —— API 层照常 200,
     前端地图照样能画环、能查库,只是起点名不好看。
     """

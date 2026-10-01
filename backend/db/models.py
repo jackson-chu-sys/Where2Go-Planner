@@ -17,7 +17,7 @@
   ``(osm_type, osm_id)``,同一家酒店从不同起点搜到只存一行,``price_estimate`` / ``intro``
   由 LLM 生成后**不再被重抓覆盖**(见 services.stays)。
 * :class:`StayQueryCache` —— 住宿检索的**负缓存**(TASK-6c,BUG-3/5):记"这个坐标这个半径
-  查过了,结果是空/失败",6 小时内同坐标同半径直接回缓存态,不再重复打 Overpass;
+  查过了,结果是空/失败",6 小时内同坐标同半径直接回缓存态,不再重复打高德;
   空结果分 ``no_data`` / ``datasource_error`` / ``timeout`` 三档 reason 透传给前端文案。
 * :class:`OriginCache` —— 城市名 → 起点坐标的**地理编码持久缓存**(TASK-7a):
   ``/api/geocode`` 每次实调 Photon(德国)实测 2.7~3.4s,同一城市重复搜索重复付费;
@@ -131,7 +131,8 @@ def is_seed(tags: Optional[Mapping[str, Any]]) -> bool:
 
 
 class Place(Base):
-    """一个目的地:OSM/Overpass 抓取,或人工种子数据(``tags["source"]="种子"``)。"""
+    """一个目的地:高德 POI 抓取(TASK-9b 起;存量行可能是 OSM),或人工种子数据
+    (``tags["source"]="种子"``)。"""
 
     __tablename__ = "places"
     __table_args__ = (
@@ -174,8 +175,8 @@ class SegmentFetch(Base):
     origin_lat: Mapped[float] = mapped_column(Float, nullable=False)
     origin_lng: Mapped[float] = mapped_column(Float, nullable=False)
     place_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    source: Mapped[str] = mapped_column(String(16), nullable=False, default="overpass")
-    # 渐进抓取(TASK-6b):该 (城市, band) 已经完成过几轮 Overpass 抓取。
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="amap")
+    # 渐进抓取(TASK-6b):该 (城市, band) 已经完成过几轮抓取(TASK-9b 起是高德 v3)。
     # 冷启动只抓一小轮(配额缩到 30),前端"加载更多"每越界一次再抓一轮(30×(轮数+1)),
     # 下一轮的目标总量由这个计数推出来,所以它必须落库、且旧库要能补列(见 db.base.init_db)。
     fetch_rounds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -405,7 +406,7 @@ class Collection(Base):
 
     收藏是**快照**不是外键:``summary`` 存下收藏那一刻的 ``mode``/``duration_min``/
     ``cost_cny``/``distance_km``(以及调用方想留的其他键,如 ``kind=real|estimate``、
-    ``degraded``),之后价格系数变了、OSRM 降级了,收藏列表仍显示用户当时看到的数字
+    ``degraded``),之后价格系数变了、路线数据源降级了,收藏列表仍显示用户当时看到的数字
     (M4 对比总账要的正是"当时口径")。要看最新数字请重新调 ``/api/routes``。
 
     幂等:唯一键 ``(kind, ref_key, mode)``。同一对起终点、同一方式的路线只有一行,
@@ -468,7 +469,7 @@ PRICE_KINDS: tuple[str, ...] = (PRICE_KIND_RULE, PRICE_KIND_LLM)
 
 
 class Stay(Base):
-    """一处住宿(酒店/民宿/青旅/公寓/小屋):Overpass ``tourism=*`` 抓取 + LLM 估价与简介。
+    """一处住宿(酒店/民宿/青旅/公寓/小屋):高德 ``types=100000`` 抓取 + LLM 估价与简介。
 
     为什么不复用 :class:`Place`:住宿是行程编排的**落脚点**(M5「住哪儿」),不进需求
     四分类,展示字段也不同(要价格区间、要"约"字口径的估算标注),所以单独一张表 ——
@@ -557,7 +558,7 @@ class StayQueryCache(Base):
     """一次住宿检索的**空结果/失败**记录(负缓存):有这行且未过期 = 不必再触网。
 
     为什么要有负缓存:住宿在郊区/小城镇经常真的搜不到,而"搜不到"这条路每次都要等
-    Overpass 三个公共实例轮一遍(实测十几秒),用户连点两下就是两次白等(BUG-3)。
+    半径阶梯(5/10/30km)一轮轮打完(实测十几秒),用户连点两下就是两次白等(BUG-3)。
     于是把"这个坐标 + 这个半径查过了,结论是空/报错/超时"落一行,
     :data:`services.stays.NEG_CACHE_TTL_S`(6 小时)内同键直接回缓存态。
 
@@ -724,13 +725,14 @@ GEOCODER_LEN = 16
 class OriginCache(Base):
     """城市名 → 起点坐标的**地理编码持久缓存**:有这行且未过期 = 不必再问地理编码源。
 
-    ``/api/geocode`` 每次都实调 Photon(服务器在德国),实测 2.7~3.4s;而城市中心坐标
-    基本不变,同一个城市被反复搜索就是反复白等。于是把结果落一行,
+    ``/api/geocode`` 每次都实调地理编码源(TASK-9c 起主链是高德,降级腿 Photon 在德国
+    实测 2.7~3.4s);而城市中心坐标基本不变,同一个城市被反复搜索就是反复白等白耗配额。
+    于是把结果落一行,
     ``WHERE2GO_ORIGIN_CACHE_TTL_S``(缺省 7 天)内命中直接返回、零网络
     (读写口径见 :func:`db.repository.get_origin_cache` 与 app.api.places.geocode_city)。
 
     键口径:``city`` 就是调用方传来的城市名(去空白后),String **主键** → 天然幂等 upsert
-    (重复写只刷新坐标与 ``updated_at``)。``geocoder`` 原样存 ``photon`` / ``nominatim``,
+    (重复写只刷新坐标与 ``updated_at``)。``geocoder`` 原样存 ``amap`` / ``photon`` / ``nominatim``,
     命中时按原值回报,响应形状与不走缓存时逐字段一致;**只缓存真的问到了地理编码源的
     结果** —— 调用方直接给坐标(``geocoder="none"``)的退化路径不写行。坐标按
     :data:`COORD_PRECISION` 定点入库,与其他表同一口径。

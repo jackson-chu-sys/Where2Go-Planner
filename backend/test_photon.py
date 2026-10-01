@@ -490,6 +490,107 @@ def test_photon_uses_direct_connection_by_default(monkeypatch: pytest.MonkeyPatc
 # --------------------------------------------------------------------------- #
 
 
+def test_chain_prefers_amap_over_photon_and_nominatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TASK-9c:主链路是高德 —— amap 命中时 Photon/Nominatim 一碰都不碰。"""
+    calls: list[str] = []
+
+    def fake_amap(city: str) -> list[dict[str, Any]]:
+        calls.append(city)
+        return [{
+            "formatted_address": "北京市", "province": "北京市", "city": "",
+            "district": "", "adcode": "110000", "township": "",
+            "lat": BEIJING["lat"], "lng": BEIJING["lng"],
+        }]
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("amap 命中时不应降级到 Photon/Nominatim")
+
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", fake_amap)
+    monkeypatch.setattr(place_loader, "ds_photon_geocode", boom)
+    monkeypatch.setattr(place_loader, "ds_geocode", boom)
+    geo, geocoder = place_loader.geocode_with_fallback("北京")
+    assert geocoder == "amap" and calls == ["北京"]
+    assert (geo["lat"], geo["lng"]) == (BEIJING["lat"], BEIJING["lng"])
+    assert geo["display_name"], "display_name 由 formatted_address/四段拼装,不能为空"
+
+
+def test_chain_falls_back_to_photon_when_amap_has_no_key(monkeypatch: pytest.MonkeyPatch, photon_ok) -> None:
+    """未配高德 key(DataSourceError)→ 回落 Photon;photon_ok 已保证 Nominatim 不被碰。"""
+
+    def no_key(city: str) -> list[dict[str, Any]]:
+        raise DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)")
+
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", no_key)
+    geo, geocoder = place_loader.geocode_with_fallback("北京")
+    assert geocoder == "photon"
+    assert geo["display_name"] == "北京市, 中国"
+    assert photon_ok == [{"query": "北京", "limit": place_loader.PHOTON_LIMIT}]
+
+
+def test_chain_falls_back_when_amap_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """高德空结果同样当失败 → 降到 Photon(空串/空列表都不该被当成命中)。"""
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", lambda city: [])
+    monkeypatch.setattr(
+        place_loader, "ds_photon_geocode",
+        lambda query, *, limit=5: [{"lat": BEIJING["lat"], "lng": BEIJING["lng"], "display_name": "北京市, 中国"}],
+    )
+    geo, geocoder = place_loader.geocode_with_fallback("北京")
+    assert geocoder == "photon"
+
+
+def test_reverse_chain_prefers_amap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """逆地理同样高德优先;amap 不收 zoom,命中即返回。"""
+    calls: list[tuple[float, float]] = []
+
+    def fake_amap(lat: float, lng: float) -> dict[str, Any]:
+        calls.append((lat, lng))
+        return {
+            "lat": lat, "lng": lng,
+            "formatted_address": "浙江省杭州市西湖区灵隐街道曙光新村",
+            "province": "浙江省", "city": "杭州市", "district": "西湖区", "township": "灵隐街道",
+        }
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("amap 命中时不应降级")
+
+    monkeypatch.setattr(place_loader, "ds_amap_reverse", fake_amap)
+    monkeypatch.setattr(place_loader, "ds_photon_reverse", boom)
+    monkeypatch.setattr(place_loader, "ds_reverse", boom)
+    geo, geocoder = place_loader.reverse_with_fallback(30.2741, 120.1551)
+    assert geocoder == "amap" and calls == [(30.2741, 120.1551)]
+    assert "杭州" in geo["display_name"]
+
+
+def test_api_geocode_reports_amap_and_caches_it(session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """/api/geocode 响应键不变、geocoder=amap;OriginCache 存 amap 且第二次命中零网络。"""
+    calls: list[str] = []
+
+    def fake_amap(city: str) -> list[dict[str, Any]]:
+        calls.append(city)
+        return [{
+            "formatted_address": "北京市", "province": "北京市", "city": "",
+            "district": "", "adcode": "110000", "township": "",
+            "lat": BEIJING["lat"], "lng": BEIJING["lng"],
+        }]
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("amap 命中/缓存命中都不应再触网")
+
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", fake_amap)
+    monkeypatch.setattr(place_loader, "ds_photon_geocode", boom)
+    monkeypatch.setattr(place_loader, "ds_geocode", boom)
+
+    first = places_api.geocode_city(city="北京", session=session)
+    assert first["geocoder"] == "amap" and calls == ["北京"]
+    assert set(first) == {"origin", "geocoder", "bands", "segments"}, "响应键名与旧口径一致"
+    row = repo.get_origin_cache(session, city="北京")
+    assert row is not None and row.geocoder == "amap", "OriginCache 值域扩到 amap(§6.7)"
+
+    second = places_api.geocode_city(city="北京", session=session)
+    assert calls == ["北京"], "第二次命中缓存,零网络"
+    assert second == first, "命中与否响应逐字段一致"
+
+
 def test_chain_prefers_photon_and_never_touches_nominatim(photon_ok) -> None:
     geo = place_loader.default_geocoder("北京")
     assert geo == {
@@ -521,22 +622,29 @@ def test_chain_falls_back_to_nominatim_when_photon_returns_empty(monkeypatch: py
 
 
 def test_chain_double_failure_raises_chinese_error_with_both_reasons(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TASK-9c:降级链是 高德→Photon→Nominatim 三腿,全失败时报错带齐三边原因。"""
+
+    def amap_boom(city: str) -> dict[str, Any]:
+        raise DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)")
+
     def photon_boom(query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         raise DataSourceError("Photon", "网络连接失败")
 
     def nominatim_boom(query: str, *, limit: int = 1) -> dict[str, Any]:
         raise DataSourceError("Nominatim", "被限流(HTTP 429)")
 
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", amap_boom)
     monkeypatch.setattr(place_loader, "ds_photon_geocode", photon_boom)
     monkeypatch.setattr(place_loader, "ds_geocode", nominatim_boom)
     exc = expect_error(
         lambda: place_loader.geocode_with_fallback("北京"),
         DataSourceError,
-        "两个地理编码源都失败",
+        "三个地理编码源都失败",
+        "amap=未配置 WHERE2GO_AMAP_KEY",
         "Photon=网络连接失败",
         "Nominatim=被限流",
     )
-    assert exc.source == "Photon/Nominatim"
+    assert exc.source == place_loader.GEOCODER_CHAIN_SOURCE
 
 
 def test_chain_blank_city_raises_value_error() -> None:
@@ -579,18 +687,25 @@ def test_reverse_chain_falls_back_to_nominatim_with_zoom(monkeypatch: pytest.Mon
 
 
 def test_reverse_chain_double_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TASK-9c:逆地理同样是三腿链,全失败时报错带齐三边原因。"""
+
+    def amap_boom(lat: float, lng: float) -> dict[str, Any]:
+        raise DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)")
+
     def photon_boom(lat: float, lng: float) -> dict[str, Any]:
         raise DataSourceError("Photon", "网络连接失败")
 
     def nominatim_boom(lat: float, lng: float, zoom: int = 10) -> dict[str, Any]:
         raise DataSourceError("Nominatim", "服务繁忙")
 
+    monkeypatch.setattr(place_loader, "ds_amap_reverse", amap_boom)
     monkeypatch.setattr(place_loader, "ds_photon_reverse", photon_boom)
     monkeypatch.setattr(place_loader, "ds_reverse", nominatim_boom)
     expect_error(
         lambda: place_loader.reverse_with_fallback(31.2304, 121.4737),
         DataSourceError,
-        "两个逆地理编码源都失败",
+        "三个逆地理编码源都失败",
+        "amap=未配置 WHERE2GO_AMAP_KEY",
         "Photon=网络连接失败",
         "Nominatim=服务繁忙",
     )
@@ -652,19 +767,24 @@ def test_api_geocode_reports_nominatim_on_fallback(session, monkeypatch: pytest.
 
 
 def test_api_geocode_double_failure_is_400_in_chinese(session, monkeypatch: pytest.MonkeyPatch) -> None:
+    def amap_boom(city: str) -> dict[str, Any]:
+        raise DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)")
+
     def photon_boom(query: str, *, limit: int = 5) -> list[dict[str, Any]]:
         raise DataSourceError("Photon", "网络连接失败")
 
     def nominatim_boom(query: str, *, limit: int = 1) -> dict[str, Any]:
         raise DataSourceError("Nominatim", "直连超时")
 
+    monkeypatch.setattr(place_loader, "ds_amap_geocode", amap_boom)
     monkeypatch.setattr(place_loader, "ds_photon_geocode", photon_boom)
     monkeypatch.setattr(place_loader, "ds_geocode", nominatim_boom)
     expect_http_error(
         lambda: places_api.geocode_city(city="北京", session=session),
         400,
         "无法解析城市",
-        "两个地理编码源都失败",
+        "三个地理编码源都失败",
+        "amap",
         "Photon",
         "Nominatim",
     )

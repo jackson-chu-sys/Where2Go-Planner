@@ -1,30 +1,36 @@
-"""Where2Go 免费数据源适配层(阶段0 POC)。
+"""Where2Go 数据源适配层(TASK-9 起主数据源为**高德 v3**)。
 
-三个**免费、无需 key** 的公共数据源(见 ADR-006):
+三个数据源(见 ADR-006 与 ``docs/TASK-9-CONTRACT.md``):
 
-* :mod:`data_sources.osrm` —— 驾车路线(``distance_km`` / ``duration_min``);
-* :mod:`data_sources.nominatim` —— 正向/逆向地理编码(带 User-Agent 与 1 req/s 节流);
-* :mod:`data_sources.overpass` —— 按 tag 检索周边 POI(目的地库冷启动)。
+* :mod:`data_sources.amap` —— POI 检索 / 正逆地理编码 / 驾车路线(需 ``WHERE2GO_AMAP_KEY``);
+* :mod:`data_sources.photon` —— 地理编码降级链第一腿(免费无 key,直连);
+* :mod:`data_sources.nominatim` —— 地理编码降级链末腿(带 User-Agent 与 1 req/s 节流)。
+
+Overpass 与 OSRM 已在 **TASK-9c 物理删除**(不留降级链、不留休眠文件);
+:func:`haversine_km` 随之搬到 :mod:`data_sources._common`,导入面不变。
 
 用法::
 
-    from data_sources import geocode, nearby_places, route
+    from data_sources import amap, geocode, haversine_km
 
-    origin = geocode("北京")
-    places = nearby_places(origin["lat"], origin["lng"], 50_000, {"tourism": "attraction"})
-    leg = route((origin["lng"], origin["lat"]), (places[0]["lng"], places[0]["lat"]))
+    rows = amap.geocode("杭州西湖")
+    leg = amap.driving(30.2741, 120.1551, 31.2304, 121.4737)
+    km = haversine_km(30.2741, 120.1551, 31.2304, 121.4737)
 
-所有失败都会抛出 :class:`DataSourceError`(中文说明);真实网络端到端验证见
-``data_sources/verify_poc.py``。
+所有失败都会抛出 :class:`DataSourceError`(中文说明);可临时重试的再细分成
+:class:`TransientDataSourceError`,方便上层做退避与降级。
 """
 
+from . import amap
 from ._common import (
     DEFAULT_TIMEOUT,
+    EARTH_RADIUS_KM,
     MAX_TIMEOUT,
     USER_AGENT,
     DataSourceError,
     TransientDataSourceError,
     build_session,
+    haversine_km,
     normalize_timeout,
 )
 from .nominatim import (
@@ -34,40 +40,21 @@ from .nominatim import (
     geocode,
     reverse,
 )
-from .osrm import (
-    ALT_ENDPOINT as OSRM_ALT_ENDPOINT,
-    DEFAULT_ENDPOINT as OSRM_ENDPOINT,
-    OsrmClient,
-    route,
-)
-from .overpass import (
-    DEFAULT_ENDPOINT as OVERPASS_ENDPOINT,
-    FALLBACK_ENDPOINTS as OVERPASS_FALLBACK_ENDPOINTS,
-    OverpassClient,
-    haversine_km,
-    nearby_places,
-)
 
 __all__ = [
     "USER_AGENT",
     "DEFAULT_TIMEOUT",
     "MAX_TIMEOUT",
+    "EARTH_RADIUS_KM",
     "DataSourceError",
     "TransientDataSourceError",
     "build_session",
     "normalize_timeout",
-    "OSRM_ENDPOINT",
-    "OSRM_ALT_ENDPOINT",
+    "haversine_km",
+    "amap",
     "NOMINATIM_ENDPOINT",
     "NOMINATIM_MIN_INTERVAL_S",
-    "OVERPASS_ENDPOINT",
-    "OVERPASS_FALLBACK_ENDPOINTS",
-    "OsrmClient",
     "NominatimClient",
-    "OverpassClient",
-    "route",
     "geocode",
     "reverse",
-    "nearby_places",
-    "haversine_km",
 ]

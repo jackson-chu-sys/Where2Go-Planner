@@ -74,7 +74,7 @@ RETRY_BACKOFF_S: tuple[float, ...] = (2.0, 5.0)
 
 COORD_PRECISION = 7          # 与 db.models.COORD_PRECISION 同一口径(定点入库)
 GEOMETRY_COORD_PRECISION = 6  # 折线坐标 6 位小数(≈0.1m,画线足够)
-GEOMETRY_MAX_POINTS = 1200    # 抽稀口径与 services.routes.GEOMETRY_MAX_POINTS 等值(不 import osrm)
+GEOMETRY_MAX_POINTS = 1200    # 抽稀口径与 services.routes.GEOMETRY_MAX_POINTS 等值(两边各自定义)
 
 GEOCODE_PATH = "/geocode/geo"
 REGEO_PATH = "/geocode/regeo"

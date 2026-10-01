@@ -3,8 +3,10 @@
 全程不触网(参照 :mod:`backend.test_classify` 的 ``no_network`` 风格):
 
 * ``no_network`` 把 :meth:`requests.Session.request` 换成直接抛错,任何偷偷联网都会当场失败;
-* OSRM 两层都有替身:服务层注入 ``router=``(:class:`FakeRouter`),数据源层用
-  :class:`FakeSession` 断言**请求参数**与 geometry 解析;
+* 驾车有替身:服务层注入 ``router=``(:class:`FakeRouter`)顶掉
+  :func:`services.routes.default_router` 的高德调用(TASK-9c 起驾车走 ``amap.driving``,
+  数据源层自身的请求/解析用例见 :mod:`backend.test_amap` 与
+  :mod:`backend.test_amap_geocode_driving`);
 * API 直接调路由函数(同 :mod:`backend.test_places`),用 :func:`expect_http_error`
   断言状态码与中文 detail;另有 :func:`http_get` 自己拼 ASGI scope 走一遍**完整 HTTP 链**
   (仓库没装 httpx/TestClient),校验参数解析与 400 契约;
@@ -16,7 +18,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import math
 import os
@@ -36,9 +37,7 @@ if BACKEND_DIR not in sys.path:
 from app.api import discover as discover_api  # noqa: E402
 from app.api import routes as routes_api  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
-from data_sources import DataSourceError  # noqa: E402
-from data_sources import osrm  # noqa: E402
-from data_sources.overpass import EARTH_RADIUS_KM  # noqa: E402
+from data_sources import DataSourceError, EARTH_RADIUS_KM  # noqa: E402
 from services import routes as route_service  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -72,19 +71,6 @@ DEFAULT_LEG = {
     "geometry": [[31.2304, 121.4737], [31.8, 121.2], [32.5, 120.6]],
 }
 
-OSRM_WITH_GEOMETRY = {
-    "code": "Ok",
-    "routes": [{
-        "distance": 122376.1,
-        "duration": 5638.8,
-        "geometry": {
-            "type": "LineString",
-            "coordinates": [[121.4737, 31.2304], [121.2, 31.8], [116.4074, 39.9042]],
-        },
-    }],
-}
-
-
 def point_north(km: float, *, name: Optional[str] = None) -> dict[str, Any]:
     """构造距上海 ``km`` 公里(正北)的目的地,直线距离由 haversine 复核即 ``km``。"""
     return {
@@ -110,40 +96,12 @@ def plan_for(km: float, *, router: Optional[Callable] = None, to_name: Optional[
 # --------------------------------------------------------------------------- #
 
 
-@dataclasses.dataclass
-class Call:
-    method: str
-    url: str
-    params: Optional[dict[str, Any]]
-
-
-class FakeResponse:
-    """最小 response 替身:只需要 ``status_code`` 与 ``text``。"""
-
-    def __init__(self, payload: Any, *, status_code: int = 200) -> None:
-        self.status_code = status_code
-        self.text = json.dumps(payload, ensure_ascii=False)
-
-
-class FakeSession:
-    """记录请求参数并返回预设响应的 session 替身(不触网)。"""
-
-    def __init__(self, payload: Any) -> None:
-        self.responses = [FakeResponse(payload)]
-        self.calls: list[Call] = []
-
-    def request(self, method: str, url: str, params: Optional[dict[str, Any]] = None,
-                **kwargs: Any) -> FakeResponse:
-        self.calls.append(Call(method, url, params))
-        return self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
-
-    @property
-    def last(self) -> Call:
-        return self.calls[-1]
-
-
 class FakeRouter:
-    """OSRM 替身:记录 ``(start, end)`` 调用,返回预设 leg 或抛预设异常。"""
+    """驾车路由替身(顶掉 :func:`services.routes.default_router` 的高德调用)。
+
+    记录 ``(start, end)`` 调用,返回预设 leg(``distance_km``/``duration_min``/
+    ``geometry``,可选 ``toll_distance_km``)或抛预设异常。
+    """
 
     def __init__(self, leg: Optional[dict[str, Any]] = None,
                  error: Optional[BaseException] = None) -> None:
@@ -227,8 +185,8 @@ def no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def stub_osrm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeRouter]:
-    """把服务层的默认 OSRM 调用换成替身;返回工厂,便于按用例定制 leg / error。"""
+def stub_amap(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeRouter]:
+    """把服务层的默认**高德驾车**调用换成替身;返回工厂,便于按用例定制 leg / error。"""
 
     def install(leg: Optional[dict[str, Any]] = None,
                 error: Optional[BaseException] = None) -> FakeRouter:
@@ -240,84 +198,20 @@ def stub_osrm(monkeypatch: pytest.MonkeyPatch) -> Callable[..., FakeRouter]:
 
 
 # --------------------------------------------------------------------------- #
-# OSRM 数据源:geometry(默认形状不变,只在 with_geometry 时多要折线)
-# --------------------------------------------------------------------------- #
-
-
-def test_osrm_default_call_keeps_stage0_shape() -> None:
-    session = FakeSession(OSRM_WITH_GEOMETRY)
-    result = osrm.OsrmClient(session=session).route((121.4737, 31.2304), (116.4074, 39.9042))
-
-    assert result == {"distance_km": 122.376, "duration_min": 94.0}, "默认不能多带 geometry 键"
-    assert session.last.params == {
-        "overview": "false", "alternatives": "false", "steps": "false", "annotations": "false",
-    }, "默认请求参数不能变(POC /api/discover 与既有单测依赖)"
-
-
-def test_osrm_with_geometry_asks_full_overview_and_swaps_axis_order() -> None:
-    session = FakeSession(OSRM_WITH_GEOMETRY)
-    result = osrm.OsrmClient(session=session).route(
-        (121.4737, 31.2304), (116.4074, 39.9042), with_geometry=True
-    )
-
-    assert session.last.params == {
-        "overview": "full", "geometries": "geojson",
-        "alternatives": "false", "steps": "false", "annotations": "false",
-    }
-    assert result["distance_km"] == 122.376 and result["duration_min"] == 94.0
-    # GeoJSON 是 [lng, lat],前端 Leaflet 要 [lat, lng],数据源层就换好
-    assert result["geometry"] == [[31.2304, 121.4737], [31.8, 121.2], [39.9042, 116.4074]]
-
-
-def test_osrm_geometry_is_optional_and_malformed_is_ignored() -> None:
-    """折线缺失/畸形不该拖垮整条驾车路线:geometry 降级为 None,时长里程照给。"""
-    bad_geometries: list[Any] = [
-        None, {}, "LineString", {"type": "LineString"}, {"coordinates": []},
-        {"coordinates": [[121.4737]]}, {"coordinates": [["a", "b"]]}, {"coordinates": [[999.0, 31.0]]},
-    ]
-    for geometry in bad_geometries:
-        route: dict[str, Any] = {"distance": 1000.0, "duration": 600.0}
-        if geometry is not None:
-            route["geometry"] = geometry
-        session = FakeSession({"code": "Ok", "routes": [route]})
-        result = osrm.OsrmClient(session=session).route((121.0, 31.0), (121.1, 31.1),
-                                                        with_geometry=True)
-        assert result["geometry"] is None, f"geometry={geometry!r} 应降级为 None"
-        assert result["distance_km"] == 1.0 and result["duration_min"] == 10.0
-
-
-def test_service_default_router_asks_osrm_for_geometry(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[Any, Any, dict[str, Any]]] = []
-
-    def fake_ds_route(start: Any, end: Any, **kwargs: Any) -> dict[str, Any]:
-        calls.append((start, end, kwargs))
-        return {"distance_km": 10.0, "duration_min": 12.0, "geometry": None}
-
-    monkeypatch.setattr(route_service, "ds_route", fake_ds_route)
-    leg = route_service.default_router((121.4737, 31.2304), (121.5, 31.3))
-
-    # with_steps:费用引擎 v2 要靠 steps[].ref(G/S 编号)认高速里程(TASK-6d)
-    assert calls == [
-        ((121.4737, 31.2304), (121.5, 31.3), {"with_geometry": True, "with_steps": True})
-    ]
-    assert leg["distance_km"] == 10.0
-
-
-# --------------------------------------------------------------------------- #
 # 费用估算(系数集中在 services.routes,算式见 docs/STAGE2-PLAN.md 第 2 节)
 # --------------------------------------------------------------------------- #
 
 
 def test_cost_formulas_follow_v2_coefficients() -> None:
     """费用引擎 v2 的算式(TASK-6d):驾车构成明细、铁路分档、机票公布价区间中值。"""
-    steps = [{"distance_km": 60.0, "ref": "G60"}, {"distance_km": 40.0, "ref": None}]
     # 驾车 100km(东部 0.45 元/km,油价默认 8 元/L):
-    # 拿不到 steps → 高速里程按 100×0.55 = 55km → 过路 24.75 + 油费 64 = 88.75 元
+    # 高德没给 toll_distance → 收费里程按 100×0.55 = 55km → 过路 24.75 + 油费 64 = 88.75 元
     assert route_service.driving_cost_cny(100, region="east") == pytest.approx(88.75)
-    # 有 steps → 高速里程 = 60km(ref 以 G 开头那段)→ 过路 27 + 油费 64 = 91 元
-    assert route_service.driving_cost_cny(100, steps=steps, region="east") == pytest.approx(91.0)
-    money = route_service.driving_money(100, steps=steps, region="east")
-    assert money["cost_breakdown"] == {"toll": 27, "fuel": 64, "mode": "osrm_refs"}
+    # 有 toll_distance(60km 收费路段)→ 过路 27 + 油费 64 = 91 元
+    assert route_service.driving_cost_cny(
+        100, toll_distance_km=60.0, region="east") == pytest.approx(91.0)
+    money = route_service.driving_money(100, toll_distance_km=60.0, region="east")
+    assert money["cost_breakdown"] == {"toll": 27, "fuel": 64, "mode": "amap_toll_distance"}
     assert money["cost_cny"] == 91 == 27 + 64, "先各项四舍五入再相加,toll + fuel 必等于总价"
     assert money["per_person_cny"] == 23, "人均 = 91 ÷ 4 → 23(四舍五入)"
     # 铁路:运营里程 = 直线 × 1.15,双高铁枢纽走 350km/h 档 0.46 元/km
@@ -346,7 +240,7 @@ def test_cost_model_and_mode_rules_are_exposed_for_labels() -> None:
     model = route_service.cost_coefficients()
     assert set(model) == {"driving", "rail", "flight", "disclaimer"}
     assert model["disclaimer"] == "估算·非实时·以官方为准"
-    # 驾车 v2:油耗 + 区域费率表 + 高速里程两种口径 + 整车/人均
+    # 驾车 v2:油耗 + 区域费率表 + 收费里程两种口径 + 整车/人均
     assert model["driving"]["fuel_l_per_km"] == 0.08
     assert model["driving"]["fuel_l_per_100km"] == 8.0
     assert model["driving"]["fuel_price_cny_per_l"] == 8.0
@@ -355,7 +249,8 @@ def test_cost_model_and_mode_rules_are_exposed_for_labels() -> None:
         "east": 0.45, "central": 0.40, "west": 0.35,
     }
     assert model["driving"]["heuristic_highway_ratio"] == 0.55
-    assert model["driving"]["highway_ref_prefixes"] == ["G", "S"]
+    assert model["driving"]["toll_distance_field"] == "amap.toll_distance"
+    assert model["driving"]["toll_modes"] == ["amap_toll_distance", "heuristic"]
     assert model["driving"]["vehicle_label"] == "整车≤4人" and model["driving"]["seats"] == 4
     # 铁路 v2:运营里程系数 + 分档费率 + 种子对数
     assert model["rail"]["operating_detour"] == 1.15
@@ -382,8 +277,8 @@ def test_cost_model_and_mode_rules_are_exposed_for_labels() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_modes_appear_by_distance_threshold(stub_osrm) -> None:
-    stub_osrm()
+def test_modes_appear_by_distance_threshold(stub_amap) -> None:
+    stub_amap()
     cases = [
         (99.0, ["driving"]),                       # 99km:不到铁路阈值
         (100.5, ["driving", "rail"]),
@@ -415,8 +310,8 @@ def test_durations_match_poc_but_flight_threshold_is_raised() -> None:
     expect_error(lambda: route_service.estimate_duration_min("driving", 100.0), ValueError, "仅铁路/飞机")
 
 
-def test_three_mode_payload_shape_and_honest_labels(stub_osrm) -> None:
-    stub_osrm()
+def test_three_mode_payload_shape_and_honest_labels(stub_amap) -> None:
+    stub_amap()
     plan = plan_for(1067.0, to_name="北京")   # ≥600km 才有飞机条目(v2 阈值)
     driving, rail, flight = plan.routes
 
@@ -428,14 +323,14 @@ def test_three_mode_payload_shape_and_honest_labels(stub_osrm) -> None:
         assert route["links"], "每条路线都要带跳转链接"
 
     assert (driving["mode"], driving["label"], driving["kind"], driving["source"]) == (
-        "driving", "驾车", "real", "OSRM"
+        "driving", "驾车", "real", "amap"
     )
     assert driving["duration_min"] == 94 and driving["distance_km"] == 122.4
     assert driving["cost_cny"] == 108, "驾车整车费用 = 油费 78 + 高速过路费 30(估算)"
     assert driving["cost_breakdown"] == {"toll": 30, "fuel": 78, "mode": "heuristic"}
     assert driving["vehicle_label"] == "整车≤4人" and driving["per_person_cny"] == 27
     assert driving["geometry"] == DEFAULT_LEG["geometry"]
-    assert "OSRM" in driving["note"] and "费用为估算" in driving["note"]
+    assert "高德" in driving["note"] and "费用为估算" in driving["note"]
     assert route_service.ESTIMATE_DISCLAIMER in driving["note"]
 
     assert (rail["mode"], rail["kind"], rail["source"]) == ("rail", "estimate", "estimate")
@@ -455,14 +350,14 @@ def test_three_mode_payload_shape_and_honest_labels(stub_osrm) -> None:
     assert route_service.FLIGHT_DYNAMIC_NOTE in flight["note"]
 
 
-def test_driving_route_calls_osrm_with_lnglat_pairs() -> None:
+def test_driving_route_calls_router_with_lnglat_pairs() -> None:
     router = FakeRouter()
     dest = point_north(120.0)
     route_service.plan_routes(
         from_lat=SHANGHAI["lat"], from_lng=SHANGHAI["lng"],
         to_lat=dest["lat"], to_lng=dest["lng"], to_name="莫干山", router=router,
     )
-    # OSRM 坐标顺序是 (lng, lat),别和 Leaflet 的 [lat, lng] 搞混
+    # RouterFn 的坐标顺序是 (lng, lat),别和前端画线用的 [lat, lng] 搞混
     assert router.calls == [
         ((SHANGHAI["lng"], SHANGHAI["lat"]), (dest["lng"], dest["lat"]))
     ]
@@ -559,8 +454,8 @@ def test_default_departure_date_is_today_in_china_time() -> None:
     assert f"searchDepartureTime={today}" in route_service.flight_ota_url(to_name="北京")
 
 
-def test_route_links_are_attached_per_mode(stub_osrm) -> None:
-    stub_osrm()
+def test_route_links_are_attached_per_mode(stub_amap) -> None:
+    stub_amap()
     driving, rail, flight = plan_for(1067.0, to_name="北京", from_name="上海").routes
 
     assert [link["provider"] for link in driving["links"]] == ["amap", "google"]
@@ -581,8 +476,8 @@ def test_route_links_are_attached_per_mode(stub_osrm) -> None:
     )
 
 
-def test_missing_place_names_fall_back_to_coordinates(stub_osrm) -> None:
-    stub_osrm()
+def test_missing_place_names_fall_back_to_coordinates(stub_amap) -> None:
+    stub_amap()
     plan = plan_for(150.0, to_name=None, from_name=None)
 
     assert plan.origin["name"] == "我的位置(31.2304,121.4737)"
@@ -594,12 +489,12 @@ def test_missing_place_names_fall_back_to_coordinates(stub_osrm) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# OSRM 失败:驾车条目降级,不 500、不瞎估
+# 高德驾车失败:驾车条目降级,不 500、不瞎估
 # --------------------------------------------------------------------------- #
 
 
-def test_osrm_failure_degrades_driving_entry() -> None:
-    router = FakeRouter(error=DataSourceError("OSRM", "请求超时(>15s)"))
+def test_amap_failure_degrades_driving_entry() -> None:
+    router = FakeRouter(error=DataSourceError("amap", "驾车路线请求超时(>15s)"))
     plan = plan_for(1067.0, to_name="北京", router=router)
     driving, rail, flight = plan.routes
 
@@ -610,12 +505,12 @@ def test_osrm_failure_degrades_driving_entry() -> None:
     assert driving["cost_breakdown"] is None and driving["per_person_cny"] is None, \
         "降级时不给钱数(整车/人均都不给),但口径标注 vehicle_label 仍在"
     assert driving["vehicle_label"] == "整车≤4人"
-    assert "OSRM" in driving["note"] and route_service.ESTIMATE_DISCLAIMER in driving["note"]
+    assert "高德" in driving["note"] and route_service.ESTIMATE_DISCLAIMER in driving["note"]
     assert [link["provider"] for link in driving["links"]] == ["amap", "google"], "降级也要能跳转导航"
-    assert rail["cost_cny"] == 553 and flight["cost_cny"] == 809, "估算方式不受 OSRM 影响"
+    assert rail["cost_cny"] == 553 and flight["cost_cny"] == 809, "估算方式不受驾车数据源影响"
 
 
-def test_osrm_invalid_coordinates_degrade_instead_of_raising() -> None:
+def test_driving_invalid_coordinates_degrade_instead_of_raising() -> None:
     """router 抛 ValueError(坐标不在路网/格式不对)时同样只降级。"""
     router = FakeRouter(error=ValueError("坐标必须包含 2 个分量(lng, lat)"))
     driving = plan_for(150.0, router=router).routes[0]
@@ -627,8 +522,8 @@ def test_osrm_invalid_coordinates_degrade_instead_of_raising() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_api_routes_payload_shape(stub_osrm) -> None:
-    router = stub_osrm()
+def test_api_routes_payload_shape(stub_amap) -> None:
+    router = stub_amap()
     dest = point_north(1067.0, name="北京")
     payload = routes_api.list_routes(
         from_lat=SHANGHAI["lat"], from_lng=SHANGHAI["lng"],
@@ -648,12 +543,12 @@ def test_api_routes_payload_shape(stub_osrm) -> None:
     assert payload["mode_rules"]["rail_min_km"] == 100.0
     assert payload["cost_model"]["disclaimer"] == route_service.ESTIMATE_DISCLAIMER
     assert payload["generated_at"] and payload["elapsed_s"] >= 0
-    assert "估算" in payload["note"] and "OSRM" in payload["note"]
+    assert "估算" in payload["note"] and "高德" in payload["note"]
     assert router.calls == [((SHANGHAI["lng"], SHANGHAI["lat"]), (dest["lng"], dest["lat"]))]
 
 
-def test_api_routes_rejects_bad_params(stub_osrm) -> None:
-    router = stub_osrm()
+def test_api_routes_rejects_bad_params(stub_amap) -> None:
+    router = stub_amap()
     ok = {"from_lat": 31.2304, "from_lng": 121.4737, "to_lat": 32.0, "to_lng": 121.0}
 
     for missing in ("from_lat", "from_lng", "to_lat", "to_lng"):
@@ -674,8 +569,8 @@ def test_api_routes_rejects_bad_params(stub_osrm) -> None:
     assert router.calls == [], "参数非法时应快速失败,不触网"
 
 
-def test_api_routes_degrades_when_osrm_fails(stub_osrm) -> None:
-    stub_osrm(error=DataSourceError("OSRM", "所有端点均不可用"))
+def test_api_routes_degrades_when_amap_fails(stub_amap) -> None:
+    stub_amap(error=DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)"))
     dest = point_north(150.0, name="莫干山")
     payload = routes_api.list_routes(
         from_lat=SHANGHAI["lat"], from_lng=SHANGHAI["lng"],
@@ -687,15 +582,15 @@ def test_api_routes_degrades_when_osrm_fails(stub_osrm) -> None:
     assert driving["mode"] == "driving" and driving["degraded"] is True
     assert driving["duration_min"] is None and driving["cost_cny"] is None
     assert driving["cost_breakdown"] is None and driving["per_person_cny"] is None
-    assert "OSRM" in driving["note"]
+    assert "高德" in driving["note"]
     assert len(driving["links"]) == 2
     assert rail["mode"] == "rail" and rail["cost_cny"] == 53 and rail["kind"] == "estimate"
     assert rail["price_source"] == "estimate", "150km × 1.15 × 0.31(250km/h 档)≈ 53 元"
 
 
-def test_api_routes_accepts_string_coordinates(stub_osrm) -> None:
+def test_api_routes_accepts_string_coordinates(stub_amap) -> None:
     """query 参数在 HTTP 层是字符串;服务层要能吃 ``"31.2304"`` 这种写法。"""
-    stub_osrm()
+    stub_amap()
     dest = point_north(120.0, name="莫干山")
     payload = routes_api.list_routes(
         from_lat=str(SHANGHAI["lat"]), from_lng=str(SHANGHAI["lng"]),
@@ -706,9 +601,9 @@ def test_api_routes_accepts_string_coordinates(stub_osrm) -> None:
     assert payload["from"]["name"] == "我的位置(31.2304,121.4737)"
 
 
-def test_http_layer_rejects_bad_coordinates_with_400(stub_osrm) -> None:
+def test_http_layer_rejects_bad_coordinates_with_400(stub_amap) -> None:
     """走完整 FastAPI 校验链:缺参/空串/非数字/越界一律 **400 + 中文说明**(不是 422)。"""
-    router = stub_osrm()
+    router = stub_amap()
     tail = "from_lng=121.4737&to_lat=32.0&to_lng=121.0"
     cases = [
         ("", "缺少必要参数:from_lat"),
@@ -725,9 +620,9 @@ def test_http_layer_rejects_bad_coordinates_with_400(stub_osrm) -> None:
     assert router.calls == [], "参数非法时应快速失败,不触网"
 
 
-def test_http_layer_returns_full_payload_for_string_query(stub_osrm) -> None:
+def test_http_layer_returns_full_payload_for_string_query(stub_amap) -> None:
     """HTTP 层 query 全是字符串:``"31.2304"`` 要能规划出三方式,响应可直接 JSON 序列化。"""
-    stub_osrm()
+    stub_amap()
     dest = point_north(1067.0)
     status, payload = http_get(
         f"from_lat={SHANGHAI['lat']}&from_lng={SHANGHAI['lng']}"

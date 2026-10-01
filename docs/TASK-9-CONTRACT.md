@@ -118,7 +118,7 @@ MIN_REQUEST_INTERVAL_S = 0.4     # env WHERE2GO_AMAP_MIN_INTERVAL_S; 实测 QPS 
   - band `low > 0` → 以 band 外半径的**包围盒**经 `amap.grid_polygons` 切格，逐格 `amap.search_polygon`（每格 ≤200 条），本地 haversine 收敛到 `[low, high)`；
   - **扩格策略**：若某 band 抓回条数 < 目标配额且仍有未抓格子，按 `fetch_rounds` 递增扩格（口径与现有 `progressive_target_total` 一致：`PROGRESSIVE_STEP * (fetch_rounds+1)`）；
   - `default_fetcher(fetch_fn=...)` 注入点保持可替换（测试用替身）；`SegmentFetch` 水位语义不变（同 (城市, band) 二次查询读库零网络）。
-- 入库身份：`osm_type="amap"`、`osm_id=<高德 POI id>`、`origin_city` 不变 → **Place 表结构零改动**；`tags` 写 `{"source":"高德","typecode":…,"type":…}`；`db.repository.place_source()` 增加「高德」来源分支（**已存量行的「种子」标注不受影响**）。
+- 入库身份（⚠️ 09:30 更正）：`Place.osm_id` 是 **`Mapped[int]`（Integer 列，见 models.py:117）**，而高德 POI id 是字符串（如 `B023B17WWK`）→ **必须哈希**：`osm_id = zlib.crc32(poi_id.encode("utf-8")) & 0xFFFFFFFF`（无符号 32 位、确定性、可重入）；原始 id 存 `tags["amap_id"]`（前端身份脚注可展示）。`osm_type="amap"`、`origin_city` 不变 → **Place 表结构零改动**；`tags` 写 `{"source":"高德","amap_id":…,"typecode":…,"type":…}`；`db.repository.place_source()` 增加「高德」来源分支（**已存量行的「种子」标注不受影响**）。幂等键 `osm_key(type,id)` 与收藏 ref_key 沿用既有口径（哈希稳定即全链自洽，**不许改 Collection 逻辑**）。
 - `services/stays.py::search_stays` 换 `amap.search_around(types="100000")`；半径阶梯（5/10/30km）、负缓存（6h，`no_data`/`datasource_error`/`timeout` 三档）、批量 LLM 估价、`price_kind` 规则表**全不变**；`SOURCE_FETCH = "amap"`。
 - **一次性清库脚本 `tools/amap_cutover.py`**（默认 `--dry-run` 只打印计数）：清除坐标系/来源不一致的派生行 —— `Place`、`SegmentFetch`、`Stay`、`StayQueryCache`、`OriginCache`、`PlaceRecommendation`、`PlaceDetail`、`PlaceHighlight`、`PlaceMedia`（后三张表若尚未建则跳过）；**必须保留用户数据 `Collection`/`CollectionCat`/`TripPlan`**（收藏是快照，不重算）。执行器在真机冒烟时先 `--dry-run` 报数，再 `--apply`。
 - 种子数据：`WHERE2GO_SEEDS` 默认关闭不变；若启用，身份脚注仍标「人工种子数据（WGS-84 坐标，与高德底图存在 50~500m 偏移）」。
@@ -165,3 +165,14 @@ MIN_REQUEST_INTERVAL_S = 0.4     # env WHERE2GO_AMAP_MIN_INTERVAL_S; 实测 QPS 
 - `photon.py` / `nominatim.py`（保留为降级链，不删不改功能）。
 - `AGENTS.md`（夜班不可写，晨报提示主会话白天同步）。
 - 不扩 scope：不接高德「公交/火车票」商业接口（铁路/飞机仍走既有估算口径）、不做高德静态地图/天气、不做坐标转换服务（全链 GCJ-02 自洽）。
+
+## 6. 更正与补充（2026-10-01 09:30，合并并发会话的实测笔记）
+
+1. **节流与重试口径以本节为准**：`MIN_REQUEST_INTERVAL_S = 0.6`（不是 0.4s；实测连发第 3 个请求即 `10021 CUQPS_HAS_EXCEEDED_THE_LIMIT`），瞬时报错**退避重试 2s / 5s，最多 3 次**（照 `photon.py` 类级节流写法）。
+2. **infocode 细分表（比 §3.9a 更全，照此实现）**：**Transient**（可重试）= `10004`（分钟超限）· `10014/10019/10020/10021/10029/10044`（QPS/日限流）· `10015/10016`（服务器繁忙）；**永久** = `10001`（key 无效）· `10002/10012/10041`（权限）· `10005`（IP 白名单）· `10009`（平台不符，即 JS key 调 REST）· `10013`（key 被删）· `20000/20001`（参数）· `40000/40002`（配额耗尽/到期）。全部映射为 `DataSourceError(SOURCE_NAME, 中文文案+infocode)` / `TransientDataSourceError`，`SOURCE_NAME="amap"`。
+3. **必须用 v3**（v5 `page` 坏的）**且 radius 钳到 50000**；**单次查询深翻上限 ≈200 条**（8×25，`page=9` 返空）→ 拿不满就按 typecode 拆细 + 多边形分块，**禁止假设能取全量**。`types` 支持管道多值（`080106|110101` 实测混排可用）；`types` 与 `keywords` 建议二选一（同时给会按关键词排序偏移）。
+4. **「小城古镇」组不能用村庄码**：`190106` 实测杭州周边 0 命中 → 该组改用 `keywords=古镇|老街|古城`（配 `city` 参数）。**滑雪场 = `080106`**（`080115` 实测 0 命中）；运动场馆大类 `080100`；公园广场 `110101`（归 `110000` 风景名胜大类）；餐饮 `050000`；住宿 `100000`。
+5. **驾车**：`strategy` **不传**（实测传 `strategy=11` 可能返回多条 `paths`；不传更干净）；若返回多条一律取 `paths[0]`。`tolls` 恒 `0`、`cost` 恒 `null` 的口径不变（§1.5）→ 过路费仍用 `toll_distance` × 区域费率。
+6. **坐标系**：高德全链 GCJ-02；存量旧行与种子是 WGS-84（偏差 ≤500m）。**瓦片切高德后新抓数据与底图自洽**；存量旧行偏差可接受（白天 refresh 重抓即消化），**种子静态数据不做坐标转换**（band 尺度 ≥5km，300m 不可见；产品化再议）。新代码内部一律高德坐标。
+7. **`SegmentFetch.source` / `Stay.source` 写 `"amap"`**（列 String(16)，无迁移）；`OriginCache.geocoder` 值域扩为 `"amap"`（主）/`"photon"`/`"nominatim"`（降级），TTL 口径不动。
+8. 前端 JS key 本期是否使用见队列头部通告的最终裁定（与「瓦片是否走无 key 栅格」二选一，**不许两个 key 都塞进前端**）。

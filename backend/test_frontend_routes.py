@@ -1,6 +1,7 @@
 """TASK-2b 单测:前端路线面板(``app/static/index.html``)的轻量断言。
 
-页面是**原生 JS 单文件**(Leaflet 走 CDN,没有构建步骤),所以这里不跑浏览器,
+页面是**原生 JS 单文件**(TASK-9d 起地图走高德 JS API 2.0,脚本运行时按
+``/api/map-config`` 下发的 key 动态注入,没有构建步骤),所以这里不跑浏览器,
 只做三类**离线**断言:
 
 1. **DOM / JS 面**:路线面板的容器与控件 id、卡片渲染与画线相关函数名都在;
@@ -11,7 +12,9 @@
    逐个对回响应里的真实键 —— 后端改字段名而前端没跟上(或反过来)时,这里当场红。
    同时校验前端抽稀上限不比后端 ``GEOMETRY_MAX_POINTS`` 松。
 3. **零回退**:阶段1a/1b/1c 的分类 pin、popup 简介、band 切换、城市搜索、
-   「📍 我的位置」「补简介」相关 id 与函数一个不少;Leaflet CDN + SRI 仍在。
+   「📍 我的位置」「补简介」相关 id 与函数一个不少;地图层已是高德
+   (``AMap.Map``/``Circle``/``Marker``/``InfoWindow``/``Polyline``),Leaflet 已退役,
+   且**页面里不出现 32 位 key 样态字符串**(key 只由 ``/api/map-config`` 运行时下发)。
 
 若环境里装了 ``node``,再加一条 ``node --check`` 对内联脚本做**语法**校验
 (仍不触网、不需要浏览器);没装就 skip。
@@ -79,6 +82,14 @@ STAGE1_FUNCTIONS = ["initMap", "renderBandOptions", "renderCategoryOptions", "re
 ROUTE_FIELDS = ["mode", "label", "emoji", "duration_min", "cost_cny", "distance_km",
                 "geometry", "kind", "degraded", "note", "links"]
 LINK_FIELDS = ["provider", "label", "url", "note"]
+# TASK-9d:地图层已从 Leaflet 切高德 JS API 2.0(key 由 /api/map-config 运行时下发)
+AMAP_JS_SRC = "https://webapi.amap.com/maps"
+MAP_CONFIG_PATH = "/api/map-config"
+MAP_NO_KEY_HINT = "地图未配置高德 JS key"
+ENV_JS_KEY = "WHERE2GO_AMAP_JS_KEY"
+ENV_SECURITY_CODE = "WHERE2GO_AMAP_SECURITY_JS_CODE"
+# 32 位小写十六进制 = 高德 key 的样态(**拼出来**,免得仓库里真出现一串像 key 的字面量)
+AMAP_KEY_SAMPLE = "0123456789abcdef" * 2
 
 SHANGHAI = {"lat": "31.2304", "lng": "121.4737", "name": "上海"}
 BEIJING = {"lat": "39.9042", "lng": "116.4074", "name": "北京"}   # 直线约 1067km → 三方式都出现
@@ -204,8 +215,8 @@ def test_route_panel_is_hidden_until_opened(html: str) -> None:
 
 
 def test_pin_click_opens_panel_and_popup_keeps_route_entry(html: str) -> None:
-    assert 'marker.on("popupopen"' in html, "点 pin(popup 打开)应触发路线面板"
-    assert "openRoutePanel(place)" in html, "popupopen 应调用 openRoutePanel"
+    assert 'marker.on("click"' in html, "点 pin 应触发 InfoWindow + 路线面板(高德只能绑在 Marker 上)"
+    assert "openRoutePanel(place)" in html, "点 pin 应调用 openRoutePanel"
     assert "js-routes" in html, "popup 内应保留一个显式的路线入口按钮"
     assert "popupHtml(place,index)" in html, "popup 按钮要靠 pin 序号取回该 Place"
     assert "state.places" in html, "当前渲染的 Place 列表应存进 state 供面板取用"
@@ -245,24 +256,25 @@ def test_deep_links_use_backend_urls_and_open_new_tab(html: str) -> None:
 
 def test_mode_switch_draws_one_line_and_close_clears_it(html: str) -> None:
     section = panel_section(html)
-    assert "L.layerGroup()" in html, "画线应有专用图层"
-    assert "routeLayer.clearLayers()" in section, "画线前先清图层 → 同一时刻只有一条线"
+    assert "routeLayer=[];" in html, "画线应有专用覆盖物数组(不与 pin/环圈混用)"
+    assert "clearOverlays(routeLayer)" in section, "画线前先清图层 → 同一时刻只有一条线"
     draw = section[section.index("function drawRouteLine("):]
-    assert draw.index("clearRouteLine()") < draw.index("L.polyline("), "drawRouteLine 应先清后画"
+    assert draw.index("clearRouteLine()") < draw.index("new AMap.Polyline("), "drawRouteLine 应先清后画"
     close = section[section.index("function closeRoutePanel("):]
     assert "clearRouteLine()" in close, "关闭面板要清线"
-    assert "fitBounds(" in section, "切换方式后应把路线 fit 进视野"
+    assert "map.setFitView([routeLine]" in section, "切换方式后应把路线 fit 进视野"
 
 
 def test_driving_uses_geometry_and_others_are_dashed_schematic(html: str) -> None:
     assert "route.geometry" in html, "驾车应优先用后端 geometry 折线"
-    assert "L.polyline(" in html, "画线用 L.polyline"
+    assert "new AMap.Polyline(" in html, "画线用 AMap.Polyline"
     styles = re.search(r"const ROUTE_LINE_STYLE=\{(.*?)\};", html, re.S)
     assert styles, "应集中定义各方式的线型"
     body = styles.group(1)
     for mode in ("driving", "rail", "flight"):
         assert mode in body, f"线型缺少 {mode}"
     assert body.count("dashArray") == 2, "铁路/飞机用虚线示意,驾车用实线"
+    assert "strokeDasharray:style.dashArray" in html, "虚线口径要透给高德 strokeDasharray"
     colors = re.findall(r'color:"(#[0-9a-fA-F]{6})"', body)
     assert len(set(colors)) == 3, f"三种方式颜色应互不相同:{colors}"
     assert "arcPoints(" in html, "飞机示意线应有弧线(区别于铁路直线)"
@@ -386,16 +398,17 @@ def test_stage1_behaviours_still_wired(html: str) -> None:
     assert 'addEventListener("click",locateMe)' in html, "「📍 我的位置」仍绑定"
     assert 'addEventListener("click",fillIntros)' in html, "「补简介」仍绑定"
     assert "navigator.geolocation" in html, "浏览器定位逻辑仍在"
-    assert "L.divIcon(" in html and "categoryMeta(" in html, "pin 仍按分类着色"
-    assert "bindPopup(popupHtml(place,index))" in html, "popup 仍走 popupHtml(含简介)"
-    assert "leaflet@1.9.4" in html and "integrity=" in html, "Leaflet 仍走 CDN + SRI"
-    assert "if(!window.L)" in html, "CDN 挂了的降级提示仍在"
+    assert "new AMap.Marker(" in html and "categoryMeta(" in html, "pin 仍按分类着色"
+    assert "infoWindow.setContent(popupHtml(place,index))" in html, "InfoWindow 仍承载 popupHtml(含简介)"
+    assert 'getJSON("/api/map-config")' in html, "地图 key 运行时向 /api/map-config 取"
+    assert AMAP_JS_SRC in html, "高德 JS API 2.0 脚本地址不变"
+    assert "showMapFallback(" in html, "key 缺失 / JS API 挂了的降级提示仍在"
 
 
 def test_route_layer_does_not_disturb_existing_layers(html: str) -> None:
-    assert "rings=L.layerGroup().addTo(map);" in html, "范围圈图层不变"
-    assert "pins=L.layerGroup().addTo(map);" in html, "pin 图层不变"
-    assert "routeLayer=L.layerGroup().addTo(map);" in html, "画线另开图层,不与 pin/环混用"
+    assert "rings=[];        // 环形范围圈" in html, "范围圈覆盖物数组不变"
+    assert "pins=[];         // POI pin" in html, "pin 覆盖物数组不变"
+    assert "routeLayer=[];   // 路线画线专用" in html, "画线另开数组,不与 pin/环混用"
     assert "closeRoutePanel();" in html, "重画 pin / 换起点时应收掉面板与线"
 
 
@@ -943,7 +956,7 @@ STAY_ROW = {"id": 11, "osm_type": "node", "osm_id": 5, "name": "测试酒店", "
 def more_section(html: str) -> str:
     """切出「加载更多(TASK-6e)」那一段 JS(分页契约断言只在这一段里找字段引用)。"""
     start = html.index("// 加载更多(TASK-6e,配合 TASK-6b")
-    end = html.index("// 来源计数:OSM 抓取 vs 人工种子", start)
+    end = html.index("// 来源计数:高德抓取 vs 人工种子", start)
     return html[start:end]
 
 
@@ -1120,7 +1133,7 @@ def test_more_expand_progress_text(html: str) -> None:
     load_more = section[section.index("async function loadMorePlaces"):]
     assert "MORE_EXPAND_HINT" in load_more and "pageNeedsExpand()" in load_more, \
         "扩抓中要给「正在扩抓更多目的地…」"
-    assert "10-60s" in load_more, "扩抓耗时量级(10-60s)要说清楚"
+    assert "EXPAND_HINT_SECONDS" in load_more, "扩抓耗时量级要说清楚(常量口径,别写死在文案里)"
     assert "button.textContent=busy?(expand?MORE_EXPAND_HINT:MORE_PAGE_HINT):MORE_BTN_LABEL" in section
     assert "state.page.busy=true" in load_more, "扩抓/翻页期间要有 busy 守卫(防连点)"
 
@@ -1154,14 +1167,14 @@ def test_more_does_not_disturb_pins_or_panel(html: str) -> None:
     section = more_section(html)
     extra = section[section.index("// 加载更多只给"):section.index("async function loadPlaces")]
     assert "clearLayers" not in extra, "加载更多不清图层(只给新行补 pin)"
+    assert "clearOverlays" not in extra, "加载更多不清图层(只给新行补 pin)"
     assert "closeRoutePanel" not in extra, "加载更多不该关掉已打开的路线面板"
     assert 'state.pinScope!=="all"' in extra, "只画 AI 推荐时,加载更多不动地图"
     assert "ensurePlaceRow(place)" in extra, "新行也要能取回 state.places 序号(popup/按钮靠它)"
-    assert 'marker.on("popupopen",()=>openRoutePanel(place))' in extra, "新 pin 一样点开路线面板"
-    assert 'bindPopup(popupHtml(place,index))' in extra, "新 pin 的 popup 仍走 popupHtml"
+    assert "addPin(place,index,false)" in extra, "新 pin 一样走 makePin(点开 InfoWindow + 路线面板)"
     # 既有图层与「换段/重画就收面板」的行为不变
-    assert "rings=L.layerGroup().addTo(map);" in html and "pins=L.layerGroup().addTo(map);" in html
-    assert "routeLayer=L.layerGroup().addTo(map);" in html and "closeRoutePanel();" in html
+    assert "rings=[];        // 环形范围圈" in html and "pins=[];         // POI pin" in html
+    assert "routeLayer=[];   // 路线画线专用" in html and "closeRoutePanel();" in html
     first = section[section.index("async function loadPlaces"):section.index("async function loadMorePlaces")]
     for token in ("renderPinsByScope()", "renderPlaceList()", "loadRecommend(false)",
                   "setBusy(true)", "state.page.token+=1", "token!==state.page.token"):
@@ -1349,3 +1362,196 @@ def test_geocode_contract_returns_geocoder(html: str, geocode_session) -> None:
     origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
     assert not (referenced_fields(origin, "data") - set(city) - {"resolved"}), \
         "applyOrigin 只能读 /api/geocode(+/reverse)真的会给的键"
+
+
+# --------------------------------------------------------------------------- #
+# 7. TASK-9d:地图层切高德 JS API 2.0(Leaflet 退役)+ /api/map-config 运行时下发 key
+#    静态断言 + 薄路由真跑;全程不触网(JS API 脚本只在浏览器里才会被注入)。
+# --------------------------------------------------------------------------- #
+
+
+def amap_section(html: str) -> str:
+    """切出「地图(TASK-9d)」常量段 → renderBandOptions 之前的那一段 JS(含 loader/initMap)。"""
+    start = html.index("// 地图(TASK-9d):Leaflet 退役")
+    return html[start:html.index("function renderBandOptions(", start)]
+
+
+def identity_section(html: str) -> str:
+    start = html.index("function identityHtml(")
+    return html[start:html.index("\n\n", start)]
+
+
+def boot_section(html: str) -> str:
+    return html[html.index("(async function boot(){"):]
+
+
+def test_leaflet_is_fully_retired(html: str) -> None:
+    for token in ("leaflet@", "unpkg.com", "tile.openstreetmap.org", "L.map(", "L.tileLayer(",
+                  "L.marker(", "L.circle(", "L.circleMarker(", "L.polyline(", "L.divIcon(",
+                  "L.layerGroup(", "bindPopup(", "bindTooltip(", "fitBounds(", "window.L",
+                  "clearLayers(", ".addTo(map)"):
+        assert token not in html, f"Leaflet 应已退役,页面里还留着 {token}"
+
+
+def test_amap_map_config_is_fetched_before_script(html: str) -> None:
+    boot = boot_section(html)
+    assert "loadMapConfig()" in boot and "loadAMapScript(config)" in boot, "启动要先取配置再注入脚本"
+    assert boot.index("loadMapConfig()") < boot.index("loadAMapScript(config)")
+    assert f'getJSON("{MAP_CONFIG_PATH}")' in html, "key 只能运行时向 /api/map-config 取"
+    assert "localStorage" not in html, "key 不进 localStorage"
+    assert "sessionStorage" not in html, "key 也不进 sessionStorage"
+
+
+def test_amap_security_code_written_before_script_injection(html: str) -> None:
+    loader = amap_section(html)[amap_section(html).index("function loadAMapScript("):]
+    assert "window._AMapSecurityConfig={securityJsCode:code}" in loader, "安全密钥要写进 _AMapSecurityConfig"
+    assert "script.src=AMAP_JS_URL" in loader and "document.head.appendChild(script)" in loader
+    assert loader.index("window._AMapSecurityConfig") < loader.index("script.src=AMAP_JS_URL"), \
+        "§1.7:安全密钥必须在加载 JS API **之前**写好,否则高德报 INVALID_USER_SCODE"
+    assert loader.index("script.src=AMAP_JS_URL") < loader.index("document.head.appendChild(script)")
+    assert 'const AMAP_JS_VERSION="2.0"' in html and AMAP_JS_SRC in html, "走 JS API 2.0 官方地址"
+    assert "AMAP_LOAD_TIMEOUT_MS" in loader and "script.onerror" in loader, "加载失败/超时也要能降级"
+
+
+def test_amap_overlays_used_for_map_elements(html: str) -> None:
+    for token in ('new AMap.Map("map"', "new AMap.Circle(", "new AMap.CircleMarker(",
+                  "new AMap.Marker(", "new AMap.InfoWindow(", "new AMap.Polyline(",
+                  "new AMap.Pixel(", "map.setFitView("):
+        assert token in html, f"高德覆盖物/地图缺少 {token}"
+
+
+def test_amap_ring_is_outer_solid_inner_dashed(html: str) -> None:
+    rings = html[html.index("function drawRings("):html.index("// 高德没有 fitBounds")]
+    assert rings.count("new AMap.Circle(") == 2, "环圈 = 外圆(上限)+ 内圆(下限)"
+    assert 'strokeStyle:"solid"' in rings and 'strokeStyle:"dashed"' in rings, "外实内虚"
+    assert "RING_COLOR" in rings, "颜色沿用现有 CSS 变量口径"
+    assert "band.high*1000" in rings and "band.low*1000" in rings, "半径单位是米(与旧口径一致)"
+    assert "map.setFitView([outerRing]" in html, "fitView 用环圈 bounds"
+    assert "clearOverlays(rings)" in rings, "换 band/起点要先把旧环圈摘掉"
+
+
+def test_amap_pin_click_is_bound_on_marker(html: str) -> None:
+    pin = html[html.index("function makePin("):html.index("function addPin(")]
+    assert 'marker.on("click",()=>openPinPopup(place,index))' in pin, \
+        "§1.7:自绘 content 的 pin,点击必须用 marker.on(\"click\") 绑在 Marker 上"
+    assert "onclick" not in pin, "不要在自绘 div 上挂 onclick(高德不触发)"
+    assert "dispatchEvent" not in html, "合成事件也不触发,别用它兜底"
+    assert "content:pinHtml(meta,reco)" in pin and "categoryMeta(place.category)" in pin, \
+        "pin 仍是分类色 + emoji 自绘 content"
+    assert 'class="pin' in html and 'reco?" reco":""' in html, "沿用原来的 .pin / .pin.reco CSS"
+    assert ".pin.reco{" in html, "推荐 pin 的大号描边样式还在"
+
+
+def test_amap_infowindow_carries_existing_popup(html: str) -> None:
+    start = html.index("function openPinPopup(")
+    popup = html[start:html.index("function focusPlaceRow(", start)]
+    assert "infoWindow.setContent(popupHtml(place,index))" in popup, "InfoWindow 承载现有 popupHtml()"
+    assert "infoWindow.open(map,lngLat(place.lat,place.lng))" in popup
+    assert "openRoutePanel(place)" in popup, "点 pin 一样自动展开路线面板(原 popupopen 行为)"
+    for token in ("js-place-fav", "js-routes", "js-place-detail"):
+        assert token in html, f"popup 里应保留入口按钮 {token}"
+    assert "📄 查看详情" in html and "🚗 路线对比" in html and "收藏目的地" in html
+
+
+def test_amap_coordinates_are_lng_lat(html: str) -> None:
+    assert "function lngLat(lat,lng){return [num(lng),num(lat)];}" in html, "高德是 [lng,lat],要统一转"
+    assert "position:lngLat(place.lat,place.lng)" in html, "pin 坐标走 lngLat()"
+    assert "path:points.map(pair=>[pair[1],pair[0]])" in html, "画线只在交给高德时翻坐标"
+    assert "thinPoints(route.geometry,ROUTE_MAX_POINTS)" in html, "抽稀口径不变"
+    assert "arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW)" in html, "飞机弧线沿用 arcPoints"
+    assert 'strokeStyle:style.dashArray?"dashed":"solid"' in html, "驾车实线 / 铁路·飞机虚线"
+
+
+def test_identity_html_shows_amap_source_and_gcj02(html: str) -> None:
+    section = identity_section(html)
+    assert "AMAP_OSM_TYPE" in section and 'const AMAP_OSM_TYPE="amap"' in html
+    assert "来源:<b>高德</b> · POI " in section, "高德行要标「来源:高德 · POI <id>」"
+    assert "坐标(GCJ-02)" in section, "高德行坐标是 GCJ-02"
+    assert "tags.amap_id" in section, "POI id 显示 TASK-9b 入库的原文"
+    assert "crc32 数字 id" in section, "拿不到原文就退回显示 crc32 数字 id 并标明"
+
+
+def test_identity_html_warns_about_seed_wgs84(html: str) -> None:
+    section = identity_section(html)
+    assert "SEED_SOURCE" in section and "人工种子数据" in section
+    assert section.count("MAP_COORD_WARN") == 2, "种子行与存量 OSM 行都要给 WGS-84 偏差提示"
+    assert 'MAP_COORD_WARN="坐标 WGS-84,与高德 GCJ-02 底图可能偏差 ≤500m"' in html
+
+
+def test_no_amap_key_literal_in_page(html: str) -> None:
+    assert not re.search(r"[a-f0-9]{32}", html), "index.html 里不得出现 32 位 key 样态字符串"
+    assert AMAP_KEY_SAMPLE not in html, "key 只由 /api/map-config 运行时下发,绝不写进页面"
+    assert "securityJsCode:code" in html, "安全密钥只能来自运行时变量"
+
+
+def test_map_fallback_message_present(html: str) -> None:
+    assert f'const MAP_NO_KEY_HINT="{MAP_NO_KEY_HINT}"' in html, "缺 key 的降级文案要写死在页面里"
+    assert 'id="mapFallback"' in html, "地图上要有降级说明层"
+    fallback = html[html.index("function showMapFallback("):]
+    fallback = fallback[:fallback.index("\n\n")]
+    assert '$("mapFallback")' in fallback and "state.mapNote" in fallback
+    assert "照常可用" in fallback, "降级只降地图:其余功能要说清仍可用"
+    assert ENV_JS_KEY in fallback, "降级文案要给出下一步(配哪个 env)"
+    assert "MAP_LOAD_FAIL_HINT" in html, "「没配 key」与「JS API 加载失败」要分两种文案"
+
+
+def test_boot_keeps_working_without_map(html: str) -> None:
+    boot = boot_section(html)
+    assert "if(loaded&&window.AMap)" in boot and "showMapFallback(" in boot
+    assert boot.index("showMapFallback(") < boot.index("await loadMeta()")
+    assert "await loadMeta()" in boot and "await searchCity(" in boot, "地图挂了也要把列表跑起来"
+    assert "initMap();" in boot, "拿到 AMap 才建图"
+
+
+def test_geocoder_labels_and_wording_are_amap(html: str) -> None:
+    labels = js_map(html, "GEOCODER_LABEL")
+    assert place_loader.GEOCODER_AMAP in labels, "geocoder=amap 要有中文文案"
+    assert "高德(主路径)" in labels, "高德是主路径,Photon/Nominatim 降为降级"
+    footer = html[html.index("<footer>"):html.index("</footer>")]
+    for token in ("Overpass", "OSRM", "Leaflet", "OpenStreetMap", "osrm_refs"):
+        assert token not in footer, f"页脚还留着旧数据源文案 {token}"
+    assert "高德 JS API 2.0" in footer and "GCJ-02" in footer and "/api/map-config" in footer
+    body = html[:html.index("<script>")]
+    assert "Overpass" not in body, "页面文案(含按钮 title)不应再提 Overpass"
+    assert "OSRM" not in body, "页面文案不应再提 OSRM"
+
+
+# --- /api/map-config 薄路由:key 只在运行时从 env 读,不进 git ---------------------- #
+
+
+def test_map_config_route_is_registered() -> None:
+    paths = fastapi_app.openapi()["paths"]
+    assert MAP_CONFIG_PATH in paths, "/api/map-config 应已注册(挂在 /api 前缀下)"
+    assert "get" in paths[MAP_CONFIG_PATH], "只开 GET"
+
+
+def test_map_config_returns_empty_strings_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(ENV_JS_KEY, raising=False)
+    monkeypatch.delenv(ENV_SECURITY_CODE, raising=False)
+    body = places_api.map_config()
+    assert body["amap_js_key"] == "" and body["amap_security_js_code"] == "", \
+        "没配 env → 空串(不是 null、不报 404),前端据此给降级文案"
+    assert set(body) == {"amap_js_key", "amap_security_js_code", "note"}, "响应键名固定"
+    assert body["note"] and "高德" in body["note"] and "JS API" in body["note"], "要带中文口径说明"
+
+
+def test_map_config_reads_env_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(ENV_JS_KEY, f"  {AMAP_KEY_SAMPLE}  ")
+    monkeypatch.setenv(ENV_SECURITY_CODE, " sec-code-sample ")
+    body = places_api.map_config()
+    assert body["amap_js_key"] == AMAP_KEY_SAMPLE, "运行时读 env 并 strip"
+    assert body["amap_security_js_code"] == "sec-code-sample"
+    monkeypatch.delenv(ENV_JS_KEY)
+    monkeypatch.delenv(ENV_SECURITY_CODE)
+    assert places_api.map_config() == {
+        "amap_js_key": "", "amap_security_js_code": "",
+        "note": body["note"],
+    }, "env 撤掉后立刻回空串(不在 import 期取值)"
+
+
+def test_map_config_env_names_match_frontend(html: str) -> None:
+    assert places_api.ENV_AMAP_JS_KEY == ENV_JS_KEY
+    assert places_api.ENV_AMAP_SECURITY_JS_CODE == ENV_SECURITY_CODE
+    assert ENV_JS_KEY in html and ENV_SECURITY_CODE in html, "降级文案要说清配哪两个 env"
+    assert "_AMapSecurityConfig" in places_api.MAP_CONFIG_NOTE, "note 要说清安全密钥必须先于脚本写好"
+    assert "/api/map-config" in html, "页面文案里要指到 /api/map-config"

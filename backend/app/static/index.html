@@ -4,8 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Where2Go · 目的地地图(阶段5c · AI 推荐上地图 + 列表长介绍 + 两层收藏)</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
 <style>
   body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f5f7fa;color:#1f2937}
   header{background:#0f766e;color:#fff;padding:14px 22px}
@@ -23,6 +21,13 @@
   button.secondary{background:#e5e7eb;color:#1f2937}
   button:disabled{opacity:.5;cursor:wait}
   #map{height:62vh;min-height:420px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);background:#e8eef1}
+  /* 地图降级(TASK-9d):高德 JS key 未配置 / JS API 加载失败时盖在 #map 上的说明层,
+     只降地图不降功能(列表、收藏、路线面板照常可用),文案里给下一步操作。 */
+  #mapFallback{display:none;position:absolute;top:0;left:0;right:0;bottom:0;z-index:900;
+               border-radius:12px;background:#eef2f4;color:#4b5563;
+               padding:26px 22px;box-sizing:border-box;font-size:14px;line-height:1.75;overflow:auto}
+  #mapFallback b{color:#b45309}
+  #mapFallback .mf-ttl{font-weight:700;font-size:15px;color:#1f2937;margin-bottom:6px}
   .status{color:#6b7280;font-size:13px;margin-top:10px}
   .status b{color:#0f766e}
   .err{color:#b91c1c;background:#fee2e2;padding:10px 14px;border-radius:8px;margin-top:10px;font-size:14px}
@@ -34,7 +39,14 @@
   .pin{width:26px;height:26px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:2px solid #fff;
        box-shadow:0 1px 4px rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;box-sizing:border-box}
   .pin span{transform:rotate(45deg);font-size:12px;line-height:1}
-  .leaflet-popup-content{margin:12px 14px}
+  /* 高德 JS API 2.0:InfoWindow(承载 popupHtml)与 Marker 标签(推荐 pin 的名称)/
+     Text(环圈 hover 提示)的默认样式收一点边距,和原 Leaflet popup 观感对齐。 */
+  .amap-info-content{padding:12px 14px}
+  .amap-info-outer{box-shadow:0 3px 14px rgba(0,0,0,.28);border-radius:10px}
+  .amap-marker-label{border:1px solid #fcd34d;background:#fffbeb;color:#92400e;
+                     font-size:11px;border-radius:7px;padding:1px 6px;line-height:1.6}
+  .ring-lb{background:rgba(255,255,255,.94);border:1px solid #d1d5db;border-radius:6px;
+           padding:2px 7px;font-size:11px;color:#374151;white-space:nowrap}
   .pop .nm{font-weight:700;font-size:15px;margin-bottom:5px}
   .pop .cat{display:inline-block;color:#fff;font-size:12px;padding:1px 8px;border-radius:10px}
   .pop .kv{color:#374151;font-size:13px;margin-top:6px}
@@ -178,6 +190,8 @@
   .pin.reco span{font-size:15px}
   .pl-row{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:8px;background:#fff}
   .pl-row.reco{border-color:#fcd34d;background:#fffbeb}
+  /* 「📄 查看详情」把这一行滚进视野后短暂高亮一下(1.6s 后自动去掉) */
+  .pl-row.pl-focus{border-color:#0f766e;box-shadow:0 0 0 2px #99f6e4}
   .pl-top{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
   .pl-nm{font-weight:700;font-size:14px}
   .pl-km{color:#6b7280;font-size:12px}
@@ -225,7 +239,7 @@
       <div class="field"><label for="category">分类</label><select id="category"></select></div>
       <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
         <div class="inline">
-          <button id="reload" class="secondary" title="忽略库缓存,重新抓一次 Overpass 四分类并集">重新抓取</button>
+          <button id="reload" class="secondary" title="忽略库缓存,重新抓一次高德四分类检索(v3 place/around + place/polygon)">重新抓取</button>
           <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
           <button id="openFav" class="secondary" title="收藏对比 + 勾选组合行程方案(POST/GET/DELETE /api/collections、/api/trip-plans)">⭐ 我的收藏</button>
         </div></div>
@@ -253,6 +267,8 @@
   </div>
   <div id="mapWrap">
     <div id="map"></div>
+    <!-- 地图降级说明(TASK-9d):没配高德 JS key / JS API 加载失败时显示,由 showMapFallback() 填文案 -->
+    <div id="mapFallback" role="note"></div>
     <!-- 路线面板(TASK-2b):点 pin 自动展开;✕ 关闭时清掉地图上的路线 -->
     <aside id="routePanel" aria-live="polite">
       <div class="rp-head">
@@ -295,10 +311,10 @@
     <div class="rp-msg" id="placeListMsg" style="display:none"></div>
     <div id="placeListBody"></div>
     <!-- 加载更多(TASK-6e):GET /api/places 分页(page_size=15 / offset / more)。
-         翻到库尾时带 more=true,后端会再抓一轮 Overpass(约 10-60s);has_more=false 就没更多了。 -->
+         翻到库尾时带 more=true,后端会再抓一轮高德检索(约 3-20s);has_more=false 就没更多了。 -->
     <div class="pl-more" id="moreWrap" style="display:none">
       <button type="button" id="moreBtn" class="secondary" disabled
-              title="按 offset 取下一页 15 条(读库约 1s);翻到库尾时带 more=true,后端会再抓一轮 Overpass(约 10-60s)">加载更多(每页 15)</button>
+              title="按 offset 取下一页 15 条(读库约 1s);翻到库尾时带 more=true,后端会再抓一轮高德检索(约 3-20s)">加载更多(每页 15)</button>
       <span class="fp-sub" id="moreSub"></span>
     </div>
   </div>
@@ -360,13 +376,16 @@
   </div>
 </main>
 <footer>
-  Where2Go 阶段2b · 地图:Leaflet + OpenStreetMap 瓦片 · 数据:Overpass 四分类 tag 并集抓取后入 SQLite,
+  Where2Go 阶段2b · 地图:高德 JS API 2.0(底图与 POI 同源、坐标 GCJ-02;JS key 与安全密钥由
+  /api/map-config 运行时下发,不进 git、不写在本页)· 数据:高德 v3 四分类检索
+  (place/around + 包围盒分格 place/polygon)抓取后入 SQLite,
   同一「城市 + 分段」二次查询只读库不触网 · 归类优先级 滑雪 &gt; 运动 &gt; 人文美食 &gt; 自然,
-  按 OSM (type, id) 去重、一地只属一类 · 一句话简介由 LLM 生成并按 POI 缓存 ·
-  OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据垫底(popup 标注来源=种子)·
-  路线:驾车时长/里程来自 OSRM 真实路网(费用为估算),铁路/飞机为经验估算,
+  按高德 POI id 去重(osm_type="amap";存量 OSM 行按 (type, id))、一地只属一类 ·
+  一句话简介由 LLM 生成并按 POI 缓存 ·
+  高德覆盖不足处由人工种子数据垫底(popup 标注来源=种子,坐标是 WGS-84、与高德底图可能偏差 ≤500m)·
+  路线:驾车时长/里程来自高德驾车路线(费用为估算,过路费按 toll_distance × 区域费率),铁路/飞机为经验估算,
   一律标注「估算 · 非实时 · 以官方为准」,只用 deep-link 跳转官方、不代订不抓价 ·
-  住宿:OSM tourism 检索目的地周边落脚点,价格与简介为 AI 预估参考价
+  住宿:高德住宿类 POI 检索目的地周边落脚点,价格与简介为 AI 预估参考价
   (强标注「AI 预估 · 仅供参考 · 以 OTA 实时为准」),不代订、不抓 OTA 实时价 ·
   行程方案:勾选收藏组合后存进后端(SQLite),总花费由后端按收藏快照的「当时口径」估算
   (quote.kind=estimate + note 双标注),仅供参考、不代订不抓实时价 ·
@@ -374,18 +393,16 @@
   降级为「按距离推荐」并在页面上标明原因 · 长介绍:地图下方列表分批懒加载(每批 10 条、推荐条优先),
   按 POI 缓存在库里、只补还没有的 · 收藏两层:目的地为父节点,它的路线与住宿收藏挂在下面
   (旧收藏没有父级标注时落「未归类」,一条不丢)·
-  起点地理编码:Photon 主路径 + Nominatim 降级,状态栏标注本次是谁答的(geocoder=photon / nominatim;
-  两个源都没答时 none,降级成坐标起点,范围圈照画、分段照查)·
+  起点地理编码:高德主路径 + Photon / Nominatim 降级,状态栏标注本次是谁答的
+  (geocoder=amap / photon / nominatim;三个源都没答时 none,降级成坐标起点,范围圈照画、分段照查)·
   目的地列表分页:首屏每页 15 条,「加载更多」按 offset 逐页取;翻到库尾时带 more=true 让后端再抓一轮
-  Overpass(约 10-60s,期间提示「正在扩抓更多目的地…」),has_more=false 就没有更多了 ·
+  高德检索(约 3-20s,期间提示「正在扩抓更多目的地…」),has_more=false 就没有更多了 ·
   路线费用 v2:驾车给「整车≤4人 / 人均」双标 + 构成明细(高速费 toll / 油费 fuel,高速里程来源
-  osrm_refs|heuristic),铁路标 price_source(seed = 参考真实票价 / estimate = 分档费率估算),
+  amap_toll_distance|heuristic),铁路标 price_source(seed = 参考真实票价 / estimate = 分档费率估算),
   机票给公布价锚定区间「¥A–B(浮动)」;给不出票价时不编数字,只留 OTA deep-link 看实时价 ·
   住宿空态分三档:reason=no_data(附近没找到住宿,给最近一家的距离)/ datasource_error(数据源暂时不可用,
   可重试)/ timeout(查询超时,请稍后再试);价格还在后台回填(estimating=true)时显示「AI 估价生成中,稍后刷新」
 </footer>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>
 const $=id=>document.getElementById(id);
 const DEFAULT_CITY="上海";
@@ -396,6 +413,28 @@ const GEO_TIMEOUT_MS=12000;
 const SEED_SOURCE="种子";
 const CITY_HINTS=["上海","北京","广州","深圳","杭州","苏州","南京","成都","重庆","武汉","西安",
                   "张家口","崇礼","吉林","哈尔滨"];
+// --------------------------------------------------------------------------- //
+// 地图(TASK-9d):Leaflet 退役,底图与覆盖物全走高德 JS API 2.0。
+//   key 与安全密钥**不写在本页**、也不进浏览器本地存储:启动时先 GET /api/map-config
+//   运行时取,取到才动态注入 <script>;没配 / 加载失败 → showMapFallback() 给
+//   「地图未配置高德 JS key」降级文案,列表/收藏/路线面板等其余功能照常可用、不抛 JS 错。
+//   ⚠️ 安全密钥必须在注入 JS API **之前**写进 window._AMapSecurityConfig,否则高德报
+//   INVALID_USER_SCODE。⚠️ 自绘 content 的 pin,点击只能绑 marker.on("click",…)
+//   (在自绘 div 上挂 onclick、或用 JS 合成鼠标事件都不触发)。
+//   ⚠️ 高德坐标是 [lng,lat](与 Leaflet 的 [lat,lng] 相反),统一走 lngLat() 转。
+// --------------------------------------------------------------------------- //
+const AMAP_JS_URL="https://webapi.amap.com/maps";
+const AMAP_JS_VERSION="2.0";
+const AMAP_LOAD_TIMEOUT_MS=12000;
+const AMAP_OSM_TYPE="amap";       // 高德行的 osm_type(去重键 ("amap", POI id),见 services/classify.py)
+const AMAP_SOURCE="高德";          // 与后端 place_source()/tags["source"] 同口径
+const MAP_NO_KEY_HINT="地图未配置高德 JS key";
+const MAP_LOAD_FAIL_HINT="高德 JS API 加载失败(网络不通 / key 无效 / 缺安全密钥)";
+const MAP_COORD_WARN="坐标 WGS-84,与高德 GCJ-02 底图可能偏差 ≤500m";
+const RING_FIT_AVOID=[24,24,24,24];      // setFitView 的四边留白(上右下左),沿用原 fitBounds padding
+const ROUTE_FIT_AVOID=[40,40,40,40];
+const ROUTE_FIT_MAX_ZOOM=12;
+const EXPAND_HINT_SECONDS="约 3-20s";    // more=true 触发服务端高德扩抓的耗时量级(状态栏/按钮共用)
 // 路线面板(TASK-2b,阶段2b):口径全在后端 services/routes.py,前端只管展示/画线/降级提示
 const ROUTE_MAX_POINTS=600;   // 前端再抽稀一次(后端已按 GEOMETRY_MAX_POINTS=1200 抽过)
 const ROUTE_FLIGHT_BOW=.12;   // 飞机示意线弧度(相对起终点连线的垂直偏移比例);铁路画直线
@@ -405,12 +444,12 @@ const ROUTE_MODE_EMOJI={driving:"🚗",rail:"🚄",flight:"✈️"};
 const ROUTE_MODE_LABEL={driving:"驾车",rail:"铁路",flight:"飞机"};
 const ROUTE_LINE_STYLE={
   driving:{color:"#0f766e",weight:5,opacity:.9},
-  rail:{color:"#2563eb",weight:4,opacity:.85,dashArray:"10 8"},
-  flight:{color:"#7c3aed",weight:4,opacity:.85,dashArray:"2 8"}
+  rail:{color:"#2563eb",weight:4,opacity:.85,dashArray:[10,8]},
+  flight:{color:"#7c3aed",weight:4,opacity:.85,dashArray:[2,8]}
 };
 const KIND_BADGE={real:{cls:"real",text:"真实"},estimate:{cls:"est",text:"估算"}};
 const ROUTE_DISCLAIMER="估算·非实时·以官方为准";
-const ROUTE_LINE_LEGEND="画线:🚗 青实线 = OSRM 真实路网折线 · 🚄 蓝虚线 = 铁路示意 · "+
+const ROUTE_LINE_LEGEND="画线:🚗 青实线 = 高德驾车真实折线 · 🚄 蓝虚线 = 铁路示意 · "+
                         "✈️ 紫虚线 = 航段示意(铁路/飞机为起终点示意线,非真实轨迹)";
 
 // 住宿(TASK-3b,阶段3b):口径全在后端 services/stays.py + /api/stays,前端只管展示与降级提示。
@@ -434,14 +473,20 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
              reco:{payload:null,items:[],details:{},pending:0,loading:false,failed:false,
                    busy:false,auto:true,token:0,detailToken:0},
              list:{reco:0,other:0},
-             tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false}};
-let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null;
+             tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false},
+             mapNote:""};   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
+// 高德覆盖物句柄:rings/pins/routeLayer 是**数组**(高德没有 Leaflet 的 layerGroup,
+// 清图层 = clearOverlays() 逐个 setMap(null));infoWindow 承载 popupHtml(),hoverTip 代替 bindTooltip。
+let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null,
+    infoWindow=null,hoverTip=null;
 
 function esc(value){
   return String(value===null||value===undefined?"":value)
     .replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
-function setStatus(html){$("status").innerHTML=html;}
+// 状态栏:地图降级时把「地图未配置高德 JS key」常驻在最前面(后面的业务状态照常刷新,
+// 但降级文案不会被 loadMeta/searchCity 的 setStatus 冲掉)
+function setStatus(html){$("status").innerHTML=(state.mapNote||"")+html;}
 function showErr(message){$("err").textContent=message||"";$("err").style.display=message?"block":"none";}
 // 轻提示(不是错误):定位被拒、城市没搜到、种子数据来源等。warn=true 用黄色表示"需要注意"
 function showNote(message,warn){
@@ -468,15 +513,103 @@ function currentBand(){
     ||state.meta.bands[0]||{key:state.band,label:state.band,low:50,high:100};
 }
 
+// 运行时取地图配置:/api/map-config 只从后端 env 读 key(接口失败也当"没 key",不抛错)
+async function loadMapConfig(){
+  try{
+    const config=await getJSON("/api/map-config");
+    return (config&&typeof config==="object")?config:{};
+  }catch(error){
+    return {amap_js_key:"",amap_security_js_code:""};
+  }
+}
+
+// 动态注入高德 JS API 2.0:**先**写 window._AMapSecurityConfig(安全密钥),**再**挂 <script>。
+// 没 key / onerror / 超时 / 加载完但没有 window.AMap → resolve(false),由 boot 给降级文案。
+function loadAMapScript(config){
+  const key=String((config&&config.amap_js_key)||"").trim();
+  if(!key) return Promise.resolve(false);
+  return new Promise(resolve=>{
+    const code=String((config&&config.amap_security_js_code)||"").trim();
+    if(code) window._AMapSecurityConfig={securityJsCode:code};   // 必须在脚本之前
+    let settled=false;
+    const finish=ok=>{if(!settled){settled=true;resolve(!!ok);}};
+    const timer=setTimeout(()=>finish(false),AMAP_LOAD_TIMEOUT_MS);
+    const script=document.createElement("script");
+    script.async=true;
+    script.src=AMAP_JS_URL+"?v="+encodeURIComponent(AMAP_JS_VERSION)+"&key="+encodeURIComponent(key);
+    script.onload=()=>{clearTimeout(timer);finish(!!window.AMap);};
+    script.onerror=()=>{clearTimeout(timer);finish(false);};
+    document.head.appendChild(script);
+  });
+}
+
+// 地图降级:盖一层中文说明(不抛 JS 错),并把画图层全部置空 → drawRings/drawPins/drawRouteLine
+// 的既有守卫(if(!map||!pins))自动静默跳过,列表 / 收藏 / 路线面板 / 加载更多照常可用。
+function showMapFallback(reason){
+  const why=String(reason||MAP_NO_KEY_HINT);
+  const box=$("mapFallback");
+  if(box){
+    box.innerHTML='<div class="mf-ttl">⚠ '+esc(why)+"</div>"+
+      "<div>目的地列表、AI 推荐、长介绍、⭐ 收藏与 🧳 行程方案、路线对比(时长 / 费用 / 跳转)"+
+      "都<b>照常可用</b>,只是地图画不出来。</div>"+
+      "<div>下一步:在服务端环境里配 <b>WHERE2GO_AMAP_JS_KEY</b>"+
+      "(用 JS API 2.0 还要配 <b>WHERE2GO_AMAP_SECURITY_JS_CODE</b>),重启后端后刷新本页 —— "+
+      "前端运行时从 <b>/api/map-config</b> 取 key,页面源码里不会出现明文 key。</div>";
+    box.style.display="block";
+  }
+  state.mapNote='<b style="color:#b45309">⚠ '+esc(why)+"</b>(列表与 API 照常可用) · ";
+  map=null;rings=null;pins=null;routeLayer=null;infoWindow=null;
+  outerRing=null;routeLine=null;hideHoverTip();
+}
+
+// 高德全链 [lng,lat](Leaflet 是 [lat,lng]);后端/入库一律 lat,lng → 这里统一转,别处不再手写反序
+function lngLat(lat,lng){return [num(lng),num(lat)];}
+
+// 清图层:高德没有 layerGroup,rings/pins/routeLayer 就是覆盖物数组
+function clearOverlays(list){
+  if(!list) return;
+  while(list.length){
+    const item=list.pop();
+    if(item&&item.setMap) item.setMap(null);
+  }
+}
+
+// 悬停提示(代替 Leaflet 的 bindTooltip):高德矢量覆盖物没有 tooltip,
+// 用一个共用的 AMap.Text 浮层在 mouseover 时定位显示、mouseout 时隐藏。
+// ⚠️ 浮层必须 pointer-events:none —— 否则它盖在光标上会让底下的覆盖物立刻收到 mouseout,
+//    形成「显示→隐藏→显示」的抖动死循环。
+function showHoverTip(text,lnglat){
+  if(!map||!text||!lnglat) return;
+  if(!hoverTip){
+    hoverTip=new AMap.Text({text:String(text),position:lnglat,anchor:"center",zIndex:200,
+      style:{"background-color":"rgba(255,255,255,.94)","border":"1px solid #d1d5db",
+             "border-radius":"6px","padding":"2px 7px","font-size":"11px","color":"#374151",
+             "white-space":"nowrap","pointer-events":"none"}});
+    hoverTip.setMap(map);
+    return;
+  }
+  hoverTip.setText(String(text));
+  hoverTip.setPosition(lnglat);
+  hoverTip.show();
+}
+function hideHoverTip(){if(hoverTip) hoverTip.hide();}
+function bindHoverTip(overlay,text){
+  if(!overlay||!text||!overlay.on) return;
+  overlay.on("mouseover",event=>showHoverTip(text,event&&event.lnglat));
+  overlay.on("mouseout",hideHoverTip);
+}
+
 function initMap(){
-  map=L.map("map").setView(FALLBACK_CENTER,8);
-  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{
-    maxZoom:19,
-    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-  }).addTo(map);
-  rings=L.layerGroup().addTo(map);
-  pins=L.layerGroup().addTo(map);
-  routeLayer=L.layerGroup().addTo(map);   // 路线画线专用图层:同一时刻只留一条
+  map=new AMap.Map("map",{
+    center:lngLat(FALLBACK_CENTER[0],FALLBACK_CENTER[1]),
+    zoom:8,
+    viewMode:"2D",
+    resizeEnable:true
+  });
+  rings=[];        // 环形范围圈:外圆实线 / 内圆虚线 / 起点圆心(+ hover 文案)
+  pins=[];         // POI pin:AMap.Marker + 分类色/emoji 自绘 content
+  routeLayer=[];   // 路线画线专用:同一时刻只留一条
+  infoWindow=new AMap.InfoWindow({isCustom:false,autoMove:true,offset:new AMap.Pixel(0,-30)});
 }
 
 function renderBandOptions(){
@@ -508,7 +641,7 @@ function renderLegend(counts){
   const llm=state.meta.llm||{};
   $("legend").innerHTML+='<span><b>归类优先级</b> '+esc(priority)+"</span>"+
     '<span><b>简介</b> '+(llm.enabled?esc(llm.label||llm.provider||"LLM"):"未配置 LLM key,简介留空")+"</span>"+
-    '<span title="OSM 国内滑雪/运动覆盖不足,缺口由人工种子数据(真实经纬度 + 静态简介)垫底">'+
+    '<span title="高德覆盖不足处由人工种子数据(真实经纬度 + 静态简介)垫底;种子坐标是 WGS-84,与高德 GCJ-02 底图可能偏差 ≤500m">'+
     "<b>种子数据</b> "+seedLegend()+"</span>";
 }
 
@@ -520,25 +653,42 @@ function seedLegend(){
   return "人工补录 "+(seeds.total||0)+" 条(滑雪场 "+(by["滑雪场"]||0)+" / 运动 "+(by["运动"]||0)+")";
 }
 
-// 当前 band 的环形范围圈:外圆(上限半径)+ 内圆虚线(下限半径)= 环带示意
+// 当前 band 的环形范围圈:外圆(上限半径,实线)+ 内圆(下限半径,虚线)= 环带示意。
+// 颜色/线宽沿用原来的 RING_COLOR 与 weight 口径;半径单位都是**米**(与 Leaflet 一致)。
 function drawRings(){
-  if(!map||!rings||!state.origin) return;   // Leaflet 没加载成功时静默跳过(boot 里已给降级提示)
-  rings.clearLayers();
+  if(!map||!rings||!state.origin) return;   // 高德 JS API 没加载成功时静默跳过(boot 里已给降级文案)
+  clearOverlays(rings);
+  hideHoverTip();
   outerRing=null;
   const band=currentBand();
-  const at=[state.origin.lat,state.origin.lng];
-  outerRing=L.circle(at,{radius:band.high*1000,color:RING_COLOR,weight:2,fillColor:RING_COLOR,fillOpacity:.06});
-  const innerRing=L.circle(at,{radius:band.low*1000,color:RING_COLOR,weight:1.5,dashArray:"6 6",fill:false});
-  outerRing.bindTooltip(band.label+" 外圈("+band.high+" km)");
-  innerRing.bindTooltip(band.label+" 内圈("+band.low+" km)");
-  const center=L.circleMarker(at,{radius:6,color:"#fff",weight:2,fillColor:RING_COLOR,fillOpacity:1});
-  center.bindTooltip(state.origin.name+"(起点)",{direction:"top"});
-  rings.addLayer(outerRing);rings.addLayer(innerRing);rings.addLayer(center);
+  const at=lngLat(state.origin.lat,state.origin.lng);
+  outerRing=new AMap.Circle({center:at,radius:band.high*1000,bubble:true,zIndex:20,
+    strokeColor:RING_COLOR,strokeWeight:2,strokeOpacity:.9,strokeStyle:"solid",
+    fillColor:RING_COLOR,fillOpacity:.06});
+  bindHoverTip(outerRing,band.label+" 外圈("+band.high+" km)");
+  rings.push(outerRing);
+  if(Number(band.low)>0){   // 下限 0 的那档(市区/近郊)没有内圈
+    const innerRing=new AMap.Circle({center:at,radius:band.low*1000,bubble:true,zIndex:21,
+      strokeColor:RING_COLOR,strokeWeight:1.5,strokeOpacity:.9,strokeStyle:"dashed",
+      strokeDasharray:[6,6],fillOpacity:0});
+    bindHoverTip(innerRing,band.label+" 内圈("+band.low+" km)");
+    rings.push(innerRing);
+  }
+  const center=new AMap.CircleMarker({center:at,radius:6,bubble:true,zIndex:30,
+    strokeColor:"#ffffff",strokeWeight:2,strokeOpacity:1,fillColor:RING_COLOR,fillOpacity:1});
+  bindHoverTip(center,state.origin.name+"(起点)");
+  rings.push(center);
+  rings.forEach(item=>item.setMap(map));
 }
 
-function fitRings(){if(map&&outerRing&&outerRing.getBounds) map.fitBounds(outerRing.getBounds(),{padding:[24,24]});}
+// 高德没有 fitBounds:用 setFitView 把外圈圆 fit 进视野(四周留白沿用原来的 padding 24)
+function fitRings(){
+  if(!map||!outerRing) return;
+  map.setFitView([outerRing],true,RING_FIT_AVOID);
+}
 
-// popup 卡片:名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介 + OSM 身份脚注 + 路线入口
+// popup 卡片(高德 InfoWindow 承载):名称 + 分类(与 pin 同色)+ 距起点 + LLM 一句话简介
+// + 来源身份脚注 + ⭐收藏 / 🚗路线对比 / 📄查看详情 三个入口(按钮一律走 document 事件委托)
 function popupHtml(place,index){
   const meta=categoryMeta(place.category);
   const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
@@ -552,17 +702,34 @@ function popupHtml(place,index){
     '<div class="intro'+(hasIntro?"":" empty")+'">'+intro+"</div>"+
     '<div class="acts">'+placeFavButtonHtml(place,index)+
       '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+
-      '" title="重新拉一次 /api/routes 并跳到路线面板">🚗 路线对比(时长 / 费用 / 跳转)</button></div>'+
+      '" title="重新拉一次 /api/routes 并跳到路线面板">🚗 路线对比(时长 / 费用 / 跳转)</button>'+
+      '<button type="button" class="pop-go js-place-detail" data-id="'+Number(place.id)+
+      '" title="跳到地图下方列表里的这一条(长介绍 / 收藏 / 路线入口都在那儿;详情弹窗由 TASK-8b 接上)">'+
+      "📄 查看详情</button></div>"+
     identityHtml(place)+"</div>";
 }
 
-// 来源脚注:种子数据没有真实 OSM id,标注"来源:人工种子数据";OSM 数据照旧显示 id
+// 来源脚注(TASK-9d 高德口径):
+//   高德行(osm_type="amap") → 「来源:高德 · POI <tags.amap_id 原文> · 坐标(GCJ-02)」;
+//     tags.amap_id 是 TASK-9b 入库的高德 POI id 原文(osm_id 只是它的 crc32、不可逆),
+//     拿不到原文就退回显示那个 crc32 数字 id,并标明。
+//   种子行 → 人工种子数据 + WGS-84 偏差提示(种子坐标不做转换,与高德底图可能差 ≤500m)。
+//   存量 OSM 行 → 照旧显示 (type, id),同样标 WGS-84 偏差。
 function identityHtml(place){
   const coord=" · "+Number(place.lat).toFixed(4)+", "+Number(place.lng).toFixed(4);
+  const tags=(place&&place.tags)||{};
   if(place.source===SEED_SOURCE){
-    return '<div class="src">来源:<b>人工种子数据</b>(OSM 国内覆盖不足,坐标人工核对)'+coord+"</div>";
+    return '<div class="src">来源:<b>人工种子数据</b>(高德覆盖不足处人工补录,坐标人工核对)· '+
+      esc(MAP_COORD_WARN)+coord+"</div>";
   }
-  return '<div class="osm">来源:OSM · '+esc(place.osm_type)+"/"+esc(place.osm_id)+coord+"</div>";
+  if(String(place.osm_type||"").toLowerCase()===AMAP_OSM_TYPE||place.source===AMAP_SOURCE){
+    const poiId=String(tags.amap_id||"").trim();
+    return '<div class="src">来源:<b>高德</b> · POI '+
+      (poiId?esc(poiId):("(crc32 数字 id) "+esc(place.osm_id)))+
+      " · 坐标(GCJ-02)"+coord+"</div>";
+  }
+  return '<div class="osm">来源:OSM(存量行)· '+esc(place.osm_type)+"/"+esc(place.osm_id)+
+    " · "+esc(MAP_COORD_WARN)+coord+"</div>";
 }
 
 // --------------------------------------------------------------------------- //
@@ -744,14 +911,14 @@ function routeCardHtml(route){
   const badge=KIND_BADGE[route.kind]||KIND_BADGE.estimate;
   const selected=(state.routePanel.mode===mode);
   const degraded=route.degraded
-    ? '<span class="badge deg" title="OSRM 本次没给出驾车时长/里程,不做瞎估;跳转导航照常可用">数据源不可用</span>'
+    ? '<span class="badge deg" title="高德本次没给出驾车时长/里程,不做瞎估;跳转导航照常可用">数据源不可用</span>'
     : "";
   return '<div class="rcard'+(selected?" sel":"")+'" role="button" tabindex="0" '+
     'aria-pressed="'+(selected?"true":"false")+'" data-mode="'+esc(mode)+'" '+
     'title="点一下在地图上画这条线">'+
     '<div class="rp-top"><span class="rp-ico">'+esc(route.emoji||ROUTE_MODE_EMOJI[mode]||"🚗")+"</span>"+
       '<span class="rp-lb">'+esc(route.label||ROUTE_MODE_LABEL[mode]||mode||"路线")+"</span>"+
-      '<span class="badge '+badge.cls+'" title="真实=OSRM 路网数据,估算=经验系数">'+badge.text+"</span>"+
+      '<span class="badge '+badge.cls+'" title="真实=高德路线数据,估算=经验系数">'+badge.text+"</span>"+
       degraded+"</div>"+
     '<div class="rp-figs">'+
       '<span class="rp-fig"><b>'+esc(fmtDuration(route.duration_min))+"</b>时长</span>"+
@@ -805,15 +972,16 @@ function routeTooltip(route,schematic){
   const label=route.label||ROUTE_MODE_LABEL[route.mode]||route.mode||"路线";
   const badge=(KIND_BADGE[route.kind]||KIND_BADGE.estimate).text;
   const figs=[fmtDuration(route.duration_min),fmtCost(route.cost_cny),fmtKm(route.distance_km)].join(" · ");
-  return label+" "+figs+"("+badge+")"+(schematic?" · 示意线,非真实轨迹":" · OSRM 真实折线");
+  return label+" "+figs+"("+badge+")"+(schematic?" · 示意线,非真实轨迹":" · 高德真实折线");
 }
 
 function clearRouteLine(){
-  if(routeLayer) routeLayer.clearLayers();
+  clearOverlays(routeLayer);
+  hideHoverTip();
   routeLine=null;
 }
 
-// 画线:驾车有 geometry 就画真实折线(抽稀后),铁路/飞机(以及 OSRM 降级)画起终点示意线;
+// 画线:驾车有 geometry 就画真实折线(抽稀后),铁路/飞机(以及高德降级)画起终点示意线;
 // 先清后画 → 同一时刻地图上只有一条路线
 function drawRouteLine(route){
   clearRouteLine();
@@ -825,10 +993,19 @@ function drawRouteLine(route){
   const schematic=!points||points.length<2;
   if(schematic) points=(route.mode==="flight")?arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW):[ends.from,ends.to];
   const style=ROUTE_LINE_STYLE[route.mode]||ROUTE_LINE_STYLE.rail;
-  routeLine=L.polyline(points,{color:style.color,weight:style.weight,opacity:style.opacity,
-    dashArray:style.dashArray||null});
-  routeLine.bindTooltip(routeTooltip(route,schematic),{sticky:true});
-  routeLayer.addLayer(routeLine);
+  // 抽稀/弧线口径完全不变(仍是 [lat,lng] 数组),只在交给高德时翻成 [lng,lat]
+  routeLine=new AMap.Polyline({
+    path:points.map(pair=>[pair[1],pair[0]]),
+    strokeColor:style.color,strokeWeight:style.weight,strokeOpacity:style.opacity,
+    strokeStyle:style.dashArray?"dashed":"solid",
+    strokeDasharray:style.dashArray||[10,5],
+    lineJoin:"round",lineCap:"round",zIndex:50,bubble:true
+  });
+  const tip=routeTooltip(route,schematic);
+  routeLine.on("mouseover",event=>showHoverTip(tip,event&&event.lnglat));
+  routeLine.on("mouseout",hideHoverTip);
+  routeLayer.push(routeLine);
+  routeLine.setMap(map);
 }
 
 function selectRouteMode(mode,fit){
@@ -840,7 +1017,8 @@ function selectRouteMode(mode,fit){
     card.setAttribute("aria-pressed",on?"true":"false");
   });
   drawRouteLine(currentRoute());
-  if(fit&&map&&routeLine&&routeLine.getBounds) map.fitBounds(routeLine.getBounds(),{padding:[40,40],maxZoom:12});
+  // 高德没有 fitBounds:setFitView 只 fit 这一条线(留白 40、zoom 上限 12,与原口径一致)
+  if(fit&&map&&routeLine) map.setFitView([routeLine],true,ROUTE_FIT_AVOID,ROUTE_FIT_MAX_ZOOM);
 }
 
 function applyRouteData(data){
@@ -857,7 +1035,7 @@ function applyRouteData(data){
   renderRouteCards(routes);
   setRouteMsg("");
   showRouteLegend(true);
-  // 默认选中能画出真实折线的那条(通常是驾车),OSRM 降级时退回第一条有数字的
+  // 默认选中能画出真实折线的那条(通常是驾车),高德降级时退回第一条有数字的
   const preferred=routes.find(route=>!route.degraded&&Array.isArray(route.geometry)&&route.geometry.length>1)||
                   routes.find(route=>!route.degraded)||routes[0];
   selectRouteMode(preferred?preferred.mode:null,false);
@@ -879,7 +1057,7 @@ async function loadRoutes(place,token){
     showRouteLegend(false);
     clearRouteLine();
     setRouteMsg("路线查询失败:"+((error&&error.message)||error)+
-      "(公共 OSRM 可能繁忙,可点「重试」;地图与目的地列表不受影响)","err");
+      "(高德路线接口可能繁忙或超配额,可点「重试」;地图与目的地列表不受影响)","err");
   }
 }
 
@@ -916,7 +1094,7 @@ async function openRoutePanel(place,options){
   }
   const cached=state.routeCache[routeCacheKey(place)];
   if(cached){applyRouteData(cached);return;}
-  setRouteMsg("正在规划路线(OSRM 驾车真实路网 + 铁路/飞机估算,约 2-8s)…");
+  setRouteMsg("正在规划路线(高德驾车真实路网 + 铁路/飞机估算,约 2-8s)…");
   await loadRoutes(place,token);
 }
 
@@ -937,7 +1115,7 @@ function closeRoutePanel(){
 // --------------------------------------------------------------------------- //
 // 住宿区块(TASK-3b):openRoutePanel 时并行拉 /api/stays(不阻塞路线);
 // token 守卫与路线同套路:换 pin / 关面板后,在飞的住宿响应一律作废。
-// 冷坐标首查要过 Overpass + LLM 估价,可能 30-120s —— 给可见进度文案;
+// 冷坐标首查要过高德住宿检索 + LLM 估价,可能 10-60s —— 给可见进度文案;
 // DB 即缓存,同坐标半径二查 source=db 秒回。失败只降级提示,不影响路线与地图。
 // --------------------------------------------------------------------------- //
 function staysCacheKey(place){return [num(place.lat).toFixed(7),num(place.lng).toFixed(7),STAYS_RADIUS_KM].join("|");}
@@ -1010,7 +1188,7 @@ function stayCardHtml(item,index){
     '<div class="sc-nm">'+meta.emoji+" "+esc(item.name||"(无名住宿)")+"</div>"+
     '<div class="sc-badges"><span class="badge">'+esc(meta.label)+"</span>"+
       '<span class="badge est">'+price+"</span>"+
-      '<span class="sc-est" title="价格是 LLM 依据名称/类型/OSM 标签估的参考价区间,不是报价">'+
+      '<span class="sc-est" title="价格是 LLM 依据名称/类型/高德标签估的参考价区间,不是报价">'+
         esc(item.estimated||STAYS_EST_FALLBACK)+"</span></div>"+
     '<div class="sc-meta">距目的地 '+esc(isFinite(km)?(km.toFixed(1)+" km"):"—")+
       (item.currency?(" · "+esc(item.currency)):"")+"</div>"+
@@ -1045,9 +1223,9 @@ const STAY_REASON_TEXT={no_data:"附近没找到住宿",datasource_error:"数据
   timeout:"查询超时,请稍后再试"};
 const STAY_REASON_TONE={no_data:"warn",datasource_error:"err",timeout:"warn"};
 const STAY_REASON_NEXT={
-  no_data:"OSM 覆盖有限;可换个目的地、放大分段,或稍后再试",
-  datasource_error:"Overpass 检索报错或命中失败负缓存;点「重试」再拉一次,路线与地图不受影响",
-  timeout:"公共 Overpass 繁忙时会这样;点「重试」再来一次"};
+  no_data:"高德住宿类 POI 覆盖有限;可换个目的地、放大分段,或稍后再试",
+  datasource_error:"高德住宿检索报错或命中失败负缓存;点「重试」再拉一次,路线与地图不受影响",
+  timeout:"高德接口繁忙/超配额时会这样;点「重试」再来一次"};
 const STAY_EMPTY_FALLBACK="该目的地周边 "+STAYS_RADIUS_KM+" km 内暂时没有查到住宿";
 const STAY_ESTIMATING_TEXT="AI 估价生成中,稍后刷新";
 function stayReasonKey(result){return String((result&&result.reason)||"");}
@@ -1058,7 +1236,7 @@ function stayEmptyText(result){
   const nearest=num(result&&result.nearest_km);
   const near=(reason==="no_data"&&isFinite(nearest))
     ? (",最近的在 "+Math.max(0,nearest).toFixed(1)+" km 外"):"";
-  return head+near+"("+(STAY_REASON_NEXT[reason]||"OSM 覆盖有限;可换个目的地或稍后重试")+")。";
+  return head+near+"("+(STAY_REASON_NEXT[reason]||"高德住宿类 POI 覆盖有限;可换个目的地或稍后重试")+")。";
 }
 function applyStayData(result,place){
   state.stays.loadedKey=staysCacheKey(place);
@@ -1076,7 +1254,7 @@ function applyStayData(result,place){
   }
   renderStayCards(result);
   const reason=stayReasonKey(result);
-  // 库里有行但这次检索降级了(如 Overpass 报错):行照显示,同时把原因说清楚并亮重试
+  // 库里有行但这次检索降级了(如高德报错):行照显示,同时把原因说清楚并亮重试
   if(reason) setStayMsg("本次为降级返回(reason="+reason+"):"+stayEmptyText(result),stayEmptyTone(result));
   else if(estimating)
     setStayMsg(STAY_ESTIMATING_TEXT+"(后台正在批量回填价格,重开面板或点「重试」即可看到)","warn");
@@ -1092,7 +1270,7 @@ async function loadStays(place,token){
   }catch(error){
     if(token!==state.stays.token) return;
     renderStayCards([]);
-    setStayMsg("住宿查询失败:"+((error&&error.message)||error)+"(公共 Overpass/LLM 可能繁忙,可点「重试」;路线与地图不受影响)","err");
+    setStayMsg("住宿查询失败:"+((error&&error.message)||error)+"(高德/LLM 可能繁忙,可点「重试」;路线与地图不受影响)","err");
   }
 }
 // 打开住宿区块:已有同坐标缓存数据直接复用,否则先给进度文案再拉
@@ -1108,7 +1286,7 @@ function openStaySection(place,token){
     applyStayData(state.stays.payload,place);
     return;
   }
-  setStayMsg("正在检索周边住宿并做 AI 价格预估(库缓存命中约 1s;冷坐标首查要过 Overpass + LLM,可能 30-120s)…");
+  setStayMsg("正在检索周边住宿并做 AI 价格预估(库缓存命中约 1s;冷坐标首查要过高德检索 + LLM,可能 10-60s)…");
   loadStays(place,token);
 }
 function closeStaySection(){
@@ -1163,6 +1341,14 @@ function onDocumentClick(event){
     }
     return;
   }
+  // 「📄 查看详情」(popup 内,TASK-9d):跳到地图下方列表里的这一行并高亮;
+  // TASK-8b 的详情弹窗(图片/类别要点)会接在同一个 class 上,前端不用改调用点。
+  const detailJump=target.closest(".js-place-detail");
+  if(detailJump){
+    event.stopPropagation();
+    focusPlaceRow(detailJump.getAttribute("data-id"));
+    return;
+  }
   // 收藏弹层内的取消收藏按钮
   const delButton=target.closest("#favPanelList .js-fav-del");
   if(delButton){
@@ -1197,19 +1383,76 @@ function onDocumentKeydown(event){
   selectRouteMode(card.getAttribute("data-mode"),true);
 }
 
+// --------------------------------------------------------------------------- //
+// POI pin(TASK-9d 高德版):AMap.Marker + **自绘 content**(沿用原来的 .pin / .pin.reco
+// CSS:分类色 + emoji),偏移量口径与 Leaflet 的 iconAnchor 一致 —— 让针尖(盒子底部中心)
+// 正好落在坐标上;推荐 pin 另加 AMap 标签显示「★ 名称 · 距离」。
+// ⚠️ 自绘 content 的点击**必须**绑在 Marker 上(marker.on("click",…)):在自绘 div 上挂
+//    onclick、或用 JS 合成鼠标事件都不触发(AMap 在 overlay 层代理事件)。
+// --------------------------------------------------------------------------- //
+function pinHtml(meta,reco){
+  return '<div class="pin'+(reco?" reco":"")+'" style="background:'+meta.color+'">'+
+    "<span>"+meta.emoji+"</span></div>";
+}
+function makePin(place,index,reco){
+  const meta=categoryMeta(place.category);
+  const size=reco?34:26;
+  const marker=new AMap.Marker({
+    position:lngLat(place.lat,place.lng),
+    content:pinHtml(meta,reco),
+    anchor:"top-left",
+    offset:new AMap.Pixel(-size/2,-size),   // 针尖对准坐标(等价 Leaflet iconAnchor [size/2,size])
+    title:reco?"":(place.name||""),
+    zIndex:reco?160:120,
+    cursor:"pointer"
+  });
+  marker.on("click",()=>openPinPopup(place,index));   // 点 pin → InfoWindow + 侧栏路线面板自动展开
+  if(reco){
+    marker.setLabel({content:"★ "+esc(place.name||"(无名)")+" · "+fmtKm(place.distance_km),
+      direction:"top",offset:new AMap.Pixel(0,-4)});
+  }
+  return marker;
+}
+function addPin(place,index,reco){
+  const marker=makePin(place,index,reco);
+  pins.push(marker);
+  marker.setMap(map);
+  return marker;
+}
+function closePinPopup(){
+  if(infoWindow&&infoWindow.close) infoWindow.close();
+}
+// 点 pin:高德 InfoWindow 承载**现有 popupHtml()**(⭐收藏 / 🚗路线对比 / 📄查看详情 都在里面,
+// 按钮事件走 document 委托,InfoWindow 内容在 DOM 里所以照常命中);同时展开路线面板
+// —— 等价于原来 Leaflet 的 bindPopup + marker.on("popupopen",…)。
+function openPinPopup(place,index){
+  if(!map||!infoWindow) return;
+  infoWindow.setContent(popupHtml(place,index));
+  infoWindow.open(map,lngLat(place.lat,place.lng));
+  openRoutePanel(place);
+}
+// 「📄 查看详情」:把地图下方列表里对应那一行滚进视野并高亮(TASK-8b 的详情弹窗接在这里)
+function focusPlaceRow(placeId){
+  const row=document.querySelector('#placeListBody .pl-row[data-id="'+Number(placeId)+'"]');
+  if(!row){
+    showNote("这条目的地还不在下方列表里(地图可能只画了 AI 推荐的几条):"+
+      "把「地图显示范围」切成「全部目的地」,或点「加载更多」后再试。",true);
+    return;
+  }
+  row.scrollIntoView({behavior:"smooth",block:"center"});
+  row.classList.add("pl-focus");
+  setTimeout(()=>row.classList.remove("pl-focus"),1600);
+}
+
 function drawPins(places){
   if(!pins) return;
   closeRoutePanel();   // 换 band/分类/起点或重抓:旧 pin 可能已不在图上,面板与画线一并清掉
   state.places=places||[];
-  pins.clearLayers();
+  clearOverlays(pins);
+  closePinPopup();
   state.places.forEach((place,index)=>{
-    const meta=categoryMeta(place.category);
-    const icon=L.divIcon({className:"",iconSize:[26,26],iconAnchor:[13,26],popupAnchor:[0,-24],
-      html:'<div class="pin" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
-    const marker=L.marker([place.lat,place.lng],{icon:icon,title:place.name||""});
-    marker.bindPopup(popupHtml(place,index));
-    marker.on("popupopen",()=>openRoutePanel(place));   // 点 pin → 侧栏路线面板自动展开
-    pins.addLayer(marker);
+    if(!coordsReady(place)) return;
+    addPin(place,index,false);
   });
 }
 
@@ -1223,7 +1466,7 @@ function renderCityHints(){
   $("cityList").innerHTML=CITY_HINTS.map(name=>'<option value="'+esc(name)+'"></option>').join("");
 }
 
-// 起点城市搜索:复用后端 /api/geocode(Nominatim),顺便拿到"哪些分段已入库"。
+// 起点城市搜索:复用后端 /api/geocode(高德主 + Photon/Nominatim 降级),顺便拿到"哪些分段已入库"。
 // 空输入与"没搜到"都不当错误:给可见提示并**保留当前起点**(地图与已渲染的 pin 不动)。
 async function searchCity(city){
   const name=(city||"").trim();
@@ -1232,7 +1475,7 @@ async function searchCity(city){
     return;
   }
   clearMessages();setBusy(true);
-  setStatus('正在用 Nominatim 定位「'+esc(name)+'」…');
+  setStatus('正在用高德地理编码定位「'+esc(name)+'」…');
   try{
     applyOrigin(await getJSON("/api/geocode?city="+encodeURIComponent(name)));
     await loadPlaces(false);
@@ -1317,16 +1560,16 @@ function onLocateFailed(error){
 // --------------------------------------------------------------------------- //
 // 加载更多(TASK-6e,配合 TASK-6b 的 /api/places 分页):首屏只取第 1 页 15 条,
 // 「加载更多」按 offset 逐页取;翻到库尾(offset ≥ total_in_db)时带 more=true,后端会
-// 再抓一轮 Overpass(target_total=30×(fetch_rounds+1),实测 10-60s)—— 这期间状态栏给
+// 再抓一轮高德检索(target_total=30×(fetch_rounds+1),实测 3-20s)—— 这期间状态栏给
 // 「正在扩抓更多目的地…」;has_more=false 就把按钮收掉。分页口径全在后端 app/api/places.py
 // (page_size / offset / more / total_in_db / has_more / fetch_rounds),前端不自己算页。
 // --------------------------------------------------------------------------- //
 const PLACES_PAGE_SIZE=15;                     // 与后端 PAGE_SIZE_DEFAULT 同口径(「每页 15」)
 const MORE_BTN_LABEL="加载更多(每页 15)";
-const MORE_EXPAND_HINT="正在扩抓更多目的地…";    // more=true 触发服务端 Overpass 扩抓时的进度文案
+const MORE_EXPAND_HINT="正在扩抓更多目的地…";    // more=true 触发服务端高德扩抓时的进度文案
 const MORE_PAGE_HINT="正在加载下一页…";
 // 起点地理编码来源(TASK-6a 的 geocoder 字段):photon 主路径 / nominatim 降级 / none = 两个源都没答
-const GEOCODER_LABEL={photon:"Photon(主路径)",nominatim:"Nominatim(降级)",
+const GEOCODER_LABEL={amap:"高德(主路径)",photon:"Photon(降级)",nominatim:"Nominatim(降级)",
   none:"none(未解析,已降级为坐标起点)"};
 
 // 分页参数一律走 URLSearchParams(自动百分号编码);more=true 表示"翻到库尾就再抓一轮"
@@ -1344,7 +1587,7 @@ function geocoderNote(){
   const key=String(state.geocoder||"");
   return key?(" · 起点解析:<b>"+esc(GEOCODER_LABEL[key]||key)+"</b>"):"";
 }
-// 是否要现场扩抓:下一页起点已越过库内行数 → 后端得再抓一轮 Overpass 才有东西可给
+// 是否要现场扩抓:下一页起点已越过库内行数 → 后端得再抓一轮高德检索才有东西可给
 function pageNeedsExpand(){
   const total=Math.max(0,Math.round(num(state.page.total)||0));
   const offset=Math.max(0,Math.round(num(state.page.offset)||0));
@@ -1353,13 +1596,13 @@ function pageNeedsExpand(){
 function pagingNote(){
   if(!state.page.total) return "";
   return " · 已抓 <b>"+state.page.rounds+"</b> 轮"+(state.page.hasMore
-    ? ((pageNeedsExpand()?" · 下一页要现场扩抓 Overpass":" · 库里还有下一页")+"(点「加载更多」)")
+    ? ((pageNeedsExpand()?" · 下一页要现场扩抓高德":" · 库里还有下一页")+"(点「加载更多」)")
     : " · 没有更多了(has_more=false)");
 }
 // 状态栏:分页口径(已显示 / 库内 total_in_db / 抓取轮数)+ 来源 + 起点解析源 + 分段提示
 function placesStatusHtml(data){
   const bandTotal=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
-  const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"Overpass 实时抓取 → 已入库";
+  const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"高德实时抓取 → 已入库";
   const hint=bandHint(data.band);   // 功能1:含市区/近郊那一档给一句口径说明
   const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
   return '起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
@@ -1411,7 +1654,7 @@ function syncMoreButton(){
   if(sub) sub.textContent=total
     ? ("已显示 "+(state.places||[]).length+" / 库内 "+total+" 条 · 每页 "+PLACES_PAGE_SIZE+
        " 条 · 已抓 "+state.page.rounds+" 轮"+(state.page.hasMore
-          ? (expand?" · 下一页要现场扩抓 Overpass(约 10-60s)":" · 库里还有下一页")
+          ? (expand?(" · 下一页要现场扩抓高德("+EXPAND_HINT_SECONDS+")"):" · 库里还有下一页")
           : " · 没有更多了(has_more=false)"))
     : "";
   if(!button) return;
@@ -1419,10 +1662,10 @@ function syncMoreButton(){
   button.disabled=busy||!state.page.hasMore;
   button.style.display=(busy||state.page.hasMore)?"inline-block":"none";
   button.title=busy
-    ? "正在请求下一页(翻到库尾时后端会再抓一轮 Overpass,约 10-60s)"
+    ? ("正在请求下一页(翻到库尾时后端会再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
     : (state.page.hasMore
        ? ("取下一页 "+PLACES_PAGE_SIZE+" 条(offset="+offset+
-          ";翻到库尾时带 more=true 让后端再抓一轮 Overpass,约 10-60s)")
+          ";翻到库尾时带 more=true 让后端再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
        : "后端回报 has_more=false:这个分段/分类下没有更多目的地了");
 }
 // 加载更多只给**新行**补 pin:不清图层、不关已打开的路线面板(drawPins 两件事都会做)
@@ -1431,13 +1674,7 @@ function drawMorePins(rows){
   (rows||[]).forEach(place=>{
     if(!coordsReady(place)) return;
     const index=ensurePlaceRow(place);   // 行已在 state.places 里,取回它的序号供 popup/按钮用
-    const meta=categoryMeta(place.category);
-    const icon=L.divIcon({className:"",iconSize:[26,26],iconAnchor:[13,26],popupAnchor:[0,-24],
-      html:'<div class="pin" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
-    const marker=L.marker([place.lat,place.lng],{icon:icon,title:place.name||""});
-    marker.bindPopup(popupHtml(place,index));
-    marker.on("popupopen",()=>openRoutePanel(place));
-    pins.addLayer(marker);
+    addPin(place,index,false);           // 新 pin 一样走 makePin:点开出 InfoWindow + 路线面板
   });
 }
 
@@ -1455,7 +1692,7 @@ async function loadPlaces(refresh){
   state.page.busy=true;
   syncMoreButton();
   const known=state.cached[state.band];
-  if(refresh) setStatus("正在重新抓取 Overpass 四分类并集(公共源较慢,约 20-120s)…");
+  if(refresh) setStatus("正在重新抓取高德四分类检索(v3 place/around + place/polygon,约 3-20s)…");
   else if(known===undefined) setStatus("该分段尚未入库,正在抓第一轮(分页模式每轮 30 配额,约 10-60s)…");
   else setStatus("正在读取本地库(已入库,不触网;首屏每页 "+PLACES_PAGE_SIZE+" 条)…");
   try{
@@ -1478,7 +1715,7 @@ async function loadPlaces(refresh){
   }
 }
 
-// 「加载更多(每页 15)」:offset 递增翻页;翻到库尾时 more=true 让后端再抓一轮 Overpass。
+// 「加载更多(每页 15)」:offset 递增翻页;翻到库尾时 more=true 让后端再抓一轮高德检索。
 // 与 loadPlaces 共用一个 token:期间换段/换分类,这次翻页的回填一律作废。
 async function loadMorePlaces(){
   if(!state.origin||state.page.busy||!state.page.hasMore) return;
@@ -1489,7 +1726,7 @@ async function loadMorePlaces(){
   const token=state.page.token;
   syncMoreButton();
   setStatus(expand
-    ? (MORE_EXPAND_HINT+"(本页已到库尾,后端正在再抓一轮 Overpass:约 10-60s,别切分段)")
+    ? (MORE_EXPAND_HINT+"(本页已到库尾,后端正在再抓一轮高德检索:"+EXPAND_HINT_SECONDS+",别切分段)")
     : (MORE_PAGE_HINT+"(offset="+offset+",读库约 1s)"));
   try{
     const data=await getJSON("/api/places?"+placesParams(false,offset,true).toString());
@@ -1512,13 +1749,14 @@ async function loadMorePlaces(){
   }
 }
 
-// 来源计数:OSM 抓取 vs 人工种子(TASK-1c 补 OSM 国内滑雪/运动缺口);没种子就不占状态栏
+// 来源计数:高德抓取 vs 人工种子(TASK-1c 补国内滑雪/运动缺口);没种子就不占状态栏
 function sourceNote(data){
   const counts=data.counts_by_source||{};
   const seeds=counts[SEED_SOURCE]||0;
   if(!seeds) return "";
   const fresh=(data.seeded>0)?("(本次补种 "+data.seeded+" 条)"):"";
-  return " · 人工种子 <b>"+seeds+"</b> 条"+fresh+" / OSM "+(counts["OSM"]||0)+" 条";
+  return " · 人工种子 <b>"+seeds+"</b> 条"+fresh+" / 高德 "+(counts[AMAP_SOURCE]||0)+" 条"+
+    (counts["OSM"]?(" · 存量 OSM "+counts["OSM"]+" 条"):"");
 }
 
 // 简介进度:抓取路径会带回本次 LLM 生成统计;读库路径只报还缺多少条
@@ -1634,19 +1872,12 @@ function renderPinsByScope(){
   if(!pins||!map) return;
   if(state.pinScope==="all"){drawPins(state.places||[]);return;}
   closeRoutePanel();   // 换显示范围:旧 pin 可能已不在图上,面板与画线一并清掉
-  pins.clearLayers();
+  clearOverlays(pins);
+  closePinPopup();
   const rows=recoRows().filter(place=>coordsReady(place));
   rows.forEach(place=>{
     const index=ensurePlaceRow(place);
-    const meta=categoryMeta(place.category);
-    const icon=L.divIcon({className:"",iconSize:[34,34],iconAnchor:[17,34],popupAnchor:[0,-32],
-      html:'<div class="pin reco" style="background:'+meta.color+'"><span>'+meta.emoji+"</span></div>"});
-    const marker=L.marker([place.lat,place.lng],{icon:icon,zIndexOffset:600});
-    marker.bindPopup(popupHtml(place,index));
-    marker.bindTooltip("★ "+(place.name||"(无名)")+" · "+fmtKm(place.distance_km),
-      {direction:"top",offset:[0,-30]});
-    marker.on("popupopen",()=>openRoutePanel(place));   // 点 pin → 侧栏路线面板自动展开
-    pins.addLayer(marker);
+    addPin(place,index,true);   // 推荐 pin:大号描边 + 名称标签(makePin 里按 reco 分支处理)
   });
   if(!rows.length) setListMsg(emptyPinHint(),"warn");
 }
@@ -1705,7 +1936,7 @@ function renderPlaceList(){
   state.list.other=split.other.length;
   if(!split.reco.length&&!split.other.length){
     box.innerHTML='<div class="fp-empty">还没有目的地可列:先搜索起点城市并选分段'+
-      "(未入库的分段会自动抓一次 Overpass),或点「重新抓取」。"+
+      "(未入库的分段会自动抓一次高德检索),或点「重新抓取」。"+
       "有目的地后 AI 推荐与长介绍会自动补上。</div>";
     renderListSub();syncDetailMore();
     return;
@@ -2727,7 +2958,7 @@ $("pinScope").addEventListener("change",event=>{
 });
 $("recoRefresh").addEventListener("click",()=>loadRecommend(true));
 $("detailMore").addEventListener("click",onDetailMore);
-// 加载更多(TASK-6e):offset 逐页取,翻到库尾时带 more=true 让后端再抓一轮 Overpass
+// 加载更多(TASK-6e):offset 逐页取,翻到库尾时带 more=true 让后端再抓一轮高德检索
 $("moreBtn").addEventListener("click",loadMorePlaces);
 $("routePanelClose").addEventListener("click",closeRoutePanel);
 $("openFav").addEventListener("click",openFavPanel);
@@ -2757,11 +2988,22 @@ document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);
 
 (async function boot(){
-  if(!window.L){
-    showErr("Leaflet 未能从 CDN 加载(离线环境),地图不可用;后端 API 仍可直接访问 /api/places。");
-    setStatus("Leaflet 加载失败");return;
+  // 地图(TASK-9d):先运行时取 key(GET /api/map-config,key 不进 git、不写在本页),
+  // 再动态注入高德 JS API 2.0(安全密钥先于脚本写好)。**没 key / 加载失败只降地图**:
+  // 目的地列表、AI 推荐、长介绍、收藏与行程方案、路线对比全部照常可用,不抛 JS 错。
+  const config=await loadMapConfig();
+  const loaded=await loadAMapScript(config);
+  if(loaded&&window.AMap){
+    try{
+      initMap();
+    }catch(error){
+      showMapFallback("高德地图初始化失败:"+((error&&error.message)||error));
+      setStatus("地图初始化失败,继续加载其余内容…");
+    }
+  }else{
+    showMapFallback(String((config&&config.amap_js_key)||"").trim()?MAP_LOAD_FAIL_HINT:MAP_NO_KEY_HINT);
+    setStatus("继续加载目的地列表…");
   }
-  initMap();
   try{await loadMeta();}catch(error){showErr("元信息加载失败:"+error.message);setStatus("元信息加载失败");return;}
   refreshFavItems().catch(()=>{});   // 预取收藏列表:路线卡片的「已收藏」态要它;失败静默(点收藏时会再拉)
   await searchCity(($("city").value||"").trim()||DEFAULT_CITY);

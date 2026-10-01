@@ -26,6 +26,11 @@
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
   **逆**地理编码(同样高德主 + Photon/Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
+* ``GET /api/map-config`` —— 前端**高德 JS API 2.0** 的运行时配置(TASK-9d):
+  ``amap_js_key`` / ``amap_security_js_code`` 只在**每次请求时**从环境变量读
+  (``WHERE2GO_AMAP_JS_KEY`` / ``WHERE2GO_AMAP_SECURITY_JS_CODE``),
+  **绝不写进任何 git 跟踪文件**;没配就是空串,前端据此给「地图未配置高德 JS key」
+  降级文案(列表/后端 API 照常可用),永远 **HTTP 200**。
 
 ``/api/places`` 的返回里带 ``seeded`` 与 ``counts_by_source``:OSM 国内滑雪/运动覆盖差,
 缺口由 :mod:`services.seed_data` 的人工种子数据垫底,来源标注在每条 Place 的 ``source`` 字段。
@@ -92,6 +97,9 @@ FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off"})
 # 地理编码持久缓存(TASK-7a):TTL 缺省 7 天,``0`` = 每次都重新问地理编码源。
 ENV_ORIGIN_CACHE_TTL = "WHERE2GO_ORIGIN_CACHE_TTL_S"
 ORIGIN_CACHE_TTL_DEFAULT_S = 604800
+# 前端地图(TASK-9d):高德 JS API 2.0 的 key 与安全密钥,只从 env 读、不进 git。
+ENV_AMAP_JS_KEY = "WHERE2GO_AMAP_JS_KEY"
+ENV_AMAP_SECURITY_JS_CODE = "WHERE2GO_AMAP_SECURITY_JS_CODE"
 # 只缓存**真的问到了地理编码源**的结果:调用方直接给坐标 / 反查失败降级的 "none" 不写行。
 ORIGIN_CACHE_GEOCODERS = frozenset(
     {place_loader.GEOCODER_AMAP, place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
@@ -122,6 +130,14 @@ DETAILS_NOTE = (
     "长介绍(列表用 2~3 句)按 POI 缓存:只给**还没有**长介绍的 POI 调 LLM,"
     "单次最多 limit 条(前端分批懒加载);失败降级为不写行、下次可重试,"
     "reason 区分 no_key / all_failed / ok,便于前端给出可操作提示。"
+)
+MAP_CONFIG_NOTE = (
+    "前端地图(高德 JS API 2.0)的运行时配置:amap_js_key 与 amap_security_js_code "
+    "只在**每次请求时**从环境变量 WHERE2GO_AMAP_JS_KEY / WHERE2GO_AMAP_SECURITY_JS_CODE 读取,"
+    "不落库、不进 git、不写进 index.html(前端运行时取到后再动态注入 <script>)。"
+    "两者任一为空串 = 未配置:前端不加载地图脚本,页面给「地图未配置高德 JS key」降级文案,"
+    "目的地列表与其余 /api 一律照常可用。安全密钥必须在加载 JS API **之前**写进 "
+    "window._AMapSecurityConfig,否则高德会报 INVALID_USER_SCODE。"
 )
 
 
@@ -646,4 +662,25 @@ def reverse_geocode(
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=origin["city"]),
         "note": REVERSE_NOTE,
+    }
+
+
+@router.get("/map-config")
+def map_config() -> dict[str, Any]:
+    """前端**高德 JS API 2.0** 的运行时配置(TASK-9d),永远 **HTTP 200**。
+
+    为什么要这条路由:JS key 与安全密钥(securityJsCode)**绝不进 git、绝不写进
+    ``index.html``**,所以前端启动时先打这里,拿到值再
+    ``window._AMapSecurityConfig = {securityJsCode: …}`` → 动态注入
+    ``<script src="https://webapi.amap.com/maps?v=2.0&key=…">``
+    (**安全密钥必须先于脚本写好**,否则高德报 ``INVALID_USER_SCODE``)。
+
+    每次请求都现读 ``os.environ``(不在 import 期取值),这样测试里
+    ``monkeypatch.setenv`` / 运行时改 ``.env`` 都立刻生效;没配就返回**空串**
+    (不是 null、不是 404),前端据此显示「地图未配置高德 JS key」并保住列表等其余功能。
+    """
+    return {
+        "amap_js_key": (os.environ.get(ENV_AMAP_JS_KEY) or "").strip(),
+        "amap_security_js_code": (os.environ.get(ENV_AMAP_SECURITY_JS_CODE) or "").strip(),
+        "note": MAP_CONFIG_NOTE,
     }

@@ -625,19 +625,24 @@
 
 ## [TASK-9a] 高德数据源层:amap.py(geocode/regeo/around/polygon/driving)+ 四分类 typecode 映射
 
-- 状态: pending
+- 状态: done
 - 目标: 新建 `backend/data_sources/amap.py`(v3 REST:正向/逆地理编码、周边搜索、多边形搜索、驾车;归一化 POI 形状;`status/infocode` 错误翻译;0.4s 节流;直连代理口径)+ `backend/services/amap_categories.py`(四分类检索组 `AMAP_TYPE_GROUPS` + `classify_amap_poi` 优先级 滑雪>运动>人文美食>自然 + `dedupe_key=("amap", <高德POI id>)`)+ `_common.py` 加 `"amap": PROXY_OFF`。含分格纯函数 `grid_polygons` 与 `decode_polyline`。
 - 只读清单: `backend/data_sources/_common.py`、`backend/data_sources/photon.py`(写法样板)、`backend/db/models.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§1 实测数据 + §3「TASK-9a」逐字执行)。
 - 涉及: backend/data_sources/amap.py(新)、backend/services/amap_categories.py(新)、backend/data_sources/_common.py(加源)、backend/test_amap.py(新 ≥25 用例,全 mock 不触网)、backend/test_amap_categories.py
 - 验收: pytest 基线 792 零回归 + ≥25 新增;`status!="1"` 按 infocode 分派 `DataSourceError`/`TransientDataSourceError`(10021→Transient)有用例;缺 key 报中文错不崩;归一化 POI 键名与契约逐字一致;`grid_polygons` 格子数/坐标顺序有用例;节流有用例(两次调用间隔 ≥0.4s,monkeypatch 时钟)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-01 夜班,Codex 执行,commit `4a9ab68`)。
+  - 新增 `data_sources/amap.py`(892 行):geocode/reverse_geocode/search_around/search_polygon/driving + decode_polyline/grid_polygons,全部 environ=/session= 可注入;SOURCE_NAME="amap"、radius 钳 50000、page>8 空返回不发请求、节流 0.6s(env 可覆盖)、瞬时错误退避 2s/5s ≤3 次;infocode 按 §6.2 细分表全量映射(10021 等 9 个→Transient,10001/10009 等 11 个→永久,表外带原文),HTTP 码不参与判错;驾车 strategy 只留签名不进请求、多 paths 取 [0]、不透出 tolls/cost 只给 toll_distance_m、polyline 明文解析+GEOMETRY_MAX_POINTS=1200 抽稀(自定义常量未 import osrm)。
+  - 新增 `services/amap_categories.py`(232 行):AMAP_TYPE_GROUPS 五组(滑雪 080106/运动 080000/人文美食 110000+050000/小城古镇 keywords=古镇|老街|古城/自然 110000),配额与既有 SEARCH_GROUPS 一致(合计 540);classify_amap_poi 优先级 滑雪>运动>人文美食>自然、人工设施名归其他、复合专名细化(湿地公园/森林公园/自然保护区等在风景名胜大类内归自然);dedupe_key=("amap", id)。`_common.py` 加 "amap": PROXY_OFF。
+  - 测试:test_amap.py 133 例 + test_amap_categories.py 62 例(超 ≥25 要求),全 mock。执行器复跑 pytest backend/ = **987 passed**(792 基线零回归 + 195 新增,38.9s)。
+  - **Codex 256K 统计**:单次调用 ~35min(14:10-14:46 UTC,40min 止损线内),function_calls **54**,首轮写码启动后 **9.8min**(R8 12min 线内),tokens **241,572**(total 4.32M 含 cache 重放),零 compact。
+  - 备注:未动 app/、未改表结构、未新增依赖;未 push。
 
 ---
 
 ## [TASK-9b] POI/住宿检索链切高德:入库身份改 amap + 分格多边形 + 渐进口径不变 + 清库脚本
 - 依赖: TASK-9a(amap.py 与 amap_categories 已建)
 
-- 状态: pending
+- 状态: running
 - 目标: `services/classify.py` 检索组换 `AMAP_TYPE_GROUPS`(优先级/去重/预算语义保留);`services/place_loader.py` 的 `default_fetcher` 换高德:`low==0` → `search_around(radius=high)`,`low>0` → 包围盒 `grid_polygons` 分格 + `search_polygon` + 本地 haversine 收敛 `[low,high)`,扩格随 `fetch_rounds` 递增(口径同 `progressive_target_total`);入库 `osm_type="amap"`/`osm_id=<高德 id>`(表结构零改动)、`tags.source="高德"`、`place_source()` 加「高德」分支;`stays.py::search_stays` 换 `search_around(types="100000")`(半径阶梯/负缓存/估价口径全不变);新增 `tools/amap_cutover.py`(默认 --dry-run 报数,--apply 清派生行,**保留 Collection/CollectionCat/TripPlan**)。
 - 只读清单: `backend/services/place_loader.py`、`backend/services/classify.py`、`backend/services/stays.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§3「TASK-9b」逐字执行)。
 - 涉及: backend/services/(classify.py、place_loader.py、stays.py、amap_categories 已建)、backend/db/repository.py(place_source)、backend/app/api/(仅在不得已时改动,**响应键名必须零变化**)、tools/amap_cutover.py(新)、backend/test_places*.py/test_stays*.py/test_classify.py(改替身为 amap + 新增 ≥30 用例)

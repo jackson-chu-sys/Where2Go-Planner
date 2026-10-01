@@ -15,13 +15,13 @@
 
 **数据源全面切换高德**:①POI 检索 ②前端地图瓦片 ③地理编码 **全切高德**,**驾车一并切高德**;**Overpass 与 OSRM 彻底移除、不保留降级链**;渐进配额口径(首查 30/显示 15/加载更多 +30)与 `/api/places` 参数/响应形状**一律不变**(前端零改动)。Photon/Nominatim 保留为降级链。**TASK-7a 的冷抓墙钟/geocode 复验取消**(优化对象已被移除);TASK-8 全部排在 TASK-9 之后。
 **条目命名防冲突**:本期「TASK-8」只指三条(8a1 图片链路 / 8a2 类别要点 / 8b 详情弹窗,契约 `docs/TASK-8-CONTRACT.md`);高德切换一律是 **TASK-9a~9d**(契约 `docs/TASK-9-CONTRACT.md`)。**若队列里出现与本通告冲突的重复条目(如另一个「TASK-8 高德切换」),一律以本通告为准,并把冲突条目改为 `blocked`+注明,不要执行。**
-**前端地图最终裁定(神朱 2026-10-01)**:走**官方高德 JS API 2.0**(JS key 走后端 `/api/map-config` 运行时注入,**绝不写进 index.html**);真机若报 `INVALID_USER_SCODE` → **授权当轮降级为「Leaflet + 高德无 key 栅格瓦片」并注明待升级**,不许空过。
+**前端地图最终裁定(神朱 2026-10-01)**:走**官方高德 JS API 2.0**(JS key + 安全密钥都走后端 `/api/map-config` 运行时注入,**绝不写进 index.html**;安全密钥已提供);真机若仍报 `INVALID_USER_SCODE` → **授权当轮降级为「Leaflet + 高德无 key 栅格瓦片」并注明待升级**,不许空过。
 
 执行 TASK-9 前**逐字读 `docs/TASK-9-CONTRACT.md`**,四条硬数字不许猜:
 1. **检索走 v3**(v5 `page=2` 与 `page=1` 返回完全相同的页,翻页是坏的);
 2. **单查询最多 200 条**(`page>=9` 返回 0,`count` 字段不可信)→ band ≥50km 必须分格查多边形;`radius` 实测被截断在 50000;
 3. **高德 `tolls` 恒 0、`cost` 恒 null** → 过路费改用 `toll_distance` × 区域费率,别用高德过路费字段;
-4. **前端 JS key 不进 git** → 走 `GET /api/map-config` 运行时注入;key 在 `/opt/data/.env`(0600);REST 用 `WHERE2GO_AMAP_KEY`、前端用 `WHERE2GO_AMAP_JS_KEY`,两 key 平台隔离(混用报 `USERKEY_PLAT_NOMATCH`);密集连打触发 `infocode=10021`(QPS)→ 单进程最小间隔 0.4s。
+4. **前端 JS key 不进 git** → 走 `GET /api/map-config` 运行时注入;key 在 `/opt/data/.env`(0600);REST 用 `WHERE2GO_AMAP_KEY`、前端用 `WHERE2GO_AMAP_JS_KEY`+`WHERE2GO_AMAP_SECURITY_JS_CODE`(均已落 `.env`),两 key 平台隔离(混用报 `USERKEY_PLAT_NOMATCH`);密集连打触发 `infocode=10021`(QPS)→ 单进程最小间隔 **0.6s** + 退避重试 2s/5s(≤3 次)。
 
 ---
 
@@ -646,11 +646,11 @@
 
 ---
 
-## [TASK-9c] 地理编码切高德主链路 + 驾车切高德 + 删 overpass.py/osrm.py
+## [TASK-9c] 地理编码切高德主链路 + 驾车切高德 + 物理删除 overpass.py/osrm.py
 - 依赖: TASK-9a(amap.geocode/driving);与 TASK-9b 无强耦合,可并行/续做
 
 - 状态: pending
-- 目标: `resolve_origin_with_source` 主链路改 `amap.geocode`(`geocoder="amap"`),失败/无 key 回落 photon→nominatim(保留不删),`/api/geocode` 响应键与 `resolved` 语义不变;`OriginCache` **保留复用**(geocoder 存 amap,TTL 7 天不变;TASK-7a 的 Overpass 并行部分随 overpass.py 移除);`services/routes.py` 驾车改 `amap.driving`(真实 distance/duration,`kind="real"` 不变;**过路费 = `toll_distance_m` × 区域费率**,`cost_breakdown.mode="amap_toll_distance"`;油费/铁路/飞机估算/600km 阈值/机票公布价/人均/deep-link 全不变);geometry 用解码 polyline(抽稀口径不变);删除 `data_sources/overpass.py`、`data_sources/osrm.py` 及其直接引用。
+- 目标: `resolve_origin_with_source` 主链路改 `amap.geocode`(`geocoder="amap"`),失败/无 key 回落 photon→nominatim(保留不删),`/api/geocode` 响应键与 `resolved` 语义不变;`OriginCache` **保留复用**(geocoder 存 amap,TTL 7 天不变;TASK-7a 的 Overpass 并行部分随 overpass.py 移除);`services/routes.py` 驾车改 `amap.driving`(真实 distance/duration,`kind="real"` 不变;**过路费 = `toll_distance_m` × 区域费率**,`cost_breakdown.mode="amap_toll_distance"`;油费/铁路/飞机估算/600km 阈值/机票公布价/人均/deep-link 全不变);geometry 用解码 polyline(抽稀口径不变);**物理删除(`git rm`)`data_sources/overpass.py`、`data_sources/osrm.py` 及其在测试中的直接引用**(神朱 10/01 二次确认:不保留休眠文件)。
 - 只读清单: `backend/services/place_loader.py`、`backend/services/routes.py`、`backend/app/api/routes.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§1.5/§1.6 + §3「TASK-9c」逐字执行)。
 - 涉及: backend/services/(place_loader.py、routes.py)、backend/app/api/(geocode/routes 透出)、backend/data_sources/(删 overpass.py、osrm.py)、backend/test_routes*.py/test_photon.py/test_data_sources.py(引用改 amap 替身 + 新增 ≥20 用例)
 - 验收: pytest 零回归 + ≥20 新增;`/api/geocode` 键名不变且 `geocoder=amap` 命中;OriginCache 命中零网络有用例;驾车 `toll_cny` 来自 `toll_distance` 而非高德 `tolls`(用例断言 tolls=0 时仍算出非零过路费);铁路/飞机/机票/deep-link 断言零回归;全仓 `grep -rn "overpass\|osrm" backend/` 仅剩历史注释/文档。
@@ -662,10 +662,10 @@
 - 依赖: TASK-9b + TASK-9c(后端接口就绪;本项目前端零改动的约束由 9b 保证)
 
 - 状态: pending
-- 目标: `index.html` 移除 Leaflet(CDN+OSM 瓦片)改高德 JS API 2.0(官方路径;真机若报 `INVALID_USER_SCODE` 则降级为「保留 Leaflet + 换高德无 key 栅格瓦片」并注明待升级,不许空过);新增后端 `GET /api/map-config` 返回 `{"amap_js_key","amap_security_js_code"}`(取自 env,**不进 git**),前端运行时取 key 后动态注入 `<script>`、无 key 给明确降级文案;环圈→`AMap.Circle`(外实内虚)、pin→`AMap.Marker`(保留分类色/emoji 自绘)、点 pin→`AMap.InfoWindow` 承载现有 `popupHtml()`(含收藏/路线/「📄 查看详情」按钮,为 TASK-8b 铺路)、路线→`AMap.Polyline`(驾车实线/铁路虚线/飞机 `arcPoints` 弧线)、`fitView` 用环圈 bounds;`identityHtml()` 改「来源:高德 · POI <id> · GCJ-02」,种子行加 WGS-84 偏差提示;状态栏数据源文案改高德口径。
+- 目标: `index.html` 移除 Leaflet(CDN+OSM 瓦片)改高德 JS API 2.0(官方路径;真机若报 `INVALID_USER_SCODE` 则降级为「保留 Leaflet + 换高德无 key 栅格瓦片」并注明待升级,不许空过);新增后端 `GET /api/map-config` 返回 `{"amap_js_key","amap_security_js_code"}`(取自 env,**不进 git、不写进 index.html**),前端加载 JS API **前**先写 `window._AMapSecurityConfig={securityJsCode:…}`(**安全密钥已由神朱提供并落 `.env`**)再动态注入 `<script>`、无 key 给明确降级文案;环圈→`AMap.Circle`(外实内虚)、pin→`AMap.Marker`(保留分类色/emoji 自绘)、点 pin→`AMap.InfoWindow` 承载现有 `popupHtml()`(含收藏/路线/「📄 查看详情」按钮,为 TASK-8b 铺路)、路线→`AMap.Polyline`(驾车实线/铁路虚线/飞机 `arcPoints` 弧线)、`fitView` 用环圈 bounds;`identityHtml()` 改「来源:高德 · POI <id> · GCJ-02」,种子行加 WGS-84 偏差提示;状态栏数据源文案改高德口径。
 - 只读清单: `backend/app/static/index.html`、`backend/test_frontend_routes.py`、`backend/app/api/places.py`(加 map-config 的风格)、`docs/TASK-9-CONTRACT.md`(§3「TASK-9d」逐字执行)。
 - 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 新断言 + node --check)、backend/app/api/(新增 map-config 路由)
-- 验收: pytest 零回归 + ≥12 新增断言(`/api/map-config` 调用、`AMap.` 使用、`AMap.InfoWindow`、**index.html 内不得出现 32 位 key 样态字符串**);browser_exec 真机 QA:开页 0 error → 高德地图渲染 → pin+环圈 → 点 pin 出 InfoWindow → 点路线出面板并画线;若 JS API 因缺安全密钥报 `INVALID_USER_SCODE` → 记 needs_review 并在晨报请神朱补「安全密钥」,不得自行绕过。
+- 验收: pytest 零回归 + ≥12 新增断言(`/api/map-config` 调用、`AMap.` 使用、`AMap.InfoWindow`、**index.html 内不得出现 32 位 key 样态字符串**);browser_exec 真机 QA:开页 0 error → 高德地图渲染 → pin+环圈 → 点 pin 出 InfoWindow → 点路线出面板并画线;安全密钥已就绪,若仍报 `INVALID_USER_SCODE` → 按契约授权**当轮降级为「Leaflet + 高德无 key 栅格瓦片」并注明待升级**,不许空过。
 - 结果: (待夜班回填)
 
 ---

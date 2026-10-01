@@ -6,7 +6,7 @@
 ## 0. 拍板口径（勿自行改）
 
 1. **①POI 检索 ②前端地图瓦片 ③地理编码：全切高德**；**驾车一并切高德**（OSRM 移除后不能悬空）。
-2. **Overpass 与 OSRM 彻底移除，不保留降级链**（`data_sources/overpass.py`、`data_sources/osrm.py` 及其测试在契约指定条目落地后删除）。
+2. **Overpass 与 OSRM 彻底移除，不保留降级链、不留休眠文件**（神朱 2026-10-01 二次确认）：`data_sources/overpass.py`、`data_sources/osrm.py` **在 TASK-9c 落地后物理删除（`git rm`）**，连同 `test_*.py` 中对它们的直接引用（改为 amap 替身）。
 3. **渐进配额口径完全不变**：首查 30 / 显示 15 / 「加载更多」每轮 +30、`PROGRESSIVE_STEP`、`SegmentFetch.fetch_rounds`、`/api/places` 的 `page_size/offset/more` 参数与响应形状**一律不动**（前端因此零改动）。
 4. **检索必须走 v3 接口**（v5 翻页坏，见 §1.2）。
 5. **Photon / Nominatim 保留为降级链**（仅当高德无 key / 超配额时回落），本次**不删、不新增功能**。
@@ -134,12 +134,13 @@ MIN_REQUEST_INTERVAL_S = 0.4     # env WHERE2GO_AMAP_MIN_INTERVAL_S; 实测 QPS 
   - **过路费 = `toll_distance_m`/1000 × 区域费率**（东 0.45/中 0.40/西 0.35 元/km 常量沿用），`cost_breakdown` 增 `"mode":"amap_toll_distance"`（`toll_mode` 旧值 `osrm_refs` 退役）；油费口径不变（`WHERE2GO_FUEL_PRICE_CNY_L`、8L/100km）；
   - geometry 用解码 polyline（抽稀口径不变）；
   - **铁路/飞机估算、600km 飞行阈值、机票公布价锚定、`per_person_cny`、deep-link 全部不变**。
-- `data_sources/osrm.py`、`data_sources/overpass.py` **在本条落地后删除**（连同 `test_routes.py`/`test_data_sources.py`/`test_stays*.py` 中对它们的直接引用，改指 amap 替身）；`services/routes.py` 与 `services/stays.py` 不再 import 这两个模块。
+- `data_sources/osrm.py`、`data_sources/overpass.py` **在本条落地后物理删除（`git rm`）**（连同 `test_routes.py`/`test_data_sources.py`/`test_stays*.py` 中对它们的直接引用，改指 amap 替身）；`services/routes.py` 与 `services/stays.py` 不再 import 这两个模块。
 
 ### TASK-9d —— 前端地图切高德 JS API（Leaflet 退役）
 
 - `index.html`：Leaflet（CDN + OSM 瓦片）整体换 **高德 JS API 2.0**（`https://webapi.amap.com/maps?v=2.0&key=…`）**—— 神朱 2026-10-01 拍板的官方路径**。
-- **降级路径（神朱已授权，不必卡整晚）**：真机实测若因缺安全密钥报 `INVALID_USER_SCODE`（或 JS key 环境不通），**当轮直接降级为「Leaflet 保留 + 底图瓦片换高德无 key 栅格」**（`https://webrd0{1,2,3,4}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}`），实现完照样 commit + 真机 QA，并在「结果」段注明「已降级为栅格瓦片，待神朱补安全密钥后升级 JS API」；**不得就此停下或留 needs_review 空过**。
+- **安全密钥已就绪**：`WHERE2GO_AMAP_SECURITY_JS_CODE` 已落 `/opt/data/.env`（0600，神朱 2026-10-01 提供）→ 前端在加载 JS API **之前**写 `window._AMapSecurityConfig = {securityJsCode: <值>}`，key 与 security code **都由 `/api/map-config` 下发**（响应形状：`{"amap_js_key","amap_security_js_code"}`），两者都**绝不写进 `index.html`**。
+- **降级路径（神朱已授权，不必卡整晚；安全密钥就绪后应不再触发）**：真机实测若因缺安全密钥报 `INVALID_USER_SCODE`（或 JS key 环境不通），**当轮直接降级为「Leaflet 保留 + 底图瓦片换高德无 key 栅格」**（`https://webrd0{1,2,3,4}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}`），实现完照样 commit + 真机 QA，并在「结果」段注明「已降级为栅格瓦片，待神朱补安全密钥后升级 JS API」；**不得就此停下或留 needs_review 空过**。
 - **JS key 不进 git**：新增后端 `GET /api/map-config` → `{"amap_js_key": <WHERE2GO_AMAP_JS_KEY 或 "">, "amap_security_js_code": <WHERE2GO_AMAP_SECURITY_JS_CODE 或 "">}`；前端**运行时**取 key 后动态注入 `<script>`，无 key 时页面给明确降级文案「地图未配置高德 JS key」。
   - 若实测 JS API 2.0 因缺**安全密钥**报 `INVALID_USER_SCODE`（地图/覆盖物是否受影响**必须在真机浏览器里验一发**），则进 `needs_review` 并在晨报里请神朱到高德控制台补「安全密钥」，同时把该值以 `WHERE2GO_AMAP_SECURITY_JS_CODE` 落 `.env`（**同样不进 git**）。
 - 地图元素一一对应：环形范围圈 → `AMap.Circle`（外圆实线 / 内圆虚线，样式沿用现有 CSS 变量）；POI pin → `AMap.Marker` + 现有分类色/emoji 的自绘 `content`；点 pin → `AMap.InfoWindow` 承载**现有 `popupHtml()` 内容**（含「⭐收藏」「🚗路线对比」「📄查看详情」按钮，为 TASK-8b 铺路）；路线画线 → `AMap.Polyline`（驾车实线/铁路虚线/飞机弧线，弧线沿用 `arcPoints`）；`fitView` 用环圈 bounds。

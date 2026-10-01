@@ -51,6 +51,14 @@
 - 逆编：`/v3/geocode/regeo?location=lng,lat&extensions=base` → `regeocode.{formatted_address, addressComponent{province,city,district,adcode,township}}`。实测 杭州点 → 「浙江省杭州市西湖区灵隐街道曙光社区(浙大路)曙光新村」。
 - **坐标系：高德全链 GCJ-02**。既然 POI + 地理编码 + 地图瓦片都切高德，内部自洽，**不需要坐标转换**；只有「种子数据(WGS-84)」混入时才需处理（见 §3.9d）。
 
+### 1.7 前端 JS API 真机实测（主会话 2026-10-01，**已验通，9d 不必再摸索**）
+最小页（`window._AMapSecurityConfig={securityJsCode:…}` → `<script src="https://webapi.amap.com/maps?v=2.0&key=…">` → `new AMap.Map`）在**真浏览器（CDP chrome）**里实测：
+- `AMap.v = "2.0"` 正常加载；**没有出现 `INVALID_USER_SCODE`**（安全密钥已就绪并由主会话验证）；`window.__errs` **0 条**。
+- `AMap.Map` / `AMap.Circle` / `AMap.Marker`（自绘 HTML content）/ `AMap.InfoWindow` **全部可用**；地图 `complete` 事件触发、渲染出 13 块瓦片。
+- **瓦片 URL 实测为 `https://webrd04.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=&y=&z=`** —— 即**官方 JS API 2.0 的底图本身就是 webrd 栅格**；所以「降级到无 key 栅格」与官方路径在底图上并无差别，只是绕过 JS API 的脚本加载。
+- ⚠️ **实现坑（QA 必读）**：自绘 `content` 的 pin，点击**必须用 `marker.on("click", …)` 绑定**（AMap 在 overlay 层代理事件）；在自绘 div 上挂 `onclick`、或用 JS 合成 `dispatchEvent(new MouseEvent(...))` **都不触发**——真机 QA 要用**受信任的真实点击**（CDP 点坐标，`click_at_xy`）验证，否则会误判成「弹窗坏」。
+- key 与 securityJsCode 由 `/api/map-config` 下发，**两者都不进 git、不进 `index.html`**。
+
 ## 2. 只读清单（≤5 个确切文件，读完立即开工，禁止浏览式探索）
 
 - `backend/data_sources/_common.py` —— 错误类型（`DataSourceError`/`TransientDataSourceError`）、`build_session` 按源代理表

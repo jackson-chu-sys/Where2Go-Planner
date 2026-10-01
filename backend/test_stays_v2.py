@@ -6,12 +6,14 @@
 * ``llm_key_absent`` 清掉所有 LLM key 环境变量(要 key 的用例自己 ``monkeypatch.setenv``);
 * ``inline_background`` 把后台执行器换成同步的 :class:`~services.stays.InlineExecutor`,
   后台回填在测试里**确定性**跑完(不起真线程,不等);
-* Overpass 用假客户端(可按查询里的 ``around:<半径>`` 过滤,模拟"小半径搜不到"),
+* 高德检索用假 ``fetch_fn``(可按半径过滤 POI,模拟"小半径搜不到、扩档才有"),
   LLM 用假 client,DB 用 ``tmp_path`` 下的临时 SQLite。
 
 覆盖:同坐标二次请求 **0 网络**(负缓存命中)、TTL 过期后重查、三档 ``reason``、
 半径阶梯逐级扩与"显式给了半径就不扩"、``nearest_km``、批量估价 **5 家/prompt**、
 批解析失败留 null 不抛、重试 ≤1、``estimating`` 标志与"入库即刻返回"、API 透传、
+TASK-9b 起检索侧是**高德** ``place/around``(``types=100000`` 住宿大类粗筛、
+入库身份 ``osm_type="amap"`` + ``osm_id=crc32(POI id)``),负缓存/阶梯/批量估价口径不变。
 既有行为不回归(:func:`services.stays.search_stays` 仍降级成空列表、
 :func:`services.stays.load_or_fetch_stays` 仍返回 list)。
 
@@ -37,9 +39,10 @@ if BACKEND_DIR not in sys.path:
 
 from app.api import stays as stays_api  # noqa: E402
 from data_sources import DataSourceError, TransientDataSourceError  # noqa: E402
-from data_sources import overpass as overpass_module  # noqa: E402
+from data_sources import amap, haversine_km  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db.models import (  # noqa: E402
+    AMAP_OSM_TYPE,
     COORD_PRECISION,
     REASON_DATASOURCE_ERROR,
     REASON_NO_DATA,
@@ -49,6 +52,7 @@ from db.models import (  # noqa: E402
     STAY_REASONS,
     Stay,
     StayQueryCache,
+    amap_osm_id,
     stay_cache_kind,
     stay_cache_reason,
     utcnow,
@@ -70,79 +74,91 @@ LLM_KEY_ENVS = (
 )
 
 
+#: 高德返回的中文 ``type`` → 本地 kind(:data:`services.stays.AMAP_KIND_HINTS` 的关键词口径)
+KIND_TYPE_TEXTS: dict[str, str] = {
+    "hotel": "住宿服务;宾馆酒店;星级酒店",
+    "guest_house": "住宿服务;宾馆酒店;民宿",
+    "hostel": "住宿服务;宾馆酒店;青年旅舍",
+    "apartment": "住宿服务;公寓式酒店;公寓",
+    "chalet": "住宿服务;宾馆酒店;度假村",
+}
+
+
+def poi_id(number: int) -> str:
+    """第 ``number`` 家住宿的高德 POI id(字符串;入库时哈希成 ``crc32``)。"""
+    return f"B0FFH{number:05d}"
+
+
 def at_km(
     km: float,
     *,
-    osm_id: int = 1,
+    number: int = 1,
     name: Optional[str] = "示例酒店",
-    tourism: str = "hotel",
+    kind: str = "hotel",
+    cityname: str = "",
 ) -> dict[str, Any]:
-    """起点**正北 km 公里处**的一家住宿(Overpass node element 形状)。"""
-    tags: dict[str, Any] = {"tourism": tourism}
-    if name:
-        tags["name"] = name
+    """起点**正北 km 公里处**的一家住宿(**归一化高德 POI** 形状,TASK-9b 抓取替身的返回值)。
+
+    ``typecode`` 一律用 §1.4 实测的住宿大类 ``100000``;``cityname`` 默认留空,
+    免得城市线级系数(上海 ×1.2)改动既有的价格断言 —— 带城市线索的价带另有专例。
+    """
     return {
-        "type": "node",
-        "id": osm_id,
+        "id": poi_id(number),
+        "name": name or "",
         "lat": ORIGIN_LAT + km / KM_PER_DEGREE,
-        "lon": ORIGIN_LNG,
-        "tags": tags,
+        "lng": ORIGIN_LNG,
+        "type": KIND_TYPE_TEXTS[kind],
+        "typecode": stay_service.STAY_TYPES,
+        "address": "",
+        "cityname": cityname,
+        "adname": "",
+        "distance_m": int(km * 1000),
     }
 
 
-def elements_at(*kms: float) -> list[dict[str, Any]]:
-    """一批等距摆开的住宿(osm_id 从 101 起,名字互不相同)。"""
+def pois_at(*kms: float) -> list[dict[str, Any]]:
+    """一批等距摆开的住宿(POI id 序号从 101 起,名字互不相同)。"""
     return [
-        at_km(km, osm_id=101 + index, name=f"测试酒店{index + 1}")
+        at_km(km, number=101 + index, name=f"测试酒店{index + 1}")
         for index, km in enumerate(kms)
     ]
 
 
-def payload(elements: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"elements": [dict(item) for item in elements]}
+def _poi_km(poi_row: dict[str, Any]) -> float:
+    return haversine_km(ORIGIN_LAT, ORIGIN_LNG, float(poi_row["lat"]), float(poi_row["lng"]))
 
 
-def _element_km(element: dict[str, Any]) -> float:
-    center = element.get("center") or element
-    return overpass_module.haversine_km(
-        ORIGIN_LAT, ORIGIN_LNG, float(center["lat"]), float(center["lon"])
-    )
+class RadiusAwareAmap:
+    """假高德检索(:data:`services.stays.StayFetchFn` 签名):按半径过滤 POI。
 
-
-class RadiusAwareOverpass:
-    """假 Overpass:按查询里的 ``around:<半径>`` 过滤元素 —— 模拟"小半径搜不到、扩档才有"。
-
-    ``error`` 让所有请求都失败;``error_radii`` 只让指定半径失败(测"某一档挂了")。
+    模拟"小半径搜不到、扩档才有";``error`` 让所有请求都失败,``error_radii`` 只让
+    指定半径失败(测"某一档挂了")。``radii``/``calls`` 供断言半径阶梯与网络次数。
     """
 
     def __init__(
         self,
-        elements: Optional[list[dict[str, Any]]] = None,
+        pois: Optional[list[dict[str, Any]]] = None,
         *,
         error: Optional[BaseException] = None,
         error_radii: Optional[list[int]] = None,
     ):
-        self.elements = list(elements or [])
+        self.pois = list(pois or [])
         self.error = error
         self.error_radii = set(error_radii or ())
-        self.queries: list[str] = []
         self.radii: list[int] = []
         self.calls = 0
 
-    def execute(
-        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
-    ) -> Any:
+    def __call__(self, lat: float, lng: float, radius_m: Any = None,
+                 **kwargs: Any) -> list[dict[str, Any]]:
         self.calls += 1
-        self.queries.append(query)
-        matched = re.search(r"around:(\d+)", query)
-        radius = int(matched.group(1)) if matched else 0
+        radius = int(radius_m or 0)
         self.radii.append(radius)
         if self.error is not None:
             raise self.error
         if radius in self.error_radii:
-            raise DataSourceError("overpass", f"半径 {radius} 这一档端点全挂")
+            raise DataSourceError("amap", f"半径 {radius} 这一档高德配额耗尽(infocode=40000)")
         limit_km = radius / 1000.0
-        return {"elements": [dict(item) for item in self.elements if _element_km(item) <= limit_km]}
+        return [dict(item) for item in self.pois if _poi_km(item) <= limit_km]
 
 
 class BatchLLM:
@@ -258,8 +274,13 @@ def all_cache(session: Session) -> list[StayQueryCache]:
 def call_api(session: Session, monkeypatch: pytest.MonkeyPatch, **params: Any) -> dict[str, Any]:
     """直调端点函数(仓库没装 httpx/TestClient):参数按**字符串**传,与 HTTP 查询串一致。"""
     client = params.pop("client", None)
+    if client is None:
+        client = params.pop("fetch_fn", None)
+    else:
+        params.pop("fetch_fn", None)
     if client is not None:
-        monkeypatch.setattr(overpass_module, "default_client", lambda: client)
+        # 服务层缺省的检索实现就是模块级的 fetch_stay_pois(高德 place/around)
+        monkeypatch.setattr(stay_service, "fetch_stay_pois", client)
     llm = params.pop("llm", None)
     if llm is not None:
         monkeypatch.setattr(stay_service, "default_llm_client", lambda: llm)
@@ -385,43 +406,43 @@ def test_negative_state_defaults() -> None:
 
 def test_second_request_same_origin_makes_zero_network_calls(session: Session) -> None:
     """核心验收:同坐标同半径二次请求 **0 网络**(负缓存命中,直接回缓存态)。"""
-    client = RadiusAwareOverpass([])  # 半径内真的没有住宿
-    first = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+    client = RadiusAwareAmap([])  # 半径内真的没有住宿
+    first = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     assert client.calls == 1
     assert first.items == [] and first.reason == REASON_NO_DATA
     assert len(all_cache(session)) == 1
 
-    again = RadiusAwareOverpass([])
-    second = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=again)
+    again = RadiusAwareAmap([])
+    second = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=again)
     assert again.calls == 0, "6h 内同坐标同半径不该再触网"
     assert second.items == [] and second.reason == REASON_NO_DATA
     assert second.from_cache is True and second.source == stay_service.SOURCE_DB
 
 
 def test_expired_negative_cache_triggers_refetch(session: Session) -> None:
-    client = RadiusAwareOverpass([])
-    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+    client = RadiusAwareAmap([])
+    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     assert client.calls == 1
     all_cache(session)[0].fetched_at = utcnow() - timedelta(hours=7)
     session.commit()
 
-    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     assert client.calls == 2, "负缓存过期后必须重新检索"
     assert len(all_cache(session)) == 1, "重查后仍是 upsert,不堆行"
 
 
 def test_refresh_bypasses_negative_cache(session: Session) -> None:
-    client = RadiusAwareOverpass([])
-    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+    client = RadiusAwareAmap([])
+    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client, refresh=True
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client, refresh=True
     )
     assert client.calls == 2, "refresh=true 强制重查(不看负缓存)"
 
 
 def test_negative_cache_rows_do_not_pollute_stays(session: Session) -> None:
     stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=RadiusAwareOverpass([])
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=RadiusAwareAmap([])
     )
     assert all_stays(session) == [], "负缓存只进 stay_query_cache,不该凭空造住宿行"
     assert len(all_cache(session)) == 1
@@ -434,28 +455,28 @@ def test_negative_cache_rows_do_not_pollute_stays(session: Session) -> None:
 
 def test_reason_no_data_when_search_succeeds_but_empty(session: Session) -> None:
     result = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=RadiusAwareOverpass([])
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=RadiusAwareAmap([])
     )
     assert result.items == [] and result.reason == REASON_NO_DATA
     assert all_cache(session)[0].kind == STAY_CACHE_EMPTY
 
 
-def test_reason_datasource_error_on_overpass_failure(session: Session) -> None:
-    client = RadiusAwareOverpass(error=DataSourceError("overpass", "所有端点均不可用"))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+def test_reason_datasource_error_on_amap_failure(session: Session) -> None:
+    client = RadiusAwareAmap(error=DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)"))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     assert result.items == [] and result.reason == REASON_DATASOURCE_ERROR
     assert all_cache(session)[0].kind == REASON_DATASOURCE_ERROR
     # 缓存态透传:第二次请求 0 网络,reason 仍是 datasource_error
-    again = RadiusAwareOverpass(error=DataSourceError("overpass", "所有端点均不可用"))
-    second = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=again)
+    again = RadiusAwareAmap(error=DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)"))
+    second = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=again)
     assert again.calls == 0 and second.reason == REASON_DATASOURCE_ERROR
 
 
-def test_reason_timeout_on_overpass_timeout(session: Session) -> None:
-    client = RadiusAwareOverpass(
-        error=TransientDataSourceError("overpass", "请求超时(>30s):https://overpass.example/api")
+def test_reason_timeout_on_amap_timeout(session: Session) -> None:
+    client = RadiusAwareAmap(
+        error=TransientDataSourceError("amap", "请求超时(>30s):https://restapi.amap.com/v3/place/around")
     )
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client)
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client)
     assert result.items == [] and result.reason == REASON_TIMEOUT
     assert all_cache(session)[0].kind == REASON_TIMEOUT
 
@@ -464,10 +485,10 @@ def test_reason_timeout_on_overpass_timeout(session: Session) -> None:
     "exc,expected",
     [
         (TimeoutError("timed out"), REASON_TIMEOUT),
-        (TransientDataSourceError("overpass", "请求超时(>20s):url"), REASON_TIMEOUT),
+        (TransientDataSourceError("amap", "请求超时(>20s):url"), REASON_TIMEOUT),
         (RuntimeError("HTTPSConnectionPool: Read timed out."), REASON_TIMEOUT),
-        (DataSourceError("overpass", "所有 Overpass 端点均不可用(繁忙/超时)"), REASON_DATASOURCE_ERROR),
-        (DataSourceError("overpass", "被限流(HTTP 429)"), REASON_DATASOURCE_ERROR),
+        (DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=10021(瞬时,可退避重试)"), REASON_DATASOURCE_ERROR),
+        (DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=10021"), REASON_DATASOURCE_ERROR),
         (RuntimeError("端点全挂"), REASON_DATASOURCE_ERROR),
         (ValueError("查询非法"), REASON_DATASOURCE_ERROR),
     ],
@@ -478,8 +499,8 @@ def test_classify_failure_buckets(exc: BaseException, expected: str) -> None:
 
 def test_failure_does_not_expand_ladder(session: Session) -> None:
     """检索失败**不逐级扩**:端点已经挂了,再打两遍只是白等(也避免被限流)。"""
-    client = RadiusAwareOverpass(error=DataSourceError("overpass", "端点全挂"))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=client)
+    client = RadiusAwareAmap(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client)
     assert client.calls == 1
     assert client.radii == [5000]
     assert result.items == [] and result.reason == REASON_DATASOURCE_ERROR
@@ -498,9 +519,9 @@ def test_failure_keeps_db_rows_and_reports_reason(session: Session) -> None:
         ],
     )
     session.commit()
-    client = RadiusAwareOverpass(error=DataSourceError("overpass", "端点全挂"))
+    client = RadiusAwareAmap(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
     result = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, client=client, refresh=True
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=8000, fetch_fn=client, refresh=True
     )
     assert [item["name"] for item in result.items] == ["已入库旅舍"]
     assert result.source == stay_service.SOURCE_DB
@@ -522,8 +543,8 @@ def test_radius_ladder_only_when_radius_omitted(radius_m: Any, expected: tuple[i
 
 
 def test_ladder_stops_at_first_rung_with_results(session: Session) -> None:
-    client = RadiusAwareOverpass(elements_at(1.0, 3.0))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=client)
+    client = RadiusAwareAmap(pois_at(1.0, 3.0))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client)
     assert client.radii == [5000] and client.calls == 1
     assert len(result.items) == 2 and result.radius_m == 5000
     assert result.expanded is False and result.reason is None
@@ -532,8 +553,8 @@ def test_ladder_stops_at_first_rung_with_results(session: Session) -> None:
 
 def test_ladder_expands_until_results_and_reports_nearest_km(session: Session) -> None:
     """5 km 内空 → 扩到 10 km 命中即停;``nearest_km`` = 最近一家的 haversine(1 位)。"""
-    client = RadiusAwareOverpass(elements_at(7.0))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=client)
+    client = RadiusAwareAmap(pois_at(7.0))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client)
     assert client.radii == [5000, 10000] and client.calls == 2
     assert len(result.items) == 1
     assert result.radius_m == 10000 and result.expanded is True
@@ -545,8 +566,8 @@ def test_ladder_expands_until_results_and_reports_nearest_km(session: Session) -
 
 
 def test_ladder_expands_to_last_rung(session: Session) -> None:
-    client = RadiusAwareOverpass(elements_at(15.0))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=client)
+    client = RadiusAwareAmap(pois_at(15.0))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client)
     assert client.radii == [5000, 10000, 30000]
     assert len(result.items) == 1 and result.radius_m == 30000
     assert result.nearest_km == pytest.approx(15.0, abs=0.05)
@@ -554,8 +575,8 @@ def test_ladder_expands_to_last_rung(session: Session) -> None:
 
 def test_ladder_exhausted_reports_no_data(session: Session) -> None:
     """30 km 内都没有 → reason=no_data,三档半径各写一条负缓存。"""
-    client = RadiusAwareOverpass(elements_at(45.0))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=client)
+    client = RadiusAwareAmap(pois_at(45.0))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client)
     assert client.radii == [5000, 10000, 30000]
     assert result.items == [] and result.reason == REASON_NO_DATA
     assert result.radius_m == 30000 and result.expanded is True
@@ -563,8 +584,8 @@ def test_ladder_exhausted_reports_no_data(session: Session) -> None:
 
 
 def test_explicit_radius_never_expands(session: Session) -> None:
-    client = RadiusAwareOverpass(elements_at(7.0))
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=client)
+    client = RadiusAwareAmap(pois_at(7.0))
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=client)
     assert client.radii == [5000], "调用方显式给了半径就只查那一档"
     assert result.items == [] and result.reason == REASON_NO_DATA
     assert result.requested_radius_m == 5000
@@ -572,9 +593,9 @@ def test_explicit_radius_never_expands(session: Session) -> None:
 
 def test_ladder_second_request_is_offline(session: Session) -> None:
     """阶梯跑完仍空 → 二次请求在第一档就命中负缓存,0 网络。"""
-    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=RadiusAwareOverpass([]))
-    again = RadiusAwareOverpass([])
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=again)
+    stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=RadiusAwareAmap([]))
+    again = RadiusAwareAmap([])
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=again)
     assert again.calls == 0
     assert result.reason == REASON_NO_DATA and result.from_cache is True
 
@@ -593,7 +614,7 @@ def test_nearest_km_comes_from_db_when_search_is_empty(session: Session) -> None
     )
     session.commit()
     result = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=RadiusAwareOverpass([])
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=RadiusAwareAmap([])
     )
     assert result.items == [] and result.reason == REASON_NO_DATA
     assert result.nearest_km == pytest.approx(12.0, abs=0.05)
@@ -792,12 +813,12 @@ def test_estimate_mode_policy() -> None:
 
 def test_async_backfill_returns_immediately_and_fills_in_background(session: Session) -> None:
     """检索入库后**立即返回**(price_estimate=null),后台按 5 家/prompt 回填。"""
-    client = RadiusAwareOverpass(elements_at(*[1.0 + index * 0.1 for index in range(7)]))
+    client = RadiusAwareAmap(pois_at(*[1.0 + index * 0.1 for index in range(7)]))
     recorder = RecordingExecutor()
     llm = BatchLLM()
     result = stay_service.load_stays(
         session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000,
-        client=client, llm=llm, executor=recorder, estimate="async",
+        fetch_fn=client, llm=llm, executor=recorder, estimate="async",
     )
     assert len(result.items) == 7 == len(all_stays(session))
     assert all(item["price_estimate"] is None for item in result.items), "即刻返回,不等估价"
@@ -817,11 +838,11 @@ def test_async_backfill_returns_immediately_and_fills_in_background(session: Ses
 
 
 def test_auto_mode_switches_to_async_above_one_batch(session: Session) -> None:
-    client = RadiusAwareOverpass(elements_at(*[1.0 + index * 0.1 for index in range(6)]))
+    client = RadiusAwareAmap(pois_at(*[1.0 + index * 0.1 for index in range(6)]))
     recorder = RecordingExecutor()
     result = stay_service.load_stays(
         session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000,
-        client=client, llm=BatchLLM(), executor=recorder,
+        fetch_fn=client, llm=BatchLLM(), executor=recorder,
     )
     assert result.estimating is True and len(recorder.jobs) == 1
     assert all(item["price_estimate"] is None for item in result.items)
@@ -829,9 +850,9 @@ def test_auto_mode_switches_to_async_above_one_batch(session: Session) -> None:
 
 def test_auto_mode_keeps_single_batch_sync(session: Session) -> None:
     """≤ 一批(5 家)就地算完再返回:首屏就有价格,``estimating=False``。"""
-    client = RadiusAwareOverpass(elements_at(1.0, 2.0, 3.0))
+    client = RadiusAwareAmap(pois_at(1.0, 2.0, 3.0))
     result = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=client, llm=BatchLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=client, llm=BatchLLM()
     )
     assert result.estimating is False
     assert all(item["price_estimate"] for item in result.items)
@@ -839,10 +860,10 @@ def test_auto_mode_keeps_single_batch_sync(session: Session) -> None:
 
 def test_small_pending_batch_stays_sync_per_stay(session: Session) -> None:
     """既有口径不回归:一批以内(≤5 家)仍**逐家**同步估价(3 家 = 3 次调用)。"""
-    client = RadiusAwareOverpass(elements_at(1.0, 2.0, 3.0))
+    client = RadiusAwareAmap(pois_at(1.0, 2.0, 3.0))
     llm = BatchLLM("价格: 约¥200-400/晚\n简介: 位于市中心的经济型酒店。")
     items = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=client, llm=llm
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=client, llm=llm
     )
     assert llm.calls == 3
     assert all(item["price_estimate"] == "约¥200-400/晚" for item in items)
@@ -918,7 +939,7 @@ def test_inline_executor_captures_job_errors() -> None:
 def test_api_happy_path_keeps_legacy_top_level_shape(session: Session, monkeypatch) -> None:
     body = call_api(
         session, monkeypatch,
-        client=RadiusAwareOverpass(elements_at(1.0, 2.0)),
+        fetch_fn=RadiusAwareAmap(pois_at(1.0, 2.0)),
         llm=BatchLLM("价格: 约¥200-400/晚\n简介: 市中心。"),
         radius_km=8,
     )
@@ -929,7 +950,7 @@ def test_api_happy_path_keeps_legacy_top_level_shape(session: Session, monkeypat
 
 
 def test_api_exposes_three_reason_tiers(session: Session, monkeypatch) -> None:
-    empty = call_api(session, monkeypatch, client=RadiusAwareOverpass([]), radius_km=8)
+    empty = call_api(session, monkeypatch, fetch_fn=RadiusAwareAmap([]), radius_km=8)
     assert empty["count"] == 0 and empty["reason"] == REASON_NO_DATA
     assert empty["nearest_km"] is None and empty["estimating"] is False
     assert empty["source"] == stay_service.SOURCE_DB and empty["radius_km"] == 8.0
@@ -937,13 +958,13 @@ def test_api_exposes_three_reason_tiers(session: Session, monkeypatch) -> None:
 
     broken = call_api(
         session, monkeypatch, lat=31.5, lng=121.9,
-        client=RadiusAwareOverpass(error=DataSourceError("overpass", "端点全挂")), radius_km=8,
+        fetch_fn=RadiusAwareAmap(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000")), radius_km=8,
     )
     assert broken["reason"] == REASON_DATASOURCE_ERROR and broken["estimating"] is False
 
     slow = call_api(
         session, monkeypatch, lat=31.6, lng=121.9,
-        client=RadiusAwareOverpass(error=TransientDataSourceError("overpass", "请求超时(>30s)")),
+        fetch_fn=RadiusAwareAmap(error=TransientDataSourceError("amap", "请求超时(>30s)")),
         radius_km=8,
     )
     assert slow["reason"] == REASON_TIMEOUT
@@ -951,18 +972,18 @@ def test_api_exposes_three_reason_tiers(session: Session, monkeypatch) -> None:
 
 
 def test_api_negative_cache_makes_second_request_offline(session: Session, monkeypatch) -> None:
-    first = RadiusAwareOverpass([])
+    first = RadiusAwareAmap([])
     call_api(session, monkeypatch, client=first, radius_km=8)
     assert first.calls == 1
-    second = RadiusAwareOverpass([])
+    second = RadiusAwareAmap([])
     body = call_api(session, monkeypatch, client=second, radius_km=8)
     assert second.calls == 0, "6h 内同坐标同半径:0 网络"
     assert body["count"] == 0 and body["reason"] == REASON_NO_DATA
 
 
 def test_api_without_radius_uses_ladder_and_echoes_default(session: Session, monkeypatch) -> None:
-    client = RadiusAwareOverpass(elements_at(7.0))
-    body = call_api(session, monkeypatch, client=client, llm=BatchLLM(
+    client = RadiusAwareAmap(pois_at(7.0))
+    body = call_api(session, monkeypatch, fetch_fn=client, llm=BatchLLM(
         "价格: 约¥200-400/晚\n简介: 市中心。"
     ))
     assert client.radii == [5000, 10000], "未给 radius_km → 服务层按阶梯扩"
@@ -973,8 +994,8 @@ def test_api_without_radius_uses_ladder_and_echoes_default(session: Session, mon
 
 
 def test_api_explicit_radius_is_converted_to_meters(session: Session, monkeypatch) -> None:
-    client = RadiusAwareOverpass(elements_at(1.0, 7.0))
-    body = call_api(session, monkeypatch, client=client, radius_km=2.5, llm=BatchLLM(
+    client = RadiusAwareAmap(pois_at(1.0, 7.0))
+    body = call_api(session, monkeypatch, fetch_fn=client, radius_km=2.5, llm=BatchLLM(
         "价格: 约¥200-400/晚\n简介: 市中心。"
     ))
     assert client.radii == [2500] and body["radius_km"] == 2.5
@@ -988,8 +1009,8 @@ def test_api_reports_estimating_while_backfill_runs(session: Session, monkeypatc
     monkeypatch.setenv("ALIBABA_TOKEN_PLAN_API_KEY", "test-key")
     # 后台任务里解析 LLM 的入口换成假客户端:真客户端在本套单测里会被 no_network 打死
     monkeypatch.setattr(stay_service, "resolve_price_llm", lambda environ=None: BatchLLM())
-    client = RadiusAwareOverpass(elements_at(*[1.0 + index * 0.1 for index in range(7)]))
-    body = call_api(session, monkeypatch, client=client, radius_km=8)
+    client = RadiusAwareAmap(pois_at(*[1.0 + index * 0.1 for index in range(7)]))
+    body = call_api(session, monkeypatch, fetch_fn=client, radius_km=8)
     assert body["count"] == 7
     assert body["estimating"] is True
     assert all(item["price_estimate"] is None for item in body["items"])
@@ -998,15 +1019,15 @@ def test_api_reports_estimating_while_backfill_runs(session: Session, monkeypatc
 
     stats = recorder.run_all()[0]  # 跑完后台任务:价格落库,下一次请求就有
     assert stats["filled"] == 7 and stats["batches"] == 2
-    cached = call_api(session, monkeypatch, client=client, radius_km=8)
+    cached = call_api(session, monkeypatch, fetch_fn=client, radius_km=8)
     assert cached["count"] == 7 and cached["source"] == stay_service.SOURCE_DB
     assert all(item["price_estimate"] for item in cached["items"])
     assert "estimating" not in cached, "回填完就不该再报「估价中」"
 
 
 def test_api_without_llm_key_returns_null_prices_without_backfill(session: Session, monkeypatch) -> None:
-    client = RadiusAwareOverpass(elements_at(*[1.0 + index * 0.1 for index in range(7)]))
-    body = call_api(session, monkeypatch, client=client, radius_km=8)
+    client = RadiusAwareAmap(pois_at(*[1.0 + index * 0.1 for index in range(7)]))
+    body = call_api(session, monkeypatch, fetch_fn=client, radius_km=8)
     assert body["count"] == 7
     assert body.get("estimating", False) is False, "没配 key 就不排后台任务、不谎报「估价中」"
     assert set(body) == LEGACY_TOP_LEVEL_KEYS, "有结果且未降级 → 顶层形状保持既有 7 个字段"
@@ -1020,41 +1041,41 @@ def test_api_without_llm_key_returns_null_prices_without_backfill(session: Sessi
 
 
 def test_search_stays_still_degrades_to_plain_empty_list() -> None:
-    client = RadiusAwareOverpass(error=DataSourceError("overpass", "端点全挂"))
-    assert stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, client=client) == []
-    assert stay_service.search_stays(999.0, 0.0, client=client) == []
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, client=RadiusAwareOverpass(elements_at(1.0)))
+    client = RadiusAwareAmap(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
+    assert stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, fetch_fn=client) == []
+    assert stay_service.search_stays(999.0, 0.0, fetch_fn=client) == []
+    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, fetch_fn=RadiusAwareAmap(pois_at(1.0)))
     assert isinstance(rows, list) and rows[0]["name"] == "测试酒店1"
 
 
 def test_search_stays_detailed_reports_reason() -> None:
     rows, reason = stay_service.search_stays_detailed(
-        ORIGIN_LAT, ORIGIN_LNG, 8000, client=RadiusAwareOverpass([])
+        ORIGIN_LAT, ORIGIN_LNG, 8000, fetch_fn=RadiusAwareAmap([])
     )
     assert rows == [] and reason == REASON_NO_DATA
     rows, reason = stay_service.search_stays_detailed(
-        ORIGIN_LAT, ORIGIN_LNG, 8000, client=RadiusAwareOverpass(elements_at(1.0))
+        ORIGIN_LAT, ORIGIN_LNG, 8000, fetch_fn=RadiusAwareAmap(pois_at(1.0))
     )
     assert len(rows) == 1 and reason is None
     rows, reason = stay_service.search_stays_detailed(
         ORIGIN_LAT, ORIGIN_LNG, 8000,
-        client=RadiusAwareOverpass(error=TimeoutError("timed out")),
+        fetch_fn=RadiusAwareAmap(error=TimeoutError("timed out")),
     )
     assert rows == [] and reason == REASON_TIMEOUT
 
 
 def test_load_or_fetch_stays_still_returns_list(session: Session) -> None:
     """既有入口:返回值还是 list(空结果 ``== []``),只是多挂了判别属性。"""
-    broken = RadiusAwareOverpass(error=DataSourceError("overpass", "端点全挂"))
-    empty = stay_service.load_or_fetch_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=broken)
+    broken = RadiusAwareAmap(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
+    empty = stay_service.load_or_fetch_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=broken)
     assert isinstance(empty, list) and empty == []
     assert empty.reason == REASON_DATASOURCE_ERROR
-    assert stay_service.load_or_fetch_stays(session, 999.0, 0.0, client=broken) == []
+    assert stay_service.load_or_fetch_stays(session, 999.0, 0.0, fetch_fn=broken) == []
 
     # 上面两次失败已经写了负缓存,这里 refresh=True 强制重查(既有口径:refresh 跳过缓存)
     items = stay_service.load_or_fetch_stays(
         session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, refresh=True,
-        client=RadiusAwareOverpass(elements_at(1.0)), llm=BatchLLM(),
+        fetch_fn=RadiusAwareAmap(pois_at(1.0)), llm=BatchLLM(),
     )
     assert isinstance(items, list) and len(items) == 1
     assert items.source == stay_service.SOURCE_FETCH
@@ -1063,8 +1084,8 @@ def test_load_or_fetch_stays_still_returns_list(session: Session) -> None:
 
 
 def test_bad_origin_and_radius_degrade_without_network(session: Session) -> None:
-    client = RadiusAwareOverpass(elements_at(1.0))
-    result = stay_service.load_stays(session, 999.0, 0.0, client=client)
+    client = RadiusAwareAmap(pois_at(1.0))
+    result = stay_service.load_stays(session, 999.0, 0.0, fetch_fn=client)
     assert result.items == [] and client.calls == 0
-    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=0, client=client)
+    result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=0, fetch_fn=client)
     assert result.items == [] and client.calls == 0

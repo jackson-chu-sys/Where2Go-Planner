@@ -33,7 +33,14 @@ from app.main import app  # noqa: E402
 from data_sources import DataSourceError  # noqa: E402
 from db import init_db, make_engine, open_session, session_factory  # noqa: E402
 from db import repository as repo  # noqa: E402
-from db.models import OSM_SOURCE, SEED_SOURCE, SOURCE_TAG, is_seed, place_source  # noqa: E402
+from db.models import (  # noqa: E402
+    AMAP_SOURCE,
+    OSM_SOURCE,
+    SEED_SOURCE,
+    SOURCE_TAG,
+    is_seed,
+    place_source,
+)
 from services import intro as intro_service, place_loader, seed_data  # noqa: E402
 from services.bands import band_keys, in_band, require_band  # noqa: E402
 from services.classify import (  # noqa: E402
@@ -384,11 +391,12 @@ def test_count_by_source_counts_seeds_and_osm(session) -> None:
                        items=place_loader.to_place_items([point_at(80, name="云州峰",
                                                                    tags={"natural": "peak"}, osm_id=3)]))
     counts = repo.count_by_source(session, origin_city="上海", band=BAND)
-    assert counts == {OSM_SOURCE: 1, SEED_SOURCE: 2}
+    assert counts == {AMAP_SOURCE: 0, OSM_SOURCE: 1, SEED_SOURCE: 2}
     assert repo.count_by_source(session, origin_city="上海", band=BAND, category=CATEGORY_SKI) == {
-        OSM_SOURCE: 0, SEED_SOURCE: 1}
-    assert repo.count_by_source(session, origin_city="北京", band=BAND) == {OSM_SOURCE: 0, SEED_SOURCE: 0}, \
-        "两个键恒在,前端不必判空"
+        AMAP_SOURCE: 0, OSM_SOURCE: 0, SEED_SOURCE: 1}
+    assert repo.count_by_source(session, origin_city="北京", band=BAND) == {
+        AMAP_SOURCE: 0, OSM_SOURCE: 0, SEED_SOURCE: 0,
+    }, "三个键恒在(TASK-9b 起多一个「高德」),前端不必判空"
 
 
 # --------------------------------------------------------------------------- #
@@ -441,7 +449,7 @@ def test_fetch_path_merges_seeds_and_dedupes_against_osm(session) -> None:
     assert outcome.seeded == 1
     assert outcome.written == 2
     assert outcome.segment["place_count"] == 2
-    assert outcome.counts_by_source == {OSM_SOURCE: 1, SEED_SOURCE: 1}
+    assert outcome.counts_by_source == {AMAP_SOURCE: 0, OSM_SOURCE: 1, SEED_SOURCE: 1}
     assert outcome.counts_by_category == {CATEGORY_SKI: 2}
     assert sorted(row["name"] for row in outcome.places) == ["云州峰滑雪场", "测试雪场"]
     sources = {row["name"]: row["source"] for row in outcome.places}
@@ -456,7 +464,7 @@ def test_explicit_empty_seeds_disable_merging(session) -> None:
         session, city="上海", band=BAND, fetcher=fetcher, geocoder=recording_geocoder,
         seeds=[], intros=False)
     assert outcome.seeded == 0
-    assert outcome.counts_by_source == {OSM_SOURCE: 1, SEED_SOURCE: 0}
+    assert outcome.counts_by_source == {AMAP_SOURCE: 0, OSM_SOURCE: 1, SEED_SOURCE: 0}
 
 
 def test_read_path_seeding_is_idempotent_and_never_refetches(session) -> None:
@@ -474,16 +482,16 @@ def test_read_path_seeding_is_idempotent_and_never_refetches(session) -> None:
     second = place_loader.load_segment(session, city="上海", band=BAND, fetcher=ExplodingFetcher(),
                                       geocoder=recording_geocoder, seeds=seeds, intros=False)
     assert second.seeded == 0 and second.segment["place_count"] == 2
-    assert second.counts_by_source == {OSM_SOURCE: 1, SEED_SOURCE: 1}
+    assert second.counts_by_source == {AMAP_SOURCE: 0, OSM_SOURCE: 1, SEED_SOURCE: 1}
 
 
 def test_existing_segment_gets_seeded_without_refetch(session) -> None:
-    """存量库(TASK-1b 抓的、没有种子)二次查询就能拿到种子,不必重抓 Overpass。"""
+    """存量库(TASK-1b 抓的、没有种子)二次查询就能拿到种子,不必重抓高德。"""
     place_loader.load_segment(session, city="上海", band=BAND, fetcher=FakeFetcher(
         [point_at(60, name="云州峰", tags={"natural": "peak"}, osm_id=1)]),
         geocoder=recording_geocoder, seeds=[], intros=False)
     before = repo.get_segment(session, origin_city="上海", band=BAND)
-    assert before.place_count == 1 and before.source == place_loader.SOURCE_OVERPASS
+    assert before.place_count == 1 and before.source == place_loader.SOURCE_AMAP
     fetched_at = before.fetched_at
 
     outcome = place_loader.load_segment(session, city="上海", band=BAND, fetcher=ExplodingFetcher(),
@@ -493,7 +501,7 @@ def test_existing_segment_gets_seeded_without_refetch(session) -> None:
     assert outcome.segment["place_count"] == 2
     after = repo.get_segment(session, origin_city="上海", band=BAND)
     assert after.fetched_at == fetched_at, "补种是本地操作,不能改动抓取水位时间"
-    assert after.source == place_loader.SOURCE_OVERPASS
+    assert after.source == place_loader.SOURCE_AMAP
 
 
 def test_ensure_seeded_returns_zero_when_band_has_no_seeds(session) -> None:
@@ -511,7 +519,9 @@ def test_ensure_seeded_skips_row_already_in_db(session) -> None:
     seeds = [seed_at(70, name="测试雪场")]
     assert place_loader.ensure_seeded(session, origin=origin, band=band, seeds=seeds) == 1
     assert place_loader.ensure_seeded(session, origin=origin, band=band, seeds=seeds) == 0
-    assert repo.count_by_source(session, origin_city="上海", band=BAND) == {OSM_SOURCE: 0, SEED_SOURCE: 1}
+    assert repo.count_by_source(session, origin_city="上海", band=BAND) == {
+        AMAP_SOURCE: 0, OSM_SOURCE: 0, SEED_SOURCE: 1,
+    }, "count_by_source 恒给三个键(高德/OSM/种子)"
 
 
 def test_seeds_never_reach_the_llm(session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -575,7 +585,7 @@ def test_real_ski_seeds_show_up_around_beijing(session, seeds_on) -> None:
         geocoder=lambda city: {**beijing, "display_name": f"{city}市, 中国"}, intros=False)
     names = [row["name"] for row in outcome.places]
     assert "南山滑雪场" in names, f"需求点名的京郊雪场应被种子补上:{names}"
-    assert outcome.source == place_loader.SOURCE_OVERPASS
+    assert outcome.source == place_loader.SOURCE_AMAP
     assert all(row["source"] == SEED_SOURCE for row in outcome.places)
 
 

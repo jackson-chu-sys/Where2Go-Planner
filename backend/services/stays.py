@@ -6,12 +6,12 @@
 
 三段式(照 :mod:`services.place_loader` 的结构,只是范围缩到"一个坐标 + 半径"):
 
-* :func:`search_stays` —— Overpass **单组**并集检索:``tourism=hotel/guest_house/hostel/
-  apartment/chalet`` 五个选择器塞进同一个分组(一次 HTTP 请求、共用一个配额,住宿在
-  8 km 内密度低,不必像四分类那样按组拆配额),用 :func:`data_sources.overpass.parse_places`
-  解析(``limit=None`` 全收、``require_name=False`` —— 民宿/公寓常没有 ``name`` tag,
-  不能在服务端就滤掉),返回**已按离起点由近及远排序**、带 ``osm_type``/``osm_id`` 的行。
-  任何失败(端点全挂、查询非法、响应格式不对)一律降级成**空列表**,不抛给调用方。
+* :func:`search_stays` —— **高德** ``place/around`` 检索(TASK-9b):``types=100000``
+  (住宿服务**大类**粗筛)按由近及远翻页,单查询 200 条硬上限(:data:`GROUP_BUDGET`,
+  8 页 × 25 条),某页没拿满就停;具体 ``kind`` 在本地按返回的 ``type`` 中文串判
+  (:func:`stay_kind`,**不凭记忆编造中类码**),入库身份是 ``osm_type="amap"`` +
+  ``osm_id = crc32(高德 POI id)``(:func:`db.models.amap_osm_id`,原文存 ``tags["amap_id"]``,
+  表结构零改动)。任何失败(无 key、限流、响应格式不对)一律降级成**空列表**,不抛给调用方。
 * :func:`estimate_price` —— LLM 估价 + 一句话简介,**一次调用出两行**
   (``价格: 约¥A-B/晚`` / ``简介: <40字内>``):比拆两次调用省一半 token 与限流额度。
   复用 :class:`services.intro.LLMClient`(Provider 可切换、key 只读环境变量),
@@ -21,7 +21,7 @@
   对策:事实字段绑结构化来源,估算字段必须自带标注)。
 * :func:`load_or_fetch_stays` —— **DB 即缓存**:该坐标半径内已有 ≥
   :data:`MIN_CACHED_ROWS` 行就直接读库返回(``source="db"``),否则检索 → upsert →
-  只给**缺价格**的行调 LLM → 落库(``source="overpass"``);``refresh=True`` 强制重抓。
+  只给**缺价格**的行调 LLM → 落库(``source="amap"``);``refresh=True`` 强制重抓。
   已有 ``price_estimate`` 的行**永不再调 LLM**,与 ``Place.intro`` 的缓存口径一致。
 
 TASK-6c 在这个骨架上加了三件事(BUG-3/5):
@@ -29,11 +29,11 @@ TASK-6c 在这个骨架上加了三件事(BUG-3/5):
 * **负缓存**:空结果与检索失败都落一行 :class:`db.models.StayQueryCache`,
   :data:`NEG_CACHE_TTL_S`(6 小时)内同坐标同半径**直接回缓存态、不再触网**;
   过期即重查。缓存态带三档 ``reason`` —— ``no_data``(真的没有)/
-  ``datasource_error``(Overpass 报错)/ ``timeout``(超时),API 原样透传给前端分文案。
+  ``datasource_error``(高德报错)/ ``timeout``(超时),API 原样透传给前端分文案。
 * **半径阶梯** :data:`STAY_RADIUS_LADDER_M`(5→10→30 km):调用方**没显式给半径**时,
   小半径空结果就逐级扩大再查,扩到有结果即停,并给 ``nearest_km``(最近一家的 haversine
   距离,1 位小数);显式给了半径就**只查那一档**(不擅自扩,尊重调用方口径)。
-  检索**失败**不扩档 —— 端点已经挂了,再打两遍只是白等。
+  检索**失败**不扩档 —— 数据源已经挂了,再打两遍只是白等。
 * **估价异步回填**:检索入库后就能返回列表(``price_estimate`` 可为 null)。待估价的行数
   超过一批(:data:`PRICE_BATCH_SIZE` = 5 家)时不再阻塞请求,而是丢给后台线程**批量**
   回填(5 家一个 prompt、固定 ``qwen3.8-max`` 的 token-plan 注册项、单批重试 ≤ 1 次、
@@ -65,7 +65,7 @@ import math
 import os
 import re
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timezone
@@ -75,7 +75,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from data_sources import DataSourceError
-from data_sources import overpass
+from data_sources import amap
+from data_sources import haversine_km
 from db.models import (
     COORD_PRECISION,
     CURRENCY_LEN,
@@ -90,10 +91,13 @@ from db.models import (
     REASON_DATASOURCE_ERROR,
     REASON_NO_DATA,
     REASON_TIMEOUT,
+    AMAP_OSM_TYPE,
+    AMAP_SOURCE,
     STAY_CACHE_EMPTY,
     STAY_REASON_LEN,
     Stay,
     StayQueryCache,
+    amap_osm_id,
     clean_text,
     iso_utc,
     stay_cache_kind,
@@ -110,22 +114,37 @@ from services.intro import (
     clean_intro,
     find_provider,
 )
+from services import amap_categories
 from services.intro import default_client as default_llm_client
 
-# ``tourism=*`` 的住宿类型:**值即 kind**(顺序 = Overpass 选择器顺序)
+# 住宿类型(**值即 kind**):OSM 时代是 ``tourism=*`` 的取值,高德时代由
+# :func:`stay_kind` 从返回的中文 ``type``/``name`` 归一到同一批值(前端/规则表口径不变)
 STAY_TAGS: tuple[str, ...] = ("hotel", "guest_house", "hostel", "apartment", "chalet")
+# 高德检索参数(TASK-9b,§1.4 实测锚点:``100000`` 住宿服务大类,
+# ``100104`` 三星级宾馆 / ``100105`` 经济型连锁酒店)。**只用大类码粗筛**,
+# 细分 kind 在本地按返回的 ``type`` 字符串判 —— 契约明令禁止凭记忆编造中类码。
+STAY_TYPES = "100000"
+STAY_TYPECODE_PREFIX = "10"
+# 中文 type/name → kind 的关键词表(顺序 = 判定优先级,先具体后宽泛)
+AMAP_KIND_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hostel", ("青年旅舍", "青旅", "背包客栈")),
+    ("guest_house", ("民宿", "客栈", "家庭旅馆", "农家院", "民居")),
+    ("apartment", ("公寓",)),
+    ("chalet", ("度假", "别墅", "小屋", "山庄", "木屋", "营地")),
+    ("hotel", ("宾馆", "酒店", "旅馆", "招待所", "饭店", "住宿服务", "客栈酒店")),
+)
 DEFAULT_RADIUS_M = 8000
 LAT_LIMIT = 90.0
 LNG_LIMIT = 180.0
-# 单组五选择器的服务端配额:住宿密度低,200 条足够,又不至于把公共实例拖慢
-GROUP_BUDGET = 200
-# 客户端 HTTP 超时:8 km 单组并集是**交互路径**,不走 place_loader 那档 150s 冷启动超时
+# 服务端配额:住宿密度低,200 条足够 —— 恰好是高德**单查询**的硬上限(8 页 × 25 条)
+GROUP_BUDGET = amap.MAX_ROWS_PER_QUERY
+# 客户端 HTTP 超时:住宿检索是**交互路径**,不走 place_loader 那档冷启动超时
 STAY_REQUEST_TIMEOUT_S = 30.0
 DISTANCE_PRECISION = 2
 # DB 即缓存:半径内已有这么多行就不再触网(refresh=True 可强制重抓)
 MIN_CACHED_ROWS = 1
 SOURCE_DB = "db"
-SOURCE_FETCH = "overpass"
+SOURCE_FETCH = "amap"
 METERS_PER_DEGREE = 111_320.0
 # 高纬度兜底:cos(lat) 太小时经度包围盒会炸开,夹一个下限保证 SQL 粗筛仍收敛
 MIN_COS_LAT = 0.05
@@ -263,6 +282,8 @@ STARS_PRICE_BANDS: dict[int, tuple[int, int]] = {
 STARS_TAGS: tuple[str, ...] = ("stars", "hotel:stars", "stars:hotel")
 # OSM 的星级写法五花八门(``4`` / ``4*`` / ``四星`` / ``S4``),中文数字也认
 CN_STAR_DIGITS: dict[str, int] = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5}
+# 高德没有 ``stars`` tag,星级写在中文 ``type`` 里("住宿服务;宾馆酒店;三星级宾馆")
+AMAP_STARS_RE = re.compile(r"([一二两三四五1-5])\s*星")
 
 # 类型兜底档(**没品牌也没星级**时才用)。``hotel`` 刻意不在表里:"酒店"这一类的房价带
 # 太宽(100 到 3000 都有),规则乱猜不如让 LLM 看名称猜 —— 兜底只给窄口径的四种类型。
@@ -297,6 +318,9 @@ KNOWN_TIER_CITIES: tuple[str, ...] = TIER1_CITIES + NEW_TIER1_CITIES
 # 城市线索:先看地址 tag,再从名称里捞(``上海虹桥康得思酒店`` 这种写法很常见)
 CITY_TAGS: tuple[str, ...] = (
     "addr:city", "addr:town", "addr:municipality", "addr:district", "addr:province", "city",
+    # 高德行的城市线索(:func:`stay_tags`):``cityname`` 是地级市名("杭州市"),
+    # 正好对上线级表;``adname``(区县)刻意不收 —— 它不在城市表里会把一线城市压成 0.9。
+    "cityname",
 )
 # 系数乘完取整到 5 元:区间好看,也不会把 150×1.05=157.5 这种尾数塞给用户
 PRICE_BAND_STEP = 5
@@ -307,8 +331,10 @@ RULE_PROVIDER_LABEL = "规则表(0 token)"
 
 # 进 prompt 的住宿标签白名单(房价线索优先;上限 STAY_FACT_LIMIT 个,不塞整包 tag)
 STAY_FACT_TAGS: tuple[str, ...] = (
-    "tourism", "stars", "rooms", "beds", "brand", "operator", "internet_access",
-    "wheelchair", "addr:city", "addr:street", "opening_hours", "website",
+    # "type"/"cityname"/"address" 是高德行的事实线索(中文分类原文 + 城市 + 地址),
+    # 排在 OSM tag 之后、其余线索之前;白名单外的键仍不进 prompt。
+    "tourism", "stars", "brand", "operator", "type", "cityname", "address", "rooms", "beds",
+    "internet_access", "wheelchair", "addr:city", "addr:street", "opening_hours", "website",
 )
 STAY_FACT_LIMIT = 8
 STAY_SYSTEM_PROMPT = (
@@ -386,17 +412,42 @@ def coordinate_pair(lat: Any, lng: Any) -> Optional[tuple[float, float]]:
     return latitude, longitude
 
 
-def stay_kind(tags: Optional[Mapping[str, Any]]) -> str:
-    """住宿类型归一:``tourism`` 值命中 :data:`STAY_TAGS` 即为 kind。
+def amap_stay_kind(tags: Mapping[str, Any]) -> str:
+    """高德行的 kind:按返回的中文 ``type``/``name`` 关键词归一到 :data:`STAY_TAGS`。
 
-    命中不了就退回 ``tourism`` 原值(``motel``/``resort`` 这类同族写法照收,便于前端分组);
-    连 ``tourism`` 都没有时看别的 tag 值里有没有住宿类型(``building=hotel`` 的少数写法),
-    都没有 → 空串(不猜)。
+    **只按高德实际返回的字符串判,不凭记忆编造中类码**(§1.4 / §6.4 的硬约束);
+    ``typecode`` 存在却不是 ``10``(住宿服务大类)开头的脏行 → 空串(不猜);
+    大类命中但关键词都没命中 → 按 ``hotel`` 兜底(§1.4 的两个实测锚点 ``100104``
+    三星级宾馆 / ``100105`` 经济型连锁酒店 都是酒店,而 :data:`KIND_PRICE_BANDS`
+    刻意不收 ``hotel`` —— 酒店价带太宽,交给品牌/星级规则或 LLM)。
+    """
+    typecode = str(tags.get("typecode") or "").strip()
+    type_text = str(tags.get("type") or "").strip()
+    haystack = f"{type_text}|{tags.get('name') or ''}"
+    if typecode and not typecode.startswith(STAY_TYPECODE_PREFIX):
+        return ""
+    for kind, hints in AMAP_KIND_HINTS:
+        if any(hint in haystack for hint in hints):
+            return kind
+    return "hotel" if (typecode or type_text) else ""
+
+
+def stay_kind(tags: Optional[Mapping[str, Any]]) -> str:
+    """住宿类型归一:高德行看中文 ``type``/``name``,OSM/存量行看 ``tourism`` 值。
+
+    高德分支(:func:`amap_stay_kind`,TASK-9b)优先:归一出来的仍是 :data:`STAY_TAGS`
+    里那五个值,所以前端展示、:data:`KIND_PRICE_BANDS` 规则档与既有测试口径全都不变。
+    OSM 分支:``tourism`` 值命中 :data:`STAY_TAGS` 即为 kind;命中不了就退回 ``tourism``
+    原值(``motel``/``resort`` 这类同族写法照收,便于前端分组);连 ``tourism`` 都没有时
+    看别的 tag 值里有没有住宿类型(``building=hotel`` 的少数写法),都没有 → 空串(不猜)。
     """
     normalized = {
         str(key).strip().lower(): str(value).strip().lower()
         for key, value in dict(tags or {}).items()
     }
+    amap_kind = amap_stay_kind(normalized)
+    if amap_kind:
+        return amap_kind[:KIND_LEN]
     tourism = normalized.get("tourism", "")
     if tourism in STAY_TAGS:
         return tourism
@@ -440,7 +491,7 @@ def distance_km(origin_lat: Any, origin_lng: Any, lat: Any, lng: Any) -> Optiona
     if origin is None or point is None:
         return None
     return round(
-        overpass.haversine_km(origin[0], origin[1], point[0], point[1]), DISTANCE_PRECISION
+        haversine_km(origin[0], origin[1], point[0], point[1]), DISTANCE_PRECISION
     )
 
 
@@ -450,7 +501,7 @@ def _raw_distance(origin_lat: float, origin_lng: float, lat: Any, lng: Any) -> O
     longitude = _as_float(lng)
     if latitude is None or longitude is None:
         return None
-    return overpass.haversine_km(origin_lat, origin_lng, latitude, longitude)
+    return haversine_km(origin_lat, origin_lng, latitude, longitude)
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +572,22 @@ def stars_value(stay: Any) -> Optional[int]:
         number = _first_star_digit(text)
         if number in STARS_PRICE_BANDS:
             return number
-    return None
+    return amap_stars_value(normalized)
+
+
+def amap_stars_value(tags: Mapping[str, Any]) -> Optional[int]:
+    """高德行的星级:从中文 ``type``/``name`` 里捞 ``三星级`` / ``4星`` → 1..5;认不出 → ``None``。
+
+    刻意不复用 :func:`_first_star_digit` 扫全文:``7天连锁酒店`` 这种名称里的数字**不是**星级,
+    必须锚在"星"字上。命中后仍走 :data:`STARS_PRICE_BANDS` 的档位校验(超范围当没有)。
+    """
+    haystack = f"{tags.get('type') or ''}|{tags.get('name') or ''}"
+    match = AMAP_STARS_RE.search(str(haystack))
+    if match is None:
+        return None
+    char = match.group(1)
+    number = int(char) if char.isdigit() else CN_STAR_DIGITS.get(char)
+    return number if number in STARS_PRICE_BANDS else None
 
 
 def stars_band(stay: Any) -> Optional[tuple[int, int]]:
@@ -671,46 +737,108 @@ def rows_without_price(stays: Sequence[Any]) -> list[Any]:
 
 
 # --------------------------------------------------------------------------- #
-# 检索(Overpass)
+# 检索(高德 ``place/around``,TASK-9b)
 # --------------------------------------------------------------------------- #
 
-
-def stay_groups(*, budget: int = GROUP_BUDGET) -> list[dict[str, Any]]:
-    """住宿检索分组:**单组**,组内每个 ``{"tourism": tag}`` 一个选择器(并集、共用配额)。"""
-    return [
-        {
-            "tags": [{"tourism": tag} for tag in STAY_TAGS],
-            "element_types": "nwr",
-            "budget": budget,
-        }
-    ]
+#: 检索实现的可注入签名:``(lat, lng, radius_m) -> 归一化高德 POI 列表``
+#: (:func:`data_sources.amap.parse_poi` 的形状;测试传替身即可完全不触网)
+StayFetchFn = Callable[..., list[dict[str, Any]]]
 
 
-def build_stay_query(
-    lat: float, lng: float, radius_m: float = DEFAULT_RADIUS_M, *, budget: int = GROUP_BUDGET
-) -> str:
-    """构造住宿检索的 Overpass QL(:func:`data_sources.overpass.build_grouped_query` 单组)。
+def stay_page_limit(budget: int = GROUP_BUDGET) -> int:
+    """住宿检索最多翻几页:v3 固定 25 条/页、单查询 200 条硬上限(``page>=9`` 服务端恒空)。"""
+    return max(1, min(amap.MAX_PAGE, math.ceil(max(1, int(budget)) / amap.PAGE_SIZE)))
 
-    ``require_name=False``:民宿/公寓/小屋经常没有 ``name`` tag,服务端加 ``["name"]``
-    会把它们整片滤掉,宁可取回来在展示层兜底成"(无名)"。
+
+def fetch_stay_pois(
+    lat: float,
+    lng: float,
+    radius_m: float = DEFAULT_RADIUS_M,
+    *,
+    budget: int = GROUP_BUDGET,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+) -> list[dict[str, Any]]:
+    """高德 ``place/around`` 检索住宿:``types=100000``(住宿服务**大类**),由近及远翻页。
+
+    * **只用大类码粗筛**(§1.4 实测锚点:``100104`` 三星级宾馆 / ``100105`` 经济型连锁酒店),
+      具体 ``kind`` 在本地按返回的 ``type`` 中文串判(:func:`stay_kind`)—— 契约明令
+      **禁止凭记忆编造中类码**;
+    * 翻页到 :func:`stay_page_limit`(单查询 200 条硬上限)或配额满为止,**某页没拿满就停**
+      (``page>=9`` 服务端恒空,硬翻只是白烧配额);
+    * 高德返回顺序已是由近及远,这里不再重排;组内按 ``("amap", POI id)`` 去重;
+    * 半径 > 50km 由 :mod:`data_sources.amap` 钳制(住宿阶梯最大 30km,碰不到);
+    * 无 key / 限流 / 响应异常一律抛 :class:`data_sources.DataSourceError`,
+      由 :func:`search_stays_detailed` 兜成三档 reason(**绝不抛给调用方**)。
     """
-    return overpass.build_grouped_query(
-        lat, lng, radius_m, stay_groups(budget=budget), require_name=False
-    )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for page in range(1, stay_page_limit(budget) + 1):
+        batch = amap.search_around(
+            lat,
+            lng,
+            radius_m=radius_m,
+            types=STAY_TYPES,
+            page=page,
+            offset=amap.PAGE_SIZE,
+            environ=environ,
+            session=session,
+        ) or []
+        for poi in batch:
+            key = amap_categories.dedupe_key(poi)
+            if not key[1] or key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(poi))
+            if len(rows) >= max(1, int(budget)):
+                return rows
+        if len(batch) < amap.PAGE_SIZE:
+            return rows
+    return rows
 
 
-def stay_row(place: Mapping[str, Any], origin_lat: float, origin_lng: float) -> dict[str, Any]:
-    """``parse_places`` 的一条结果 → 住宿行(补 ``kind`` 与 ``distance_km``)。"""
-    tags = dict(place.get("tags") or {})
+def stay_tags(poi: Mapping[str, Any]) -> dict[str, Any]:
+    """归一化高德 POI → ``Stay.tags``:来源标注 + POI id 原文 + 分类原文 + 地址线索。
+
+    ``amap_id`` 必须留原文(``osm_id`` 是 crc32 哈希、不可逆);``type``/``typecode`` 是
+    高德分类原文(:func:`stay_kind` / :func:`stars_value` 的判定依据,也是 LLM 的事实线索);
+    ``cityname`` 给 :func:`stay_city` 做城市线级修正,``address``/``adname`` 只作展示与 prompt。
+    """
+    tags: dict[str, Any] = {
+        "source": AMAP_SOURCE,
+        "amap_id": str(poi.get("id") or "").strip(),
+        "typecode": str(poi.get("typecode") or "").strip(),
+        "type": str(poi.get("type") or "").strip(),
+    }
+    for key in ("address", "cityname", "adname"):
+        value = str(poi.get(key) or "").strip()
+        if value:
+            tags[key] = value
+    name = str(poi.get("name") or "").strip()
+    if name:
+        tags["name"] = name
+    return tags
+
+
+def stay_row(poi: Mapping[str, Any], origin_lat: float, origin_lng: float) -> dict[str, Any]:
+    """一条归一化高德 POI → 住宿行(补 **crc32 身份**、``kind`` 与 ``distance_km``)。
+
+    ``Stay.osm_id`` 也是 Integer 列,所以身份与 ``Place`` 同口径:
+    ``osm_type="amap"``、``osm_id = crc32(POI id)``(:func:`db.models.amap_osm_id`),
+    唯一键 ``(osm_type, osm_id)`` 的幂等语义原样保留;没有 id 的脏行 ``osm_id=None``,
+    由 :func:`stay_identity` 判成"无法幂等 upsert"而跳过(不抛)。
+    """
+    tags = stay_tags(poi)
+    poi_id = tags["amap_id"]
     return {
-        "osm_type": str(place.get("osm_type") or ""),
-        "osm_id": place.get("osm_id"),
-        "name": str(place.get("name") or "").strip(),
+        "osm_type": AMAP_OSM_TYPE,
+        "osm_id": amap_osm_id(poi_id) if poi_id else None,
+        "name": str(poi.get("name") or "").strip(),
         "kind": stay_kind(tags),
-        "lat": place.get("lat"),
-        "lng": place.get("lng"),
+        "lat": poi.get("lat"),
+        "lng": poi.get("lng"),
         "tags": tags,
-        "distance_km": distance_km(origin_lat, origin_lng, place.get("lat"), place.get("lng")),
+        "distance_km": distance_km(origin_lat, origin_lng, poi.get("lat"), poi.get("lng")),
     }
 
 
@@ -719,25 +847,25 @@ def search_stays(
     lng: float,
     radius_m: int = DEFAULT_RADIUS_M,
     *,
-    client: Optional[overpass.OverpassClient] = None,
+    fetch_fn: Optional[StayFetchFn] = None,
 ) -> list[dict[str, Any]]:
     """检索起点半径内的住宿,按由近及远排序;**任何失败都返回空列表**(降级,不抛)。
 
-    ``client`` 可注入(测试替换成假客户端);缺省用
-    :func:`data_sources.overpass.default_client`(端点链 + 重试)。
+    ``fetch_fn`` 可注入(测试替身,签名 ``(lat, lng, radius_m) -> 归一化高德 POI 列表``);
+    缺省用 :func:`fetch_stay_pois`(高德 ``place/around`` + ``types=100000``)。
     需要知道"为什么空"的调用方(编排层/负缓存)用 :func:`search_stays_detailed`。
     """
-    return search_stays_detailed(lat, lng, radius_m, client=client)[0]
+    return search_stays_detailed(lat, lng, radius_m, fetch_fn=fetch_fn)[0]
 
 
 def classify_failure(exc: BaseException) -> str:
     """检索异常 → 三档 reason 里的失败档:``timeout`` 或 ``datasource_error``。
 
-    超时单独分档是因为前端文案不同(超时="稍后再试",其他="可重试/换端点")。
-    ``data_sources._common`` 把 :class:`requests.Timeout` 包成 ``请求超时(>20s)`` 的
-    :class:`~data_sources.TransientDataSourceError`,Overpass 端点链全挂时又把每次尝试的
-    明细拼进最终消息,所以按**文案线索**判超时最稳;其余异常(限流/5xx/响应格式不对/
-    查询非法)一律 ``datasource_error``。
+    超时单独分档是因为前端文案不同(超时="稍后再试",其他="可重试")。
+    :mod:`data_sources._common` 与 :mod:`data_sources.amap` 都把超时包成
+    ``请求超时(...)`` 的 :class:`~data_sources.TransientDataSourceError`(高德的 QPS/日限流
+    infocode 同样归 Transient),所以按**文案线索**判超时最稳;其余异常(无 key/权限/
+    配额耗尽/响应格式不对)一律 ``datasource_error``。
     """
     if isinstance(exc, TimeoutError):  # socket.timeout 在 3.10+ 就是 TimeoutError
         return REASON_TIMEOUT
@@ -752,7 +880,7 @@ def search_stays_detailed(
     lng: float,
     radius_m: int = DEFAULT_RADIUS_M,
     *,
-    client: Optional[overpass.OverpassClient] = None,
+    fetch_fn: Optional[StayFetchFn] = None,
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     """同 :func:`search_stays`,但额外报**为什么空**:返回 ``(rows, reason)``。
 
@@ -764,22 +892,22 @@ def search_stays_detailed(
     if origin is None:
         return [], REASON_NO_DATA
     origin_lat, origin_lng = origin
-    http = client if client is not None else overpass.default_client()
+    fetch = fetch_fn if fetch_fn is not None else fetch_stay_pois
     try:
-        query = build_stay_query(origin_lat, origin_lng, radius_m)
-        payload = http.execute(query, timeout=STAY_REQUEST_TIMEOUT_S)
-        places = overpass.parse_places(
-            payload, origin_lat, origin_lng, limit=None, require_name=False, with_id=True
-        )
+        pois = fetch(origin_lat, origin_lng, radius_m)
     except DataSourceError as exc:
         return [], classify_failure(exc)
-    except Exception as exc:  # noqa: BLE001 - 检索是增强项:查询非法/响应异常都当"没搜到"
+    except Exception as exc:  # noqa: BLE001 - 检索是增强项:参数非法/响应异常都当"没搜到"
         return [], classify_failure(exc)
 
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
-    for place in places:
-        row = stay_row(place, origin_lat, origin_lng)
+    for poi in pois or []:
+        if not isinstance(poi, Mapping):
+            # 脏行(注入的替身/上游解析异常)不能让整次检索抛出去:跳过即可,
+            # 与 :func:`data_sources.amap.parse_poi` 丢弃非对象行的口径一致。
+            continue
+        row = stay_row(poi, origin_lat, origin_lng)
         identity = stay_identity(row)
         if identity is None or identity in seen:
             continue
@@ -1785,7 +1913,7 @@ def load_stays(
     *,
     radius_m: Optional[int] = None,
     refresh: bool = False,
-    client: Optional[overpass.OverpassClient] = None,
+    fetch_fn: Optional[StayFetchFn] = None,
     llm: Optional[LLMClient] = None,
     environ: Optional[Mapping[str, str]] = None,
     executor: Optional[Executor] = None,
@@ -1837,7 +1965,7 @@ def load_stays(
                     from_cache=True,
                 )
 
-        rows, reason = search_stays_detailed(origin_lat, origin_lng, rung, client=client)
+        rows, reason = search_stays_detailed(origin_lat, origin_lng, rung, fetch_fn=fetch_fn)
         if reason in (REASON_DATASOURCE_ERROR, REASON_TIMEOUT):
             db_rows = select_stays(session, origin_lat, origin_lng, rung)
             nearest = (
@@ -1906,7 +2034,7 @@ def load_or_fetch_stays(
     *,
     radius_m: Optional[int] = None,
     refresh: bool = False,
-    client: Optional[overpass.OverpassClient] = None,
+    fetch_fn: Optional[StayFetchFn] = None,
     llm: Optional[LLMClient] = None,
     environ: Optional[Mapping[str, str]] = None,
     executor: Optional[Executor] = None,
@@ -1928,7 +2056,7 @@ def load_or_fetch_stays(
             lng,
             radius_m=radius_m,
             refresh=refresh,
-            client=client,
+            fetch_fn=fetch_fn,
             llm=llm,
             environ=environ,
             executor=executor,

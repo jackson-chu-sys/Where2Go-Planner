@@ -6,10 +6,17 @@
    (:data:`CATEGORY_RULES` 按此顺序排列,首次命中即定类);
 2. **去重键 = OSM ``type + id``**:同一实体被多组检索 tag 命中时合并 tags 后只留一行
    (:func:`dedupe_places`),没有 OSM id 的种子数据由调用方给 ``identity`` 兜底;
-3. **检索**:一次查四分类 tag 的**并集**,每组带独立配额(:data:`SEARCH_GROUPS`),
-   避免某一类(如餐厅)把总量刷爆;band 下限 > 0 时由
-   :func:`data_sources.overpass.build_grouped_ring_query` 取**环形差集**
-   (上限圆 - 下限圆),配额只花在环内(TASK-1d)—— 分组、配额与归类口径都不变。
+3. **检索**(TASK-9b 起走**高德**):按组打 :mod:`data_sources.amap` 的
+   ``search_around`` / ``search_polygon``,每组带独立配额(:data:`SEARCH_GROUPS` =
+   :data:`services.amap_categories.AMAP_TYPE_GROUPS`),避免某一类(如餐厅)把总量刷爆;
+   band 下限 > 0 时用包围盒分格 + 本地 haversine 收敛到环内(见
+   :func:`services.place_loader.default_fetcher`)—— 分组、配额与归类口径都不变。
+
+OSM 时代的 tag 选择器(:data:`OSM_SEARCH_GROUPS` / :func:`search_tags`)只作为
+:mod:`services.categories` 的**兼容导入面**留着,检索链路已不再使用;
+归类侧的 tag 规则(:data:`CATEGORY_RULES`)仍服务**种子数据**与存量 OSM 行,
+高德行改走 :func:`services.amap_categories.classify_amap_poi`
+(见 :func:`amap_category` / :func:`classify_amap_places`)。
 
 分类与 OSM tag 的对照(STAGE1-PLAN 第 3 节表格):
 
@@ -40,7 +47,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Optional, Union
 
-from db.models import OSM_ELEMENT_TYPES, UNCATEGORIZED
+from db.models import AMAP_OSM_TYPE, OSM_ELEMENT_TYPES, UNCATEGORIZED
+from services import amap_categories
 
 CATEGORY_NATURE = "自然风光"
 CATEGORY_CULTURE = "小城人文美食"
@@ -291,7 +299,77 @@ def classify_places(
 
 
 # --------------------------------------------------------------------------- #
-# 检索线索:四分类 tag 并集(单次 Overpass 请求,每组独立配额)
+# 高德口径(TASK-9b):去重键 = ("amap", POI id),归类 = classify_amap_poi
+# --------------------------------------------------------------------------- #
+
+# 归一化高德 POI(:func:`data_sources.amap.parse_poi`)把 id 放在顶层 ``id``;
+# 已入库的行(tags 里有 ``amap_id``)与显式改名后的候选也一并认。
+AMAP_ID_KEYS: tuple[str, ...] = ("id", "amap_id")
+
+
+def amap_poi_id(item: Mapping[str, Any]) -> str:
+    """一条候选的高德 POI id 原文(``B023B17WWK``);拿不到 → 空串。"""
+    for key in AMAP_ID_KEYS:
+        text = str(item.get(key) or "").strip()
+        if text:
+            return text
+    tags = item.get("tags")
+    if isinstance(tags, Mapping):
+        return str(tags.get("amap_id") or "").strip()
+    return ""
+
+
+def has_amap_clue(item: Mapping[str, Any]) -> bool:
+    """这条候选是不是**高德形状**(有 POI id 或 typecode)。
+
+    种子数据与存量 OSM 行没有这两个字段,归类要退回 :func:`categorize`(tag 规则),
+    否则 :mod:`services.seed_data` 的人工种子会全被判成「其他」。
+    """
+    return bool(amap_poi_id(item) or str(item.get("typecode") or "").strip())
+
+
+def amap_identity(item: Mapping[str, Any]) -> tuple[Any, ...]:
+    """高德去重键 ``("amap", <POI id>)``;没有高德 id 时退回 :func:`default_identity`。
+
+    与 :func:`services.amap_categories.dedupe_key` 同口径(高德 POI id 全局唯一,
+    同一实体被多组检索命中时只留一行、只归一类)。
+    """
+    poi_id = amap_poi_id(item)
+    if poi_id:
+        return (AMAP_OSM_TYPE, poi_id)
+    return default_identity(item)
+
+
+def amap_category(item: Mapping[str, Any]) -> str:
+    """一条候选的分类:高德形状走 :func:`amap_categories.classify_amap_poi`,否则走 tag 规则。
+
+    两套规则的**优先级完全一致**(滑雪 > 运动 > 人文美食 > 自然),而且高德归类只看这条
+    POI 自己的 ``typecode``/``type``/``name``,与它被哪一组检索命中无关 —— 所以跨组合并
+    去重后归类结果稳定,不会因为组的顺序不同而变。
+    """
+    if has_amap_clue(item):
+        return amap_categories.classify_amap_poi(item)
+    return categorize(item.get("tags"))
+
+
+def classify_amap_places(
+    items: Iterable[Mapping[str, Any]],
+    *,
+    identity: Optional[IdentityFn] = None,
+) -> list[dict[str, Any]]:
+    """高德抓取结果的**去重 + 归类**(:func:`classify_places` 的高德版)。
+
+    去重键 ``("amap", POI id)``(:func:`amap_identity`),归类 :func:`amap_category`;
+    种子数据/存量 OSM 形状的行同样能过(自动退回 tag 口径),所以调用方不必分流。
+    """
+    rows = dedupe_places(items, identity=identity or amap_identity)
+    for row in rows:
+        row["category"] = amap_category(row)
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# 检索线索(TASK-9b 起检索侧走**高德**;下面的 OSM tag 选择器只留作兼容导入面)
 # --------------------------------------------------------------------------- #
 
 DEFAULT_ELEMENT_TYPES = "nwr"
@@ -325,8 +403,8 @@ NATURE_SEARCH_TAGS: tuple[TagSelector, ...] = (
     '["place"~"^(island|islet)$"]',
 )
 
-# 每组独立配额:一次请求查完四分类并集,又不让某一类(如餐厅/村庄)挤掉其他类。
-SEARCH_GROUPS: tuple[dict[str, Any], ...] = (
+# OSM 时代的检索分组(**已停用**,只留给 :func:`search_tags` 拼兼容用的选择器并集)。
+OSM_SEARCH_GROUPS: tuple[dict[str, Any], ...] = (
     {"category": CATEGORY_SKI, "group": "滑雪场", "budget": 80,
      "element_types": DEFAULT_ELEMENT_TYPES, "tags": SKI_SEARCH_TAGS},
     {"category": CATEGORY_SPORT, "group": "运动场所", "budget": 100,
@@ -341,17 +419,23 @@ SEARCH_GROUPS: tuple[dict[str, Any], ...] = (
      "element_types": DEFAULT_ELEMENT_TYPES, "tags": NATURE_SEARCH_TAGS},
 )
 
+# 每组独立配额:一次查完四分类并集,又不让某一类(如餐厅)挤掉其他类。
+# TASK-9b:检索侧换成高德 typecode/keywords 组(:mod:`services.amap_categories`),
+# **各组 budget 数值与合计 540 完全不变**,所以渐进配额(:func:`search_budget` 与
+# :func:`services.place_loader.scale_search_groups` 的递减口径)零改动。
+SEARCH_GROUPS: tuple[dict[str, Any], ...] = amap_categories.AMAP_TYPE_GROUPS
+
 
 def search_groups(categories: Optional[Sequence[str]] = None) -> list[dict[str, Any]]:
-    """检索分组(可按分类过滤);每组含 ``tags``(Overpass 选择器并集)与 ``budget``。"""
+    """检索分组(可按分类过滤);每组含高德检索参数 ``types``/``keywords`` 与 ``budget``。"""
     wanted = {str(item).strip() for item in categories} if categories else None
     groups = [
         {
             "category": group["category"],
             "group": group["group"],
             "budget": int(group["budget"]),
-            "element_types": group["element_types"],
-            "tags": list(group["tags"]),
+            "types": list(group.get("types") or ()),
+            "keywords": group.get("keywords"),
         }
         for group in SEARCH_GROUPS
         if wanted is None or group["category"] in wanted
@@ -360,10 +444,14 @@ def search_groups(categories: Optional[Sequence[str]] = None) -> list[dict[str, 
 
 
 def search_tags(categories: Optional[Sequence[str]] = None) -> list[TagSelector]:
-    """四分类检索线索的**并集**(去重、保持顺序):一份 tag 列表一次查完。"""
+    """**遗留**:四分类 OSM tag 选择器的并集(检索已改高德,只保 :mod:`services.categories` 导入面)。"""
+    wanted = {str(item).strip() for item in categories} if categories else None
     union: list[TagSelector] = []
     seen: set[str] = set()
-    for group in search_groups(categories):
+    for group in (
+        row for row in OSM_SEARCH_GROUPS
+        if wanted is None or row["category"] in wanted
+    ):
         for tag in group["tags"]:
             marker = str(tag) if isinstance(tag, str) else "|".join(f"{k}={v}" for k, v in sorted(tag.items()))
             if marker in seen:

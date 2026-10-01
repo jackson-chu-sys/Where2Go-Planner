@@ -3,14 +3,17 @@
 覆盖四件事,全程 mock、不触网:
 
 1. **配额缩放**::func:`services.place_loader.scale_search_groups` 把 :data:`SEARCH_GROUPS`
-   各组配额按比例缩到总量 ≈ ``target_total``(每组至少 2 条),仍然**一次**查完分组并集;
+   (TASK-9b 起是高德 typecode/keywords 组)各组配额按比例缩到总量 ≈ ``target_total``
+   (每组至少 2 条),仍然**一次**查完分组并集;
 2. **轮数落库**::attr:`db.models.SegmentFetch.fetch_rounds` 每完成一轮抓取 +1,旧库缺列由
    :func:`db.base.ensure_columns` 用 ``ALTER TABLE ADD COLUMN`` 补上(轻量迁移);
 3. **分页**``page_size`` / ``offset`` / ``more`` 三参 → 距离升序 +(osm_type, osm_id)
-   决胜的稳定切片;越界 + ``more=true`` 且库内行数没到常规全量配额时自动扩抓一轮;
+   决胜的稳定切片(高德行的 osm_id = ``crc32(POI id)``,所以断言看 ``tags.amap_id``);
+   越界 + ``more=true`` 且库内行数没到常规全量配额时自动扩抓一轮;
 4. **兼容**:三个参数一个都不带时行为与旧版完全一致(一次抓满配额、返回全量 places)。
 
 抓取/地理编码用替身注入(:mod:`services.place_loader` 的模块默认实现被 monkeypatch 换掉),
+抓取替身返回 :func:`data_sources.amap.parse_poi` 形状的**归一化高德 POI**(TASK-9b),
 ``no_network`` 把 :meth:`requests.Session.request` 换成抛错兜底,DB 用 ``tmp_path`` 下的临时
 SQLite。运行:``cd backend && ../.venv/bin/python -m pytest -q``
 """
@@ -39,7 +42,7 @@ from app.main import app  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db import repository as repo  # noqa: E402
 from db.base import get_session  # noqa: E402
-from db.models import Place, SegmentFetch  # noqa: E402
+from db.models import AMAP_OSM_TYPE, Place, SegmentFetch, amap_osm_id  # noqa: E402
 from services import intro as intro_service  # noqa: E402
 from services import place_loader  # noqa: E402
 from services.classify import search_budget  # noqa: E402
@@ -57,41 +60,56 @@ FULL_BUDGET = search_budget()
 # 坐标只由 index 决定,所以第 N 轮的点集是第 N-1 轮的**超集**,正好验扩抓去重。
 FIRST_KM = 50.5
 STEP_KM = 0.08
-# 四分类轮转:每 4 个点覆盖一次全部分类,方便断言 counts_by_category
-TAG_CYCLE: tuple[dict[str, str], ...] = (
-    {"natural": "peak", "ele": "309"},                  # 自然风光
-    {"tourism": "attraction", "historic": "yes"},       # 小城人文美食
-    {"sport": "climbing", "leisure": "sports_centre"},  # 运动
-    {"piste:type": "downhill"},                         # 滑雪场
+# 四分类轮转:每 4 个点覆盖一次全部分类,方便断言 counts_by_category。
+# typecode/type 只用 docs/TASK-9-CONTRACT.md §1.4 的实测锚点。
+TYPE_CYCLE: tuple[tuple[str, str], ...] = (
+    ("110000", "风景名胜;旅游景点"),                     # 自然风光
+    ("050100", "餐饮服务;中餐厅"),                       # 小城人文美食
+    ("080113", "体育休闲服务;台球厅"),                   # 运动
+    ("080106", "体育休闲服务;运动场馆;滑雪场"),           # 滑雪场
 )
 
 
-def point_at(
+def poi_id(number: int) -> str:
+    """第 ``number`` 个点的高德 POI id(字符串,形状仿真实 id:大写字母 + 数字)。"""
+    return f"B0FFH{number:05d}"
+
+
+def amap_ids(numbers: Any) -> list[str]:
+    """一串序号 → POI id 列表(断言用:入库的 ``tags["amap_id"]`` 是原文)。"""
+    return [poi_id(number) for number in numbers]
+
+
+def poi_at(
     km: float,
     *,
     name: str,
-    osm_id: int,
-    osm_type: str = "node",
-    tags: Optional[dict[str, Any]] = None,
+    number: int,
+    typecode: Optional[str] = None,
+    type_text: Optional[str] = None,
 ) -> dict[str, Any]:
-    """构造距上海 ``km`` 公里(正北)的 Overpass 风格候选点。"""
+    """构造距上海 ``km`` 公里(正北)的**归一化高德 POI**(TASK-9b 抓取替身的返回形状)。"""
+    resolved = TYPE_CYCLE[number % len(TYPE_CYCLE)]
     return {
-        "osm_type": osm_type,
-        "osm_id": osm_id,
+        "id": poi_id(number),
         "name": name,
-        "lat": round(SHANGHAI["lat"] + km / KM_PER_DEGREE, 6),
+        "lat": round(SHANGHAI["lat"] + km / KM_PER_DEGREE, 7),
         "lng": SHANGHAI["lng"],
-        "tags": dict(tags if tags is not None else TAG_CYCLE[osm_id % len(TAG_CYCLE)]),
+        "type": resolved[1] if type_text is None else type_text,
+        "typecode": resolved[0] if typecode is None else typecode,
+        "address": "",
+        "cityname": "上海市",
+        "adname": "",
+        "distance_m": int(km * 1000),
     }
 
 
 def band_point(index: int) -> dict[str, Any]:
-    """环内第 ``index`` 个点(``osm_id = index + 1``)。"""
-    return point_at(
+    """环内第 ``index`` 个点(POI id 由 ``index + 1`` 推出,轮转覆盖四分类)。"""
+    return poi_at(
         FIRST_KM + index * STEP_KM,
         name=f"环内点{index + 1:04d}",
-        osm_id=index + 1,
-        tags=TAG_CYCLE[index % len(TAG_CYCLE)],
+        number=index + 1,
     )
 
 
@@ -105,10 +123,10 @@ def band_points(count: int) -> list[dict[str, Any]]:
 
 
 class RingFetcher:
-    """Overpass 替身:**认 ``groups`` 关键字**(与 ``place_loader.default_fetcher`` 同签名)。
+    """高德抓取替身:**认 ``groups``/``fetch_rounds`` 关键字**(与 ``default_fetcher`` 同签名)。
 
     默认按"配额合计 = 条数"造环内候选(每 1 配额 1 条),所以 ``calls[i]["total"]``
-    直接就是这一轮要求 Overpass 取多少条;传 ``rows`` 可以改成返回固定候选。
+    直接就是这一轮要求高德取多少条;传 ``rows`` 可以改成返回固定候选。
     """
 
     def __init__(self, rows: Optional[list[dict[str, Any]]] = None) -> None:
@@ -121,6 +139,7 @@ class RingFetcher:
         lng: float,
         band: dict[str, Any],
         groups: Optional[list[dict[str, Any]]] = None,
+        fetch_rounds: Optional[int] = None,
     ) -> list[dict[str, Any]]:
         resolved = list(groups) if groups is not None else list(place_loader.SEARCH_GROUPS)
         self.calls.append(
@@ -132,8 +151,15 @@ class RingFetcher:
                 "group_count": len(resolved),
                 "budgets": [int(group["budget"]) for group in resolved],
                 "total": sum(int(group["budget"]) for group in resolved),
-                "selectors": sum(len(group["tags"]) for group in resolved),
+                # 高德的"选择器"= typecode 个数 + 关键词组数(小城古镇走 keywords)
+                "selectors": sum(
+                    len(group.get("types") or []) + (1 if group.get("keywords") else 0)
+                    for group in resolved
+                ),
+                "types": [tuple(group.get("types") or ()) for group in resolved],
+                "keywords": [group.get("keywords") for group in resolved],
                 "groups": [group["group"] for group in resolved],
+                "fetch_rounds": fetch_rounds,
             }
         )
         if self.rows is not None:
@@ -150,7 +176,7 @@ class RingFetcher:
 
 
 class LegacyFetcher:
-    """老式三参替身(既有单测的签名):不认 ``groups``,加了配额缩放也不能把它调炸。"""
+    """老式三参替身(既有单测的签名):不认 ``groups``/``fetch_rounds``,加了配额缩放也不能调炸。"""
 
     def __init__(self, rows: Optional[list[dict[str, Any]]] = None) -> None:
         self.rows = band_points(4) if rows is None else rows
@@ -169,7 +195,7 @@ class ExplodingFetcher:
 
     def __call__(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls.append(args)
-        raise AssertionError("这一路不应该再触网抓取 Overpass")
+        raise AssertionError("这一路不应该再触网抓取高德")
 
     @property
     def count(self) -> int:
@@ -330,7 +356,7 @@ def api(session, *, band: str = BAND, category=None, page_size=None, offset=None
 
 
 def seed_rows(session, rows, *, band: str = BAND, city: str = "上海", rounds: int = 1,
-              source: str = "overpass") -> SegmentFetch:
+              source: str = "amap") -> SegmentFetch:
     """直接入库若干行 + 一条抓取水位(不触网),摆出"已经抓过 N 轮"的库状态。"""
     items = place_loader.to_place_items(rows)
     repo.upsert_places(session, origin_city=city, band=band, items=items)
@@ -343,13 +369,29 @@ def seed_rows(session, rows, *, band: str = BAND, city: str = "上海", rounds: 
 
 
 def seed_db(session, count: int, **kwargs) -> SegmentFetch:
-    """入库环内前 ``count`` 个点(等距、id 连续)。"""
+    """入库环内前 ``count`` 个点(等距、POI id 连续)。"""
     return seed_rows(session, band_points(count), **kwargs)
 
 
 def stored_rows(session, *, band: str = BAND, city: str = "上海") -> list[dict[str, Any]]:
     return repo.list_places(session, origin_city=city, band=band,
                             origin_lat=SHANGHAI["lat"], origin_lng=SHANGHAI["lng"])
+
+
+def page_order(session, *, band: str = BAND, city: str = "上海") -> list[dict[str, Any]]:
+    """库内全量按**分页口径**排好序:距离升序 →(osm_type, osm_id)决胜。
+
+    TASK-9b 起 ``osm_id`` 是 ``crc32(高德 POI id)``,同距离的行不再按抓取序号决胜
+    (环内铺点间距 0.08 km,而 ``distance_km`` 只保留 1 位 → 必然有并列),所以断言
+    直接对齐 API 的排序键(:func:`app.api.places._page_sort_key`),再验切片不重不漏。
+    """
+    rows = stored_rows(session, band=band, city=city)
+    return sorted(rows, key=lambda row: (row["distance_km"], row["osm_type"], row["osm_id"]))
+
+
+def paged_ids(session, start: int, stop: int, **kwargs: Any) -> list[str]:
+    """分页口径下第 ``[start, stop)`` 行的高德 POI id 原文(``tags.amap_id``)。"""
+    return [row["tags"]["amap_id"] for row in page_order(session, **kwargs)[start:stop]]
 
 
 def load(session, *, target_total=None, fetcher=None, geocoder=None, refresh: bool = False, **kwargs):
@@ -386,11 +428,13 @@ def test_scale_search_groups_keeps_ratio_selectors_and_original() -> None:
     for original, row in zip(place_loader.SEARCH_GROUPS, scaled):
         assert row is not original, "必须返回副本,不能就地改 SEARCH_GROUPS"
         assert row["group"] == original["group"] and row["category"] == original["category"]
-        assert row["tags"] == list(original["tags"]), "tag 线索不能因为缩放而改动"
+        assert list(row.get("types") or []) == list(original.get("types") or []), \
+            "typecode 线索不能因为缩放而改动"
+        assert row.get("keywords") == original.get("keywords"), "关键词线索不能因为缩放而改动"
         assert row["budget"] < int(original["budget"]), "缩到 30 时每组都该变小"
     assert [int(group["budget"]) for group in place_loader.SEARCH_GROUPS] == before == [
-        80, 100, 120, 40, 60, 140
-    ], "原配额合计 540 不能被就地改"
+        80, 100, 180, 40, 140
+    ], "原配额合计 540 不能被就地改(高德五组:滑雪/运动/人文美食/小城古镇/自然)"
 
 
 def test_scale_search_groups_keeps_every_group_above_minimum() -> None:
@@ -431,9 +475,13 @@ def test_load_segment_sends_scaled_groups_in_one_request(session) -> None:
     call = fetcher.calls[0]
     assert call["groups_arg"] is not None and call["group_count"] == len(place_loader.SEARCH_GROUPS)
     assert call["groups"] == [group["group"] for group in place_loader.SEARCH_GROUPS]
-    assert call["selectors"] == sum(len(group["tags"]) for group in place_loader.SEARCH_GROUPS)
+    assert call["selectors"] == sum(
+        len(group.get("types") or []) + (1 if group.get("keywords") else 0)
+        for group in place_loader.SEARCH_GROUPS
+    ), "高德的『选择器』= typecode 个数 + 关键词组数"
+    assert call["types"] == [tuple(group.get("types") or ()) for group in place_loader.SEARCH_GROUPS]
     assert call["band"] == BAND and (call["lat"], call["lng"]) == (SHANGHAI["lat"], SHANGHAI["lng"])
-    assert outcome.source == place_loader.SOURCE_OVERPASS and outcome.network_used is True
+    assert outcome.source == place_loader.SOURCE_AMAP and outcome.network_used is True
     assert len(outcome.places) == 30, "环内 30 条候选全部入库"
 
 
@@ -576,9 +624,13 @@ def test_api_cold_fetch_in_paging_mode_only_grabs_one_round(session, offline) ->
     assert offline.geocoder.calls == ["上海"]
     assert payload["count"] == 15 and len(payload["places"]) == 15
     assert payload["total_in_db"] == 30 and payload["has_more"] is True
-    assert payload["fetch_rounds"] == 1 and payload["source"] == "overpass"
+    assert payload["fetch_rounds"] == 1 and payload["source"] == "amap"
     assert payload["network_used"] is True
-    assert [row["osm_id"] for row in payload["places"]] == list(range(1, 16)), "第一页 = 最近的 15 条"
+    assert [row["tags"]["amap_id"] for row in payload["places"]] == paged_ids(session, 0, 15), \
+        "第一页 = 分页口径下最近的 15 条(osm_id 是 crc32,断言看 tags.amap_id 原文)"
+    assert [row["distance_km"] for row in payload["places"]] == sorted(
+        row["distance_km"] for row in stored_rows(session)
+    )[:15], "第一页必须是最近的 15 条"
 
 
 def test_api_paging_defaults_to_page_size_15_offset_0(session, offline) -> None:
@@ -588,7 +640,7 @@ def test_api_paging_defaults_to_page_size_15_offset_0(session, offline) -> None:
     for kwargs in ({"more": "false"}, {"offset": "0"}, {"offset": 0}):
         payload = api(session, **kwargs)
         assert payload["count"] == 15, f"{kwargs} 应默认每页 15 条"
-        assert [row["osm_id"] for row in payload["places"]] == list(range(1, 16))
+        assert [row["tags"]["amap_id"] for row in payload["places"]] == paged_ids(session, 0, 15)
         assert "渐进抓取" in payload["note"]
 
 
@@ -596,25 +648,38 @@ def test_api_pages_are_stable_and_disjoint(session, offline) -> None:
     """翻遍全部页:不重不漏,拼回来正好是库内全量。"""
     seed_db(session, 30, rounds=1)
     offline.fetcher = ExplodingFetcher()
-    seen: list[int] = []
+    seen: list[str] = []
     flags: list[bool] = []
     for start in range(0, 30, 7):
         payload = api(session, page_size=7, offset=str(start), more="false")
-        seen.extend(row["osm_id"] for row in payload["places"])
+        seen.extend(row["tags"]["amap_id"] for row in payload["places"])
         flags.append(payload["has_more"])
         assert payload["total_in_db"] == 30, "total_in_db 与页码无关"
-    assert seen == list(range(1, 31)), f"分页应不重不漏:{seen}"
+    assert seen == [row["tags"]["amap_id"] for row in page_order(session)], \
+        f"分页应不重不漏:{seen}"
+    assert sorted(seen) == sorted(amap_ids(range(1, 31))), "库里就是那 30 条 POI(按 id 原文对齐)"
     assert len(set(seen)) == 30
     assert flags == [True, True, True, True, False], "最后一页 has_more=false"
 
 
+def tied_poi(name: str, id_text: str) -> dict[str, Any]:
+    """同距离(60 km)的一条高德 POI:分页决胜顺序只由 ``crc32(POI id)`` 决定。"""
+    row = poi_at(60, name=name, number=1, typecode="110000", type_text="风景名胜;旅游景点")
+    row["id"] = id_text
+    return row
+
+
 def test_api_page_order_breaks_distance_ties_by_osm_key(session, offline) -> None:
-    """同距离的行按 (osm_type, osm_id) 决胜 → 切片稳定;不分页时仍按名字。"""
+    """同距离的行按 (osm_type, osm_id) 决胜 → 切片稳定;不分页时仍按名字。
+
+    TASK-9b 起 ``osm_type`` 恒为 ``"amap"``,``osm_id = crc32(高德 POI id)``,所以决胜
+    顺序由哈希值决定(下面四个 id 的 crc32 升序是 M岩壁 < A山峰 < Z湖区 < B古镇)。
+    """
     tied = [
-        point_at(60, name="B古镇", osm_id=7, osm_type="way", tags={"natural": "peak"}),
-        point_at(60, name="A山峰", osm_id=9, osm_type="node", tags={"natural": "peak"}),
-        point_at(60, name="Z湖区", osm_id=1, osm_type="relation", tags={"natural": "peak"}),
-        point_at(60, name="M岩壁", osm_id=3, osm_type="node", tags={"natural": "peak"}),
+        tied_poi("B古镇", "B0FFHTIE4"),
+        tied_poi("A山峰", "B0FFHTIE3"),
+        tied_poi("Z湖区", "B0FFHTIE2"),
+        tied_poi("M岩壁", "B0FFHTIE7"),
     ]
     seed_rows(session, tied, rounds=1)
     offline.fetcher = ExplodingFetcher()
@@ -626,7 +691,8 @@ def test_api_page_order_breaks_distance_ties_by_osm_key(session, offline) -> Non
     assert [row["name"] for row in first["places"]] == ["M岩壁", "A山峰"]
     assert [row["name"] for row in second["places"]] == ["Z湖区", "B古镇"]
     assert [(row["osm_type"], row["osm_id"]) for row in first["places"] + second["places"]] == [
-        ("node", 3), ("node", 9), ("relation", 1), ("way", 7)
+        (AMAP_OSM_TYPE, amap_osm_id(text))
+        for text in ("B0FFHTIE7", "B0FFHTIE3", "B0FFHTIE2", "B0FFHTIE4")
     ], "决胜键 = (osm_type, osm_id),翻页才不会漂"
 
 
@@ -661,8 +727,9 @@ def test_api_more_true_expands_one_round(session, offline) -> None:
     assert payload["fetch_rounds"] == 2
     assert payload["total_in_db"] == 60 and payload["count"] == 15
     assert payload["has_more"] is True
-    assert payload["network_used"] is True and payload["source"] == "overpass"
-    assert [row["osm_id"] for row in payload["places"]] == list(range(31, 46)), "扩抓后重新排序再切片"
+    assert payload["network_used"] is True and payload["source"] == "amap"
+    assert [row["tags"]["amap_id"] for row in payload["places"]] == paged_ids(session, 30, 45), \
+        "扩抓后重新排序再切片"
 
 
 def test_api_more_true_expands_repeatedly(session, offline) -> None:
@@ -673,7 +740,7 @@ def test_api_more_true_expands_repeatedly(session, offline) -> None:
     second = api(session, page_size=15, offset=60, more="true")
     assert (second["total_in_db"], second["fetch_rounds"]) == (90, 3)
     assert offline.fetcher.totals == [60, 90]
-    assert [row["osm_id"] for row in second["places"]] == list(range(61, 76))
+    assert [row["tags"]["amap_id"] for row in second["places"]] == paged_ids(session, 60, 75)
 
 
 def test_api_more_false_never_expands(session, offline) -> None:
@@ -837,7 +904,7 @@ def test_http_paging_round_trip(session, offline, http) -> None:
     status, payload = http("/api/places", origin="上海", band=BAND, page_size=10, offset=10, more="false")
     assert status == 200
     assert payload["count"] == 10 and payload["total_in_db"] == 30 and payload["fetch_rounds"] == 1
-    assert [row["osm_id"] for row in payload["places"]] == list(range(11, 21))
+    assert [row["tags"]["amap_id"] for row in payload["places"]] == paged_ids(session, 10, 20)
     direct = api(session, page_size=10, offset=10, more="false")
     assert [row["id"] for row in direct["places"]] == [row["id"] for row in payload["places"]]
     assert direct["has_more"] == payload["has_more"]
@@ -862,7 +929,7 @@ def test_http_expansion_round_trip(session, offline, http) -> None:
     assert status == 200
     assert offline.fetcher.totals == [60]
     assert payload["fetch_rounds"] == 2 and payload["total_in_db"] == 60
-    assert [row["osm_id"] for row in payload["places"]] == list(range(31, 46))
+    assert [row["tags"]["amap_id"] for row in payload["places"]] == paged_ids(session, 30, 45)
 
 
 def test_openapi_exposes_paging_params() -> None:

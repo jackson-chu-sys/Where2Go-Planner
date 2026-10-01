@@ -33,6 +33,7 @@ from data_sources import haversine_km
 
 from .models import (
     ALL_CATEGORIES,
+    AMAP_SOURCE,
     CAT_MANUAL,
     CAT_NAME_LEN,
     COLLECTION_CAT_SOURCES,
@@ -273,11 +274,12 @@ def count_by_source(
     band: Optional[str] = None,
     category: Optional[str] = None,
 ) -> dict[str, int]:
-    """按来源(``OSM`` / ``种子``)计数,给前端状态栏与图例用。
+    """按来源(``高德`` / ``OSM`` / ``种子``)计数,给前端状态栏与图例用。
 
     ``tags`` 是 JSON 列,这里不做方言相关的 JSON 索引查询,直接取回 ``tags``
-    在 Python 里判定(单个 (城市, band) 的行数量级只有几百条);两个键恒在,
-    没有种子数据时就是 ``0``,前端不必判空。
+    在 Python 里判定(单个 (城市, band) 的行数量级只有几百条);**三个键恒在**,
+    没有该类数据时就是 ``0``,前端不必判空。TASK-9b 起新抓的行标「高德」,
+    存量「OSM」行与人工「种子」行的标注都保留(清库见 ``tools/amap_cutover.py``)。
     """
     stmt = select(Place.tags)
     if origin_city:
@@ -286,7 +288,7 @@ def count_by_source(
         stmt = stmt.where(Place.band == str(band))
     if category:
         stmt = stmt.where(Place.category == str(category))
-    counts = {OSM_SOURCE: 0, SEED_SOURCE: 0}
+    counts = {AMAP_SOURCE: 0, OSM_SOURCE: 0, SEED_SOURCE: 0}
     for (tags,) in session.execute(stmt):
         counts[place_source(tags)] += 1
     return counts

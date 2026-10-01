@@ -3,7 +3,7 @@
 全程不触网、不调真 LLM:
 
 * ``no_network`` 把 :meth:`requests.Session.request` 换成直接抛错,任何偷偷联网当场失败;
-* Overpass 换成假客户端(:func:`data_sources.overpass.default_client` 被 monkeypatch),
+* 高德检索换成假 fetch_fn(:func:`services.stays.fetch_stay_pois` 被 monkeypatch),
   LLM 换成假 client(``services.stays.default_llm_client`` 被 monkeypatch),
   所以一次请求会把 **路由 → 服务层 → 入库 → 序列化** 整条链跑完,仍然零网络;
 * DB 用 ``tmp_path`` 下的临时 SQLite,``app.dependency_overrides`` 把 ``get_session``
@@ -11,7 +11,7 @@
 
 重点覆盖:起点二选一(``lat``+``lng`` / ``place_id``)的校验(**400 + 中文报错**)、
 ``radius_km`` 上限与米换算、``refresh`` 透传、出参投影与 ``estimated`` 估算标注、
-DB 即缓存(命中缓存时零次 Overpass、零次 LLM)与各路降级都不 500。
+DB 即缓存(命中缓存时零次高德、零次 LLM)与各路降级都不 500。
 
 运行:``cd backend && ../.venv/bin/python -m pytest test_stays_api.py -q``
 """
@@ -36,10 +36,10 @@ if BACKEND_DIR not in sys.path:
 
 from app.api import stays as stays_api  # noqa: E402
 from app.main import app  # noqa: E402
-from data_sources import overpass as overpass_module  # noqa: E402
+from data_sources import haversine_km  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db.base import get_session  # noqa: E402
-from db.models import DEFAULT_CURRENCY, Place, Stay  # noqa: E402
+from db.models import DEFAULT_CURRENCY, Place, Stay, amap_osm_id  # noqa: E402
 from services import stays as stay_service  # noqa: E402
 
 # --------------------------------------------------------------------------- #
@@ -62,48 +62,66 @@ EXISTING_PATHS = {
     "/api/collections", "/api/collections/{collection_id}",
 }
 
-
-def node(osm_id: int, lat: float, lng: float, tags: dict[str, Any]) -> dict[str, Any]:
-    """一个 Overpass node element。"""
-    return {"type": "node", "id": osm_id, "lat": lat, "lon": lng, "tags": dict(tags)}
-
-
-def way(osm_id: int, lat: float, lng: float, tags: dict[str, Any]) -> dict[str, Any]:
-    """一个 way element:坐标只在 ``center`` 里(:func:`overpass.parse_element` 会取)。"""
-    return {"type": "way", "id": osm_id, "center": {"lat": lat, "lon": lng}, "tags": dict(tags)}
+#: 高德中文 ``type`` → 本地 kind(与 services.stays.AMAP_KIND_HINTS 口径一致)
+KIND_TYPE_TEXTS: dict[str, str] = {
+    "hotel": "住宿服务;宾馆酒店;星级酒店",
+    "hostel": "住宿服务;宾馆酒店;青年旅舍",
+    "guest_house": "住宿服务;宾馆酒店;民宿",
+    "apartment": "住宿服务;公寓式酒店;公寓",
+}
 
 
-SAMPLE_ELEMENTS: list[dict[str, Any]] = [
-    node(1, 31.2400, 121.4900, {"tourism": "hotel", "name": "外滩华尔道夫酒店", "stars": "5"}),
-    node(2, 31.2350, 121.4800, {"tourism": "hostel", "name": "老船长青旅"}),
-    way(3, 31.2600, 121.5000, {"tourism": "guest_house", "name": "衡山路小筑"}),
-    node(4, 31.2200, 121.4600, {"tourism": "apartment"}),
+def poi(number: int, lat: float, lng: float, *, name: str, kind: str = "hotel") -> dict[str, Any]:
+    """一条**归一化高德 POI**(TASK-9b 后 :func:`stays.fetch_stay_pois` 的输出形状)。"""
+    return {
+        "id": f"B0FFH{number:05d}",
+        "name": name,
+        "lat": lat,
+        "lng": lng,
+        "type": KIND_TYPE_TEXTS[kind],
+        "typecode": stay_service.STAY_TYPES,
+        "address": "",
+        "cityname": "",
+        "adname": "",
+        "distance_m": int(haversine_km(ORIGIN_LAT, ORIGIN_LNG, lat, lng) * 1000),
+    }
+
+
+SAMPLE_POIS: list[dict[str, Any]] = [
+    poi(1, 31.2400, 121.4900, name="外滩华尔道夫酒店"),
+    poi(2, 31.2350, 121.4800, name="老船长青旅", kind="hostel"),
+    poi(3, 31.2600, 121.5000, name="衡山路小筑", kind="guest_house"),
+    poi(4, 31.2200, 121.4600, name="", kind="apartment"),
 ]
 
 
-def sample_payload() -> dict[str, Any]:
-    return {"elements": [dict(item) for item in SAMPLE_ELEMENTS]}
+def sample_pois() -> list[dict[str, Any]]:
+    return [dict(item) for item in SAMPLE_POIS]
 
 
-class FakeOverpass:
-    """假 Overpass 客户端:记录查询与调用次数,可注入响应或异常。"""
+class FakeAmapFetch:
+    """假高德检索(:data:`services.stays.StayFetchFn` 签名):按半径过滤、记调用与圆心。"""
 
-    def __init__(self, payload: Optional[Any] = None, *, error: Optional[BaseException] = None):
-        self.payload = {"elements": []} if payload is None else payload
+    def __init__(self, pois: Optional[list[dict[str, Any]]] = None, *, error: Optional[BaseException] = None):
+        self.pois = list(pois if pois is not None else sample_pois())
         self.error = error
-        self.queries: list[str] = []
-        self.timeouts: list[Optional[float]] = []
+        self.origins: list[tuple[float, float]] = []
+        self.radii: list[Optional[int]] = []
         self.calls = 0
 
-    def execute(
-        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
-    ) -> Any:
+    def __call__(self, lat: float, lng: float, radius_m: Any = None, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls += 1
-        self.queries.append(query)
-        self.timeouts.append(timeout)
+        self.origins.append((lat, lng))
+        self.radii.append(None if radius_m is None else int(radius_m))
         if self.error is not None:
             raise self.error
-        return self.payload
+        rows = []
+        for item in self.pois:
+            km = haversine_km(lat, lng, float(item["lat"]), float(item["lng"]))
+            if radius_m is None or km * 1000 <= float(radius_m):
+                rows.append(dict(item))
+        rows.sort(key=lambda row: haversine_km(lat, lng, float(row["lat"]), float(row["lng"])))
+        return rows
 
 
 class FakeLLM:
@@ -249,10 +267,10 @@ def http(session):
 
 
 @pytest.fixture()
-def fake_overpass(monkeypatch: pytest.MonkeyPatch) -> FakeOverpass:
-    """替换 :func:`data_sources.overpass.default_client`(服务层缺省就是拿它检索)。"""
-    fake = FakeOverpass(sample_payload())
-    monkeypatch.setattr(overpass_module, "default_client", lambda: fake)
+def fake_amap(monkeypatch: pytest.MonkeyPatch) -> FakeAmapFetch:
+    """替换 :func:`services.stays.fetch_stay_pois`(服务层缺省就是拿它检索高德)。"""
+    fake = FakeAmapFetch(sample_pois())
+    monkeypatch.setattr(stay_service, "fetch_stay_pois", fake)
     return fake
 
 
@@ -299,14 +317,14 @@ def test_route_module_does_not_touch_network_itself() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_list_stays_projects_items_with_estimate_label(http, fake_overpass, fake_llm) -> None:
+def test_list_stays_projects_items_with_estimate_label(http, fake_amap, fake_llm) -> None:
     status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200, body
     assert set(body) == TOP_LEVEL_KEYS, f"顶层形状不对:{set(body) ^ TOP_LEVEL_KEYS}"
     assert body["lat"] == ORIGIN_LAT and body["lng"] == ORIGIN_LNG
     assert body["radius_km"] == stays_api.DEFAULT_RADIUS_KM, "radius_km 缺省应是 8 km"
     assert body["count"] == 4 == len(body["items"])
-    assert body["source"] == stay_service.SOURCE_FETCH, "首次查询应现场检索 Overpass"
+    assert body["source"] == stay_service.SOURCE_FETCH, "首次查询应现场检索高德"
     assert [item["name"] for item in body["items"]] == SAMPLE_ORDER, "应由近及远排序"
 
     first = body["items"][0]
@@ -317,7 +335,8 @@ def test_list_stays_projects_items_with_estimate_label(http, fake_overpass, fake
     assert first["price_kind"] == "rule", "出处标记透出:规则表(0 token)"
     assert first["currency"] == DEFAULT_CURRENCY
     assert first["intro"] is None, "规则层不出简介(不为简介烧 token)"
-    assert first["osm_type"] == "node" and first["osm_id"] == 2
+    # TASK-9b 入库身份:osm_type="amap"、osm_id=高德 POI id 的 crc32(原文在 tags.amap_id)
+    assert first["osm_type"] == "amap" and first["osm_id"] == amap_osm_id("B0FFH00002")
     assert first["kind"] == "hostel"
     assert first["distance_km"] == pytest.approx(0.79, abs=0.05)
     assert all(item["estimated"] == first["estimated"] for item in body["items"])
@@ -331,7 +350,7 @@ def test_list_stays_projects_items_with_estimate_label(http, fake_overpass, fake
     assert fake_llm.calls == 0, "三行有名称的都命中规则表,LLM 一次都不该调"
 
 
-def test_radius_km_filters_items_and_is_echoed(http, fake_overpass, fake_llm) -> None:
+def test_radius_km_filters_items_and_is_echoed(http, fake_amap, fake_llm) -> None:
     status, wide = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, radius_km=8)
     assert status == 200 and wide["radius_km"] == 8.0 and wide["count"] == 4
     status, narrow = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, radius_km=2)
@@ -357,9 +376,9 @@ def test_radius_km_converted_to_meters_and_refresh_passed_through(http, session,
     assert (seen["lat"], seen["lng"]) == (ORIGIN_LAT, ORIGIN_LNG)
 
 
-def test_empty_search_returns_200_with_db_source(http, fake_overpass, fake_llm) -> None:
+def test_empty_search_returns_200_with_db_source(http, fake_amap, fake_llm) -> None:
     """检索不到住宿(或服务层降级)→ 200 + 空列表,不是 500。"""
-    fake_overpass.payload = {"elements": []}
+    fake_amap.pois = []
     status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200, body
     assert body["count"] == 0 and body["items"] == []
@@ -368,8 +387,8 @@ def test_empty_search_returns_200_with_db_source(http, fake_overpass, fake_llm) 
     assert fake_llm.calls == 0
 
 
-def test_overpass_failure_degrades_to_empty_200(http, fake_overpass, fake_llm) -> None:
-    fake_overpass.error = RuntimeError("端点全挂")
+def test_datasource_failure_degrades_to_empty_200(http, fake_amap, fake_llm) -> None:
+    fake_amap.error = RuntimeError("高德配额耗尽")
     status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200 and body["count"] == 0, body
 
@@ -379,21 +398,21 @@ def test_overpass_failure_degrades_to_empty_200(http, fake_overpass, fake_llm) -
 # --------------------------------------------------------------------------- #
 
 
-def test_place_id_uses_place_coordinates(http, session, fake_overpass, fake_llm) -> None:
+def test_place_id_uses_place_coordinates(http, session, fake_amap, fake_llm) -> None:
     place = add_place(session, lat=31.2350, lng=121.4800)
     status, body = http("/api/stays", place_id=place.id)
     assert status == 200, body
     assert body["lat"] == 31.2350 and body["lng"] == 121.4800, "起点应是该 Place 的坐标"
     assert body["count"] == 4 and body["source"] == stay_service.SOURCE_FETCH
-    assert "31.235" in fake_overpass.queries[0], "检索应以 Place 坐标为圆心"
+    assert fake_amap.origins[0] == (31.2350, 121.4800), "检索应以 Place 坐标为圆心"
     assert body["items"][0]["name"] in SAMPLE_ORDER
 
 
-def test_unknown_place_id_returns_404(http, session, fake_overpass) -> None:
+def test_unknown_place_id_returns_404(http, session, fake_amap) -> None:
     status, body = http("/api/stays", place_id=4242)
     assert status == 404, body
     assert "4242" in body["detail"], "报错要带上出问题的 id"
-    assert fake_overpass.calls == 0, "查不到目的地就不该触网"
+    assert fake_amap.calls == 0, "查不到目的地就不该触网"
 
 
 # --------------------------------------------------------------------------- #
@@ -401,11 +420,11 @@ def test_unknown_place_id_returns_404(http, session, fake_overpass) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_missing_origin_returns_400_chinese(http, fake_overpass) -> None:
+def test_missing_origin_returns_400_chinese(http, fake_amap) -> None:
     status, body = http("/api/stays")
     assert status == 400, body
     assert "lat+lng" in body["detail"] and "place_id" in body["detail"], body["detail"]
-    assert fake_overpass.calls == 0, "参数不对就不该触网"
+    assert fake_amap.calls == 0, "参数不对就不该触网"
 
 
 @pytest.mark.parametrize(
@@ -474,10 +493,10 @@ def test_direct_call_with_unresolved_query_defaults_returns_400(session) -> None
 
 
 def test_db_cache_hit_is_offline_and_llm_free(http, session, monkeypatch) -> None:
-    """半径内已有行 → 直接读库:零次 Overpass、零次 LLM,``source=db``。"""
+    """半径内已有行 → 直接读库:零次高德、零次 LLM,``source=db``。"""
     seed_cached_stay(session)
-    boom = FakeOverpass(error=AssertionError("命中缓存就不该触网"))
-    monkeypatch.setattr(overpass_module, "default_client", lambda: boom)
+    boom = FakeAmapFetch(error=AssertionError("命中缓存就不该触网"))
+    monkeypatch.setattr(stay_service, "fetch_stay_pois", boom)
     llm = FakeLLM()
     monkeypatch.setattr(stay_service, "default_llm_client", lambda: llm)
 
@@ -492,25 +511,25 @@ def test_db_cache_hit_is_offline_and_llm_free(http, session, monkeypatch) -> Non
     assert boom.calls == 0 and llm.calls == 0
 
 
-def test_refresh_refetches_without_re_estimating(http, fake_overpass, fake_llm) -> None:
+def test_refresh_refetches_without_re_estimating(http, fake_amap, fake_llm) -> None:
     status, first = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200 and first["source"] == stay_service.SOURCE_FETCH
-    assert fake_overpass.calls == 1 and fake_llm.calls == 0
+    assert fake_amap.calls == 1 and fake_llm.calls == 0
 
     status, cached = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG)
     assert status == 200 and cached["source"] == stay_service.SOURCE_DB
-    assert fake_overpass.calls == 1, "未 refresh 时不该再检索"
+    assert fake_amap.calls == 1, "未 refresh 时不该再检索"
     assert fake_llm.calls == 0
 
     status, refreshed = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, refresh="1")
     assert status == 200 and refreshed["source"] == stay_service.SOURCE_FETCH
-    assert fake_overpass.calls == 2, "refresh=true 应强制重抓"
+    assert fake_amap.calls == 2, "refresh=true 应强制重抓"
     assert fake_llm.calls == 0, "已有价格的行不该再调 LLM(不重复花 token)"
     assert refreshed["count"] == 4
 
 
 @pytest.mark.parametrize("kwargs", [{"enabled": False}, {"error": RuntimeError("限流 429")}])
-def test_llm_degradation_keeps_200_and_null_price(http, fake_overpass, monkeypatch, kwargs) -> None:
+def test_llm_degradation_keeps_200_and_null_price(http, fake_amap, monkeypatch, kwargs) -> None:
     """未配 key / 限流 → LLM 那一路降级成 null,接口照常 200(估算失败不影响事实字段)。
 
     TASK-6g:规则层是 0 token 的,没有 key 也照样出价,所以"降级"只降规则未命中的行。

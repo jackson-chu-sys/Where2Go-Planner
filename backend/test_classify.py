@@ -30,10 +30,17 @@ if BACKEND_DIR not in sys.path:
 from app.api import discover as discover_api  # noqa: E402
 from app.api import places as places_api  # noqa: E402
 from data_sources import DataSourceError  # noqa: E402
-from data_sources import overpass  # noqa: E402
+from data_sources import amap, haversine_km  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db import repository as repo  # noqa: E402
-from db.models import UNCATEGORIZED, Place  # noqa: E402
+from db.models import (  # noqa: E402
+    AMAP_OSM_TYPE,
+    AMAP_SOURCE,
+    UNCATEGORIZED,
+    Place,
+    amap_osm_id,
+)
+from services import amap_categories  # noqa: E402
 from services import classify, intro as intro_service, place_loader, reclassify  # noqa: E402
 from services.bands import DISTANCE_BANDS, band_inner_radius_m, band_radius_m  # noqa: E402
 from services.classify import (  # noqa: E402
@@ -48,7 +55,7 @@ from services.classify import (  # noqa: E402
 )
 
 # --------------------------------------------------------------------------- #
-# 构造样本(不触网):Overpass 风格 elements / 环内候选点
+# 构造样本(不触网):归一化高德 POI / 遗留 OSM 风格 elements(种子与存量行仍走 tag 口径)
 # --------------------------------------------------------------------------- #
 
 SHANGHAI = {"lat": 31.2304, "lng": 121.4737}
@@ -102,24 +109,110 @@ class RecordingGeocoder:
         return {"lat": SHANGHAI["lat"], "lng": SHANGHAI["lng"], "display_name": f"{city}市, 中国"}
 
 
-class FakeOverpassClient:
-    """Overpass 客户端替身:记录批量抓取调用的半径/内圈/分组(验证真实抓取路径)。"""
+def poi_at_km(
+    km: float,
+    name: str,
+    id_text: str,
+    *,
+    typecode: str = "110000",
+    type_text: str = "风景名胜;旅游景点",
+) -> dict[str, Any]:
+    """距上海 ``km`` 公里(正北)的**归一化高德 POI**(:func:`data_sources.amap.parse_poi` 形状)。
 
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+    typecode/type 只用 ``docs/TASK-9-CONTRACT.md`` §1.4 的实测锚点(禁凭记忆编造中类码)。
+    """
+    return {
+        "id": id_text,
+        "name": name,
+        "lat": round(SHANGHAI["lat"] + km / KM_PER_DEGREE, 7),
+        "lng": SHANGHAI["lng"],
+        "type": type_text,
+        "typecode": typecode,
+        "address": "",
+        "cityname": "上海市",
+        "adname": "",
+        "distance_m": int(km * 1000),
+    }
 
-    def nearby_places_grouped(self, lat: float, lng: float, radius_m: float,
-                              groups: Any, **kwargs: Any) -> list[dict[str, Any]]:
-        self.calls.append({"lat": lat, "lng": lng, "radius_m": radius_m, "inner_radius_m": 0.0,
-                           "groups": list(groups), **kwargs})
-        return []
 
-    def nearby_places_ring(self, lat: float, lng: float, outer_radius_m: float,
-                           inner_radius_m: Any, groups: Any,
-                           **kwargs: Any) -> list[dict[str, Any]]:
-        self.calls.append({"lat": lat, "lng": lng, "radius_m": outer_radius_m,
-                           "inner_radius_m": inner_radius_m, "groups": list(groups), **kwargs})
-        return []
+def raw_poi(
+    id_text: str,
+    name: str,
+    lng: float,
+    lat: float,
+    type_text: str,
+    typecode: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    """高德 v3 响应里 ``pois[]`` 的**原始**形状(``location`` 是 "lng,lat" 字符串)。"""
+    body: dict[str, Any] = {
+        "id": id_text, "name": name, "location": f"{lng},{lat}",
+        "type": type_text, "typecode": typecode, "address": "", "adname": "",
+    }
+    body.update(extra)
+    return body
+
+
+def v3_payload(pois: list[dict[str, Any]]) -> dict[str, Any]:
+    """高德 v3 成功响应外壳(**HTTP 码恒 200**,成败看 status/infocode)。"""
+    return {"status": "1", "infocode": "10000", "info": "OK",
+            "count": str(len(pois)), "pois": list(pois)}
+
+
+class FakeAmapSearch:
+    """高德检索替身:签名与 :func:`amap.search_around` / :func:`amap.search_polygon` 一致。
+
+    * 圆形检索按 ``radius_m`` 过滤、多边形检索按格子包围盒过滤(高德只在范围内返回);
+    * 每次调用只回 ``offset`` 条(按页切 ``rows``),所以配额没满时
+      :func:`place_loader._paged` 会翻页 —— 正好验「配额抓满即停」与页数上限;
+    * ``error`` 让所有请求都抛错(验降级)。
+    """
+
+    def __init__(self, rows: Optional[list[dict[str, Any]]] = None,
+                 *, error: Optional[BaseException] = None) -> None:
+        self.rows = list(rows or [])
+        self.error = error
+        self.around_calls: list[dict[str, Any]] = []
+        self.polygon_calls: list[dict[str, Any]] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.around_calls) + len(self.polygon_calls)
+
+    def _page(self, page: int, offset: int) -> list[dict[str, Any]]:
+        if self.error is not None:
+            raise self.error
+        start = (int(page) - 1) * int(offset)
+        return [dict(row) for row in self.rows[start:start + int(offset)]]
+
+    def search_around(self, lat: float, lng: float, *, radius_m: Any = amap.AUTO_MAX_RADIUS_M,
+                      types: Any = None, keywords: Any = None, page: int = 1,
+                      offset: int = amap.PAGE_SIZE, environ: Any = None,
+                      session: Any = None) -> list[dict[str, Any]]:
+        self.around_calls.append({
+            "lat": lat, "lng": lng, "radius_m": radius_m, "types": types, "keywords": keywords,
+            "page": page, "offset": offset, "environ": environ, "session": session,
+        })
+        limit_km = min(float(radius_m), float(amap.AUTO_MAX_RADIUS_M)) / 1000.0
+        return [
+            row for row in self._page(page, offset)
+            if haversine_km(float(lat), float(lng), row["lat"], row["lng"]) <= limit_km
+        ]
+
+    def search_polygon(self, polygon: Any, *, types: Any = None, keywords: Any = None,
+                       page: int = 1, offset: int = amap.PAGE_SIZE, environ: Any = None,
+                       session: Any = None) -> list[dict[str, Any]]:
+        points = [(float(point[0]), float(point[1])) for point in polygon]
+        self.polygon_calls.append({
+            "polygon": points, "types": types, "keywords": keywords,
+            "page": page, "offset": offset, "environ": environ, "session": session,
+        })
+        lngs = [point[0] for point in points]
+        lats = [point[1] for point in points]
+        return [
+            row for row in self._page(page, offset)
+            if min(lngs) <= row["lng"] <= max(lngs) and min(lats) <= row["lat"] <= max(lats)
+        ]
 
 
 class FakeLLM:
@@ -167,24 +260,12 @@ class FakeSession:
 
     def request(self, method: str, url: str, params: Any = None, data: Any = None,
                 timeout: Any = None, headers: Any = None) -> FakeResponse:
-        # Overpass 走表单 ``data={"data": query}``;LLM 走 JSON 字节串 —— 两种都原样记下。
-        self.calls.append({"method": method, "url": url, "data": data,
+        # 高德 v3 走 GET 查询串 ``params``;LLM 走 JSON 字节串 —— 两种都原样记下。
+        self.calls.append({"method": method, "url": url, "params": dict(params or {}),
+                           "data": data,
                            "query": data.get("data") if isinstance(data, Mapping) else None,
                            "timeout": timeout, "headers": dict(headers or {})})
         return FakeResponse(self.payload)
-
-
-class QueuedSession(FakeSession):
-    """按调用顺序返回预设 payload(用于"整组差集 OOM → 按选择器拆开后成功"这类降级)。"""
-
-    def __init__(self, *payloads: Any) -> None:
-        super().__init__(payloads[-1] if payloads else {})
-        self.payloads = list(payloads) or [{}]
-
-    def request(self, method: str, url: str, params: Any = None, data: Any = None,
-                timeout: Any = None, headers: Any = None) -> FakeResponse:
-        self.payload = self.payloads[min(len(self.calls), len(self.payloads) - 1)]
-        return super().request(method, url, params, data, timeout, headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,6 +293,15 @@ def session(tmp_path):
     finally:
         current.close()
         engine.dispose()
+
+
+@pytest.fixture()
+def fake_amap(monkeypatch: pytest.MonkeyPatch) -> FakeAmapSearch:
+    """把 :mod:`data_sources.amap` 的两个检索函数换成替身(纯本地,零 HTTP)。"""
+    fake = FakeAmapSearch()
+    monkeypatch.setattr(amap, "search_around", fake.search_around)
+    monkeypatch.setattr(amap, "search_polygon", fake.search_polygon)
+    return fake
 
 
 @pytest.fixture()
@@ -385,17 +475,22 @@ def test_classify_places_gives_exactly_one_category_per_feature() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 4. 检索:band 上限半径 + 四分类 tag 并集(一次请求,每组独立配额)
+# 4. 检索(TASK-9b 起走**高德**):分组 typecode/keywords + 圆形/分格多边形 + 配额翻页
 # --------------------------------------------------------------------------- #
 
 
 def test_search_groups_cover_four_categories_with_independent_budgets() -> None:
+    """四分类检索组(TASK-9b 起是高德 typecode/keywords 组)与配额口径不变。"""
     groups = classify.search_groups()
     assert {group["category"] for group in groups} == set(CATEGORY_PRIORITY)
-    assert all(group["budget"] > 0 and group["tags"] for group in groups)
-    assert classify.search_budget() == sum(group["budget"] for group in groups)
+    assert all(group["budget"] > 0 for group in groups)
+    assert all(group["types"] or group["keywords"] for group in groups), \
+        "每组要么给 typecode 粗筛,要么给关键词(§6.3:两者二选一)"
+    assert classify.search_budget() == sum(group["budget"] for group in groups) == 540
+    assert [group["budget"] for group in groups] == [80, 100, 180, 40, 140], "各组配额沿用旧数值"
     ski = classify.search_groups([CATEGORY_SKI])
     assert ski and all(group["category"] == CATEGORY_SKI for group in ski)
+    assert ski[0]["types"] == [amap_categories.SKI_TYPECODE], "滑雪场 = 080106(§6.4)"
     assert classify.search_budget([CATEGORY_SKI]) < classify.search_budget()
 
 
@@ -409,137 +504,192 @@ def test_search_tags_is_a_deduped_union_of_all_category_clues() -> None:
         assert clue in joined, f"四分类线索 {clue} 应进检索并集"
 
 
-def test_grouped_query_puts_every_category_in_one_request() -> None:
-    query = overpass.build_grouped_query(
-        SHANGHAI["lat"], SHANGHAI["lng"], 100_000, classify.search_groups(), query_timeout=120
-    )
-    assert query.startswith("[out:json][timeout:120];")
-    assert query.count("out center ") == len(classify.SEARCH_GROUPS), "每组一个独立配额"
-    for group in classify.SEARCH_GROUPS:
-        assert f"out center {group['budget']};" in query
-    assert "around:100000,31.230400,121.473700" in query, "按 band 上限半径检索"
-    assert '["piste:type"]["name"]' in query and '["natural"~' in query
-    assert query.count("[out:json]") == 1, "必须是**一次**请求"
+def test_first_band_queries_every_group_once_with_its_own_amap_params(fake_amap) -> None:
+    """band 下限 = 0:每组一次 ``place/around``(半径 = band 上限),types/keywords 按组给。"""
+    fake_amap.rows = [
+        poi_at_km(20, "城里公园", "B0FFHPARK0", typecode="110101", type_text="风景名胜;公园;公园"),
+        poi_at_km(30, "云州古镇", "B0FFHTOWN0"),
+    ]
+    band = {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50}
+    rows = place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band)
 
-
-def test_nearby_places_grouped_sends_a_single_post_and_keeps_osm_ids() -> None:
-    payload = {"elements": [
-        {"type": "node", "id": 1, "lat": 31.5, "lon": 121.5, "tags": {"name": "雪场", "piste:type": "downhill"}},
-        {"type": "way", "id": 2, "center": {"lat": 31.6, "lon": 121.6}, "tags": {"name": "古镇", "historic": "town"}},
-        {"type": "way", "id": 2, "center": {"lat": 31.6, "lon": 121.6}, "tags": {"name": "古镇", "tourism": "attraction"}},
-    ]}
-    fake = FakeSession(payload)
-    client = overpass.OverpassClient(session=fake, retries=1, retry_backoff_s=0)
-    rows = client.nearby_places_grouped(
-        SHANGHAI["lat"], SHANGHAI["lng"], 100_000, classify.search_groups()
-    )
-
-    assert len(fake.calls) == 1, "四分类并集只发一次 HTTP 请求"
-    assert fake.calls[0]["method"] == "POST"
-    assert fake.calls[0]["timeout"] > 20, "冷启动批量抓取不受交互 20s 上限约束"
-    assert len(rows) == 3, "抓取层不去重(同一实体被多组命中)"
-    assert {(row["osm_type"], row["osm_id"]) for row in rows} == {("node", 1), ("way", 2)}
-    # 去重 + 归类在 services 层完成
-    classified = classify_places(rows)
-    assert [(row["name"], row["category"]) for row in classified] == [("雪场", CATEGORY_SKI), ("古镇", CATEGORY_CULTURE)]
-
-
-def test_grouped_ring_query_keeps_every_group_budget_inside_the_ring() -> None:
-    """TASK-1d:远环改用集合差,六组的配额口径与单圆并集**完全一致**。"""
-    query = overpass.build_grouped_ring_query(
-        SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, classify.search_groups(), query_timeout=240
-    )
-    assert query.startswith("[out:json][timeout:240];")
-    assert query.count("[out:json]") == 1, "环形差集仍然是**一次**请求"
-    assert query.count("out center ") == len(classify.SEARCH_GROUPS), "每组一个独立配额"
-    for group in classify.SEARCH_GROUPS:
-        assert f"out center {group['budget']};" in query, f"{group['group']} 配额不变"
-    # 每组都要同时扫上限圆与下限圆,并用一个差集运算符把内圈减掉
-    outer = query.count("around:300000,31.230400,121.473700")
-    inner = query.count("around:200000,31.230400,121.473700")
-    assert outer == inner > 0, "上下限圆的选择器数量必须对称"
-    assert query.count("\n  -\n") == len(classify.SEARCH_GROUPS), "每组一个集合差"
-    assert '["piste:type"]["name"](around:300000' in query, "require_name 口径不变"
-
-
-def test_nearby_places_ring_sends_one_difference_request_per_group(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TASK-1d:环形差集**每组一次请求**,配额/去重口径与单圆并集完全一致。
-
-    六组塞进一次请求会撞公共实例的单查询内存上限(实测 OOM / 504),拆开后单组可跑通。
-    """
-    # 断言"第 i 条请求查第 i 组",钉在串行口径;并行见 test_overpass_ring_parallel(TASK-7a)。
-    monkeypatch.setenv(overpass.ENV_WORKERS, "1")
-    payload = {"elements": [
-        {"type": "node", "id": 1, "lat": 33.03, "lon": 121.47, "tags": {"name": "环内古镇", "historic": "town"}},
-        {"type": "way", "id": 2, "center": {"lat": 32.9, "lon": 120.1}, "tags": {"name": "环内山峰", "natural": "peak"}},
-    ]}
-    fake = FakeSession(payload)
-    client = overpass.OverpassClient(session=fake, retries=1, retry_backoff_s=0)
     groups = classify.search_groups()
-    rows = client.nearby_places_ring(SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, groups)
-
-    assert len(fake.calls) == len(groups), "每组一次请求"
-    for call, group in zip(fake.calls, groups):
-        sent = call["query"]
-        assert sent.count("[out:json]") == 1
-        assert sent.count("out center ") == 1, "一次请求只查一组"
-        assert f"out center {group['budget']};" in sent, f"{group['group']} 配额不变"
-        assert f"[timeout:{overpass.DEFAULT_RING_QUERY_TIMEOUT}]" in sent, "环形查询放宽服务端超时"
-        assert call["timeout"] == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S, "客户端超时同步放宽"
-        assert "around:300000" in sent and "around:200000" in sent and "\n  -\n" in sent
-    # 抓取层仍不去重(同一实体被多组命中),但跨组合并后按由近及远排序(古镇 200 km < 山峰 226 km)
-    assert len(rows) == 2 * len(groups)
-    assert [row["name"] for row in rows] == ["环内古镇"] * len(groups) + ["环内山峰"] * len(groups)
-    assert {(row["osm_type"], row["osm_id"]) for row in rows} == {("node", 1), ("way", 2)}
-    classified = classify_places(rows)
-    assert [(row["name"], row["category"]) for row in classified] == [
-        ("环内古镇", CATEGORY_CULTURE), ("环内山峰", CATEGORY_NATURE)
-    ], "去重键 (type, id) 与归类优先级口径不变"
+    assert len(fake_amap.around_calls) == len(groups), "每组一次圆形检索(不多不少)"
+    assert fake_amap.polygon_calls == [], "下限为 0 的 band 不该走分格多边形"
+    for call, group in zip(fake_amap.around_calls, groups):
+        assert call["radius_m"] == band_radius_m(band), "半径 = band 上限"
+        assert call["types"] == (list(group["types"]) or None)
+        assert call["keywords"] == group["keywords"]
+        assert call["page"] == 1 and call["offset"] == amap.PAGE_SIZE, "v3 固定 25 条/页"
+    # 同一条 POI 被五组各命中一次 → 跨组按 ("amap", POI id) 去重后只剩两行
+    assert [row["id"] for row in rows] == ["B0FFHPARK0", "B0FFHTOWN0"]
 
 
-OOM_REMARK = "runtime error: Query run out of memory using about 2048 MB of RAM."
-
-
-def test_ring_falls_back_to_per_selector_difference_for_the_heavy_ski_group(
+def test_loader_sends_one_v3_request_per_group_and_dedupes_by_amap_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """实测**滑雪场**组整条差集在公共实例上 OOM(2048 MB),必须能按选择器拆开重发。
+    """真链路(:mod:`data_sources.amap` + 假 HTTP session):每组一次 v3 GET,身份是 crc32。"""
+    payload = v3_payload([
+        raw_poi("B023B17WWK", "太舞滑雪场", 115.4, 40.9,
+                "体育休闲服务;运动场馆;滑雪场", "080106", cityname="张家口市"),
+        raw_poi("B0FFHTOWN1", "云州古镇", 121.5, 31.6, "风景名胜;旅游景点", "110000"),
+        raw_poi("B0FFHTOWN1", "云州古镇", 121.5, 31.6, "风景名胜;旅游景点", "110000"),
+    ])
+    fake = FakeSession(payload)
+    environ = {amap.ENV_AMAP_KEY: "test-key", amap.ENV_MIN_INTERVAL: "0"}
+    band = {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50}
+    rows = place_loader.default_fetcher(
+        SHANGHAI["lat"], SHANGHAI["lng"], band, environ=environ, session=fake
+    )
 
-    拆分只改"发几条查询",不改口径:每条仍是环形差集、仍带**该组**配额,合并后按
-    ``(type, id)`` 去重并截到配额,归类优先级照旧由 :func:`classify_places` 决定。
-    """
-    # 断言"第 i 条请求查第 i 个选择器",钉在串行口径(TASK-7a 起拆分降级也并行)。
-    monkeypatch.setenv(overpass.ENV_WORKERS, "1")
-    ski = next(group for group in classify.search_groups() if group["category"] == CATEGORY_SKI)
-    selectors = overpass.tags_to_selectors(ski["tags"])
-    assert len(selectors) > 1, "滑雪场组本来就是多选择器并集,才需要拆分降级"
-    payload = {"elements": [
-        {"type": "node", "id": 1, "lat": 33.03, "lon": 121.47,
-         "tags": {"name": "环内雪场", "piste:type": "downhill", "sport": "skiing"}},
-        {"type": "way", "id": 2, "center": {"lat": 32.9, "lon": 120.1},
-         "tags": {"name": "环内雪道", "piste:type": "downhill"}},
-    ]}
-    session = QueuedSession({"remark": OOM_REMARK, "elements": []}, *([payload] * len(selectors)))
-    client = overpass.OverpassClient(session=session, retries=1, retry_backoff_s=0)
-    rows = client.nearby_places_ring(SHANGHAI["lat"], SHANGHAI["lng"], 300_000, 200_000, [ski])
+    groups = classify.search_groups()
+    assert len(fake.calls) == len(groups), "每组一次请求;第一页没拿满就不再翻页"
+    assert all(call["method"] == "GET" for call in fake.calls)
+    assert all(call["url"].endswith(amap.SEARCH_AROUND_PATH) for call in fake.calls), "必须走 v3 圆形检索"
+    assert {call["params"]["key"] for call in fake.calls} == {"test-key"}
+    assert {call["params"]["radius"] for call in fake.calls} == {50000}
+    assert {call["params"]["offset"] for call in fake.calls} == {amap.PAGE_SIZE}
+    ski = next(call for call in fake.calls if call["params"].get("types") == "080106")
+    assert "keywords" not in ski["params"], "§6.3:types 与 keywords 二选一"
+    town = next(call for call in fake.calls if call["params"].get("keywords") == "古镇|老街|古城")
+    assert "types" not in town["params"], "小城古镇走关键词(§6.4:村庄码 0 命中)"
 
-    assert len(session.calls) == 1 + len(selectors), "整组 1 次 + 每个选择器各 1 次"
-    for call, selector in zip(session.calls, [None, *selectors]):
-        sent = call["query"]
-        assert sent.count("out center ") == 1, "一次请求只查一组/一个选择器"
-        assert f"out center {ski['budget']};" in sent, f"{ski['group']} 配额不变"
-        assert "\n  -\n" in sent and "around:300000" in sent and "around:200000" in sent
-        assert call["timeout"] == overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
-        if selector is not None:
-            assert f'{selector}["name"]' in sent, "每个选择器单独一条差集查询"
-    # 同两个地物被每个选择器各命中一次 → 按 (type, id) 去重后只剩 2 条(未超配额)
-    assert {(row["osm_type"], row["osm_id"]) for row in rows} == {("node", 1), ("way", 2)}
-    assert len(rows) == 2
-    assert [(row["name"], row["category"]) for row in classify_places(rows)] == [
-        ("环内雪场", CATEGORY_SKI), ("环内雪道", CATEGORY_SKI)
-    ], "归类优先级口径不变"
+    assert [row["id"] for row in rows] == ["B023B17WWK", "B0FFHTOWN1"], "同实体跨组只留一行"
+    classified = classify.classify_amap_places(rows)
+    assert [(row["name"], row["category"]) for row in classified] == [
+        ("太舞滑雪场", CATEGORY_SKI), ("云州古镇", CATEGORY_CULTURE)
+    ], "去重键 = 高德 POI id,归类优先级不变"
+    items = place_loader.to_place_items(rows)
+    assert [(item["osm_type"], item["osm_id"]) for item in items] == [
+        (AMAP_OSM_TYPE, amap_osm_id("B023B17WWK")), (AMAP_OSM_TYPE, amap_osm_id("B0FFHTOWN1"))
+    ], "入库身份:osm_type=amap、osm_id=crc32(POI id)"
+    assert items[0]["tags"] == {
+        "source": AMAP_SOURCE, "amap_id": "B023B17WWK",
+        "typecode": "080106", "type": "体育休闲服务;运动场馆;滑雪场",
+    }
+
+
+def test_ring_cells_only_keep_cells_intersecting_the_band() -> None:
+    """band 下限 > 0 的分格计划:切格 → 只留与环带相交的 → 按最近距离升序。"""
+    band = next(item for item in DISTANCE_BANDS if item["key"] == "50_100")
+    assert place_loader.grid_side(band_radius_m(band)) == 8, "200 km 直径 / 25 km 格边长 = 8"
+    cells = place_loader.ring_cells(SHANGHAI["lat"], SHANGHAI["lng"], band)
+    assert 0 < len(cells) < 8 * 8, "整格都在环外的(太近/太远)被丢掉"
+    ranges = [place_loader.cell_distance_range(cell, SHANGHAI["lat"], SHANGHAI["lng"]) for cell in cells]
+    assert [near for near, _ in ranges] == sorted(near for near, _ in ranges), \
+        "按最近距离升序 → 前几格总是环带里离起点最近的部分"
+    for cell, (near, far) in zip(cells, ranges):
+        assert len(cell) == 4 and all(len(point) == 2 for point in cell), "格子是 4 顶点矩形(lng,lat)"
+        assert far >= band_inner_radius_m(band) / 1000.0, "整格都在内圈里的不该进计划"
+        assert near < band_radius_m(band) / 1000.0, "整格都在外圈外的不该进计划"
+    min_lat, min_lng, max_lat, max_lng = place_loader.band_bbox(
+        SHANGHAI["lat"], SHANGHAI["lng"], band_radius_m(band)
+    )
+    for cell in cells:  # 顶点按 7 位小数定点(amap.COORD_PRECISION),留 1e-6 容差
+        assert all(min_lng - 1e-6 <= x <= max_lng + 1e-6 for x, _ in cell)
+        assert all(min_lat - 1e-6 <= y <= max_lat + 1e-6 for _, y in cell), "格子都在外半径包围盒内"
+
+
+def test_grid_cell_limit_grows_with_fetch_rounds() -> None:
+    """递增扩格:本轮抓几格 = 4 ×(已完成轮数 + 1),与配额 30 ×(轮数 + 1)同口径。"""
+    assert place_loader.GRID_CELLS_PER_ROUND == 4
+    assert place_loader.grid_cell_limit(None) == 4
+    assert [place_loader.grid_cell_limit(rounds) for rounds in (0, 1, 2, 3)] == [4, 8, 12, 16]
+    assert place_loader.grid_cell_limit(-5) == 4, "负轮数按 0 起算"
+    assert [place_loader.progressive_target_total(rounds) for rounds in (0, 1, 2)] == [30, 60, 90]
+
+
+def test_ring_fetch_queries_every_group_per_cell(fake_amap) -> None:
+    """分格路径:**每组 × 每格**一次 ``place/polygon``,参数就是该组的 types/keywords。"""
+    band = next(item for item in DISTANCE_BANDS if item["key"] == "50_100")
+    fake_amap.rows = []  # 空结果:配额永远抓不满 → 每格都得问一遍
+    cells = place_loader.ring_cells(SHANGHAI["lat"], SHANGHAI["lng"], band)
+    groups = classify.search_groups()
+    rows = place_loader.default_fetcher(
+        SHANGHAI["lat"], SHANGHAI["lng"], band, cell_limit=len(cells)
+    )
+
+    assert rows == []
+    assert fake_amap.around_calls == [], "下限 > 0 不走圆形检索"
+    assert len(fake_amap.polygon_calls) == len(groups) * len(cells), "每组每格一次请求"
+    expected = [
+        (list(group["types"]) or None, group["keywords"])
+        for group in groups
+        for _ in cells
+    ]
+    assert [(call["types"], call["keywords"]) for call in fake_amap.polygon_calls] == expected
+    assert all(call["page"] == 1 and call["offset"] == amap.PAGE_SIZE for call in fake_amap.polygon_calls)
+
+
+def test_default_fetcher_expands_cells_with_fetch_rounds(fake_amap) -> None:
+    """扩格随 ``fetch_rounds`` 递增:上一轮没抓满 → 下一轮「加载更多」多抓几格。"""
+    band = next(item for item in DISTANCE_BANDS if item["key"] == "50_100")
+    cells = place_loader.ring_cells(SHANGHAI["lat"], SHANGHAI["lng"], band)
+    assert len(cells) > place_loader.grid_cell_limit(1), "本用例需要足够多的格子才验得出扩格"
+    group = {"category": CATEGORY_NATURE, "group": "自然风光", "budget": 140,
+             "types": ("110000",), "keywords": None}
+    for rounds in (None, 0, 1, 2):
+        fake_amap.polygon_calls.clear()
+        place_loader.default_fetcher(
+            SHANGHAI["lat"], SHANGHAI["lng"], band, groups=[group], fetch_rounds=rounds
+        )
+        assert len(fake_amap.polygon_calls) == place_loader.grid_cell_limit(rounds), \
+            f"fetch_rounds={rounds} 应抓 {place_loader.grid_cell_limit(rounds)} 格"
+    # cell_limit 显式给定时优先于 fetch_rounds(测试/回填脚本用)
+    fake_amap.polygon_calls.clear()
+    place_loader.default_fetcher(
+        SHANGHAI["lat"], SHANGHAI["lng"], band, groups=[group], fetch_rounds=0, cell_limit=3
+    )
+    assert len(fake_amap.polygon_calls) == 3
+
+
+def test_group_paging_respects_amap_page_cap_and_budget(fake_amap) -> None:
+    """单查询 200 条硬上限:页数夹在 ``[1, MAX_PAGE]``,配额抓满就停止翻页。"""
+    assert place_loader.FETCH_LIMIT == amap.MAX_ROWS_PER_QUERY == 200
+    assert place_loader.page_limit(30) == 2, "30 条配额 = 2 页(25 条/页)"
+    assert place_loader.page_limit(30, slack=place_loader.RING_PAGE_SLACK) == 3, "分格路径多翻一页兜损耗"
+    assert place_loader.page_limit(540) == amap.MAX_PAGE == 8, "page>=9 服务端恒空,不硬翻"
+    assert place_loader.page_limit(0) == 1
+
+    fake_amap.rows = [
+        poi_at_km(20 + index * 0.1, f"环内点{index + 1:03d}", f"B0FFH{index + 1:05d}")
+        for index in range(60)
+    ]
+    group = {"category": CATEGORY_NATURE, "group": "自然风光", "budget": 30,
+             "types": ("110000",), "keywords": None}
+    rows = place_loader.fetch_group_around(SHANGHAI["lat"], SHANGHAI["lng"], 50_000, group)
+    assert len(rows) == 30, "配额抓满即停"
+    assert [call["page"] for call in fake_amap.around_calls] == [1, 2], "30 条只翻 2 页"
+    assert [row["id"] for row in rows] == [f"B0FFH{index + 1:05d}" for index in range(30)]
+
+
+def test_ring_fetch_converges_to_band_and_keeps_group_budget(fake_amap) -> None:
+    """分格 + 本地 haversine 收敛:环外的行不占配额,配额只花在 ``[low, high)`` 内。"""
+    band = next(item for item in DISTANCE_BANDS if item["key"] == "50_100")
+    fake_amap.rows = [
+        poi_at_km(20, "城里公园", "B0FFHPARK0", typecode="110101", type_text="风景名胜;公园;公园"),
+        poi_at_km(60, "远山", "B0FFHMOUNT0"),
+        poi_at_km(75, "云州古镇", "B0FFHTOWN0"),
+        poi_at_km(150, "下一段雪场", "B0FFHSKI00",
+                  typecode="080106", type_text="体育休闲服务;运动场馆;滑雪场"),
+    ]
+    cells = place_loader.ring_cells(SHANGHAI["lat"], SHANGHAI["lng"], band)
+    group = {"category": CATEGORY_NATURE, "group": "自然风光", "budget": 140,
+             "types": ("110000",), "keywords": None}
+    rows = place_loader.fetch_group_polygon(cells, SHANGHAI["lat"], SHANGHAI["lng"], band, group)
+    assert [row["id"] for row in rows] == ["B0FFHMOUNT0", "B0FFHTOWN0"], "环内两条按由近及远"
+    for row in rows:
+        distance = haversine_km(SHANGHAI["lat"], SHANGHAI["lng"], row["lat"], row["lng"])
+        assert 50.0 <= distance < 100.0, f"收敛到 [low, high):{row['name']} {distance}"
+
+    tight = dict(group, budget=1)
+    assert [row["id"] for row in
+            place_loader.fetch_group_polygon(cells, SHANGHAI["lat"], SHANGHAI["lng"], band, tight)] \
+        == ["B0FFHMOUNT0"], "配额 1 条就只留最近的一条"
+    assert place_loader.fetch_group_polygon([], SHANGHAI["lat"], SHANGHAI["lng"], band, group) == []
+    assert place_loader.fetch_group_polygon(
+        cells, SHANGHAI["lat"], SHANGHAI["lng"], band, dict(group, budget=0)
+    ) == [], "配额 0 不检索"
 
 
 # --------------------------------------------------------------------------- #
@@ -560,54 +710,58 @@ def test_to_place_items_dedupes_and_classifies_before_insert() -> None:
     assert all("intro" not in item for item in items), "简介在入库后由 services.intro 补,不在归类阶段生成"
 
 
-def test_loader_fetches_every_band_as_a_ring_difference() -> None:
+def test_loader_pins_amap_groups_and_limits() -> None:
+    """loader 侧的口径常量:分组 = classify 的高德组、200 条上限、水位来源写 amap。"""
     assert place_loader.SEARCH_GROUPS == classify.search_groups()
     assert {group["category"] for group in place_loader.SEARCH_GROUPS} == set(CATEGORY_PRIORITY)
-    assert place_loader.SEARCH_TAGS == classify.search_tags()
-    assert place_loader.GROUP_REQUEST_TIMEOUT > 20, "冷启动批量抓取不受交互 20s 上限约束"
-    assert place_loader.RING_REQUEST_TIMEOUT > place_loader.GROUP_REQUEST_TIMEOUT, "差集更慢,超时放宽一档"
-
-    client = FakeOverpassClient()
-    band = next(item for item in DISTANCE_BANDS if item["low"] > 0)
-    place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
-    assert len(client.calls) == 1, "四分类并集只发一次 Overpass 请求"
-    call = client.calls[0]
-    assert call["radius_m"] == band_radius_m(band), "外圈仍是分段**上限半径**"
-    assert call["inner_radius_m"] == band_inner_radius_m(band) == band["low"] * 1000, "内圈 = 分段下限(配额只花在环内)"
-    assert call["groups"] == classify.search_groups(), "一次查完四分类 tag 并集"
-    assert call["with_id"] is True, "带 OSM 身份才能按 (type, id) 去重"
-    assert call["query_timeout"] == place_loader.RING_QUERY_TIMEOUT
-    assert call["request_timeout"] == place_loader.RING_REQUEST_TIMEOUT
+    assert place_loader.SEARCH_TAGS == classify.search_tags(), \
+        "/api/places/meta 的 search_tags 键仍要有值(遗留 OSM 选择器并集,只作口径展示)"
+    assert place_loader.FULL_SEARCH_BUDGET == 540 and place_loader.PROGRESSIVE_STEP == 30
+    assert place_loader.FETCH_LIMIT == amap.MAX_ROWS_PER_QUERY
+    assert place_loader.SOURCE_AMAP == "amap", "SegmentFetch.source / API source 写 amap(§6.7)"
+    assert not hasattr(place_loader, "SOURCE_OVERPASS"), "Overpass 时代的来源常量应已退役"
 
 
-def test_loader_ring_covers_every_band_with_positive_lower_bound() -> None:
-    """下限 > 0 的分段全部走环形差集(远环稀少 bug 的根因就在这里);0_50 例外(见下一例)。"""
-    client = FakeOverpassClient()
+def test_loader_ring_covers_every_band_with_positive_lower_bound(fake_amap) -> None:
+    """下限 > 0 的分段全部走**包围盒分格**(远环稀少 bug 的根因就在这里);0_50 例外(见下一例)。"""
     for band in DISTANCE_BANDS:
-        place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
-    assert [call["inner_radius_m"] for call in client.calls] == [
-        band_inner_radius_m(band) for band in DISTANCE_BANDS
-    ]
-    assert all(
-        call["inner_radius_m"] > 0
-        for call, band in zip(client.calls, DISTANCE_BANDS)
-        if band["low"] > 0
-    )
-    assert [call["inner_radius_m"] for call, band in zip(client.calls, DISTANCE_BANDS) if band["low"] == 0] == [0.0]
-    assert [call["radius_m"] for call in client.calls] == [band_radius_m(band) for band in DISTANCE_BANDS]
+        fake_amap.around_calls.clear()
+        fake_amap.polygon_calls.clear()
+        place_loader.default_fetcher(
+            SHANGHAI["lat"], SHANGHAI["lng"], band,
+            cell_limit=place_loader.GRID_MAX_SIDE ** 2,
+        )
+        if band["low"] == 0:
+            assert fake_amap.polygon_calls == [] and fake_amap.around_calls, band["key"]
+            continue
+        assert fake_amap.around_calls == [], f"{band['key']} 该走分格多边形"
+        cells = place_loader.ring_cells(SHANGHAI["lat"], SHANGHAI["lng"], band)
+        queried = [call["polygon"] for call in fake_amap.polygon_calls]
+        groups = classify.search_groups()
+        assert len(queried) == len(cells) * len(groups), f"{band['key']} 每格每组都问到"
+        assert queried[:len(cells)] == [list(cell) for cell in cells], "格子顺序 = 由近及远"
+        min_lat, min_lng, max_lat, max_lng = place_loader.band_bbox(
+            SHANGHAI["lat"], SHANGHAI["lng"], band_radius_m(band)
+        )
+        for cell in queried:  # 顶点 7 位小数定点,留 1e-6 容差
+            assert all(min_lng - 1e-6 <= x <= max_lng + 1e-6 for x, _ in cell)
+            assert all(min_lat - 1e-6 <= y <= max_lat + 1e-6 for _, y in cell), \
+                f"{band['key']} 的格子必须落在**上限半径**的包围盒里"
 
 
-def test_loader_degrades_to_single_circle_when_band_low_is_zero() -> None:
-    """下限为 0 的分段没有内圈可减 → 退化成单圆查询与单圆超时(行为同 TASK-1b)。"""
-    client = FakeOverpassClient()
+def test_loader_degrades_to_single_circle_when_band_low_is_zero(fake_amap) -> None:
+    """下限为 0 的分段没有内圈可减 → 退化成每组一次圆形检索(半径 = band 上限)。"""
     band = {"key": "0_50", "label": "0-50 km", "low": 0, "high": 50}
     assert band_inner_radius_m(band) == 0.0
-    place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band, client=client)
-    call = client.calls[0]
-    assert call["inner_radius_m"] == 0.0
-    assert call["radius_m"] == 50_000
-    assert call["query_timeout"] == place_loader.GROUP_QUERY_TIMEOUT
-    assert call["request_timeout"] == place_loader.GROUP_REQUEST_TIMEOUT
+    place_loader.default_fetcher(SHANGHAI["lat"], SHANGHAI["lng"], band)
+    assert fake_amap.polygon_calls == []
+    groups = classify.search_groups()
+    assert len(fake_amap.around_calls) == len(groups)
+    assert all(call["radius_m"] == 50_000 for call in fake_amap.around_calls)
+    assert all(call["page"] == 1 for call in fake_amap.around_calls)
+    assert (fake_amap.around_calls[0]["lat"], fake_amap.around_calls[0]["lng"]) == (
+        SHANGHAI["lat"], SHANGHAI["lng"]
+    )
 
 
 

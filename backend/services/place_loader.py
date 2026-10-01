@@ -5,11 +5,15 @@
 1. 查 ``SegmentFetch`` 水位 —— 有记录说明该 (城市, band) 已入库 →
    直接 :func:`db.repository.list_places` 读库返回,**不发任何网络请求**
    (读库路径也不会调 LLM,保证"二次查询秒出");
-2. 没记录 → 解析起点(Photon 主 + Nominatim 降级)→ 按分段一次查**四分类 tag 并集**
-   (:data:`SEARCH_GROUPS`,每组独立配额,见 :mod:`services.classify`),分段下限 > 0 时
-   用 Overpass **环形差集**(上限圆 - 下限圆)让配额只花在环内 → haversine 复核收敛到环内
-   → 按 OSM ``(type, id)`` **去重** + 优先级**归类**
+2. 没记录 → 解析起点(Photon 主 + Nominatim 降级;TASK-9c 起主链路走高德)→ 按分段
+   **分组打高德 v3 检索**(:data:`SEARCH_GROUPS` = 高德 typecode/keywords 组,每组独立配额,
+   见 :mod:`services.amap_categories`):分段下限 = 0 走 ``place/around`` 单圆;下限 > 0 走
+   「外半径包围盒 :func:`data_sources.amap.grid_polygons` 分格 + 逐格 ``place/polygon``」,
+   再本地 haversine 收敛到环内(高德**单查询只有 200 条**、``radius`` 被截断在 50km)
+   → 按高德 POI id ``("amap", id)`` **去重** + 优先级**归类**
    (滑雪 > 运动 > 人文美食 > 自然,一地只入一类)→ upsert 入库 → 记水位;
+   入库身份:``osm_type="amap"``、``osm_id = crc32(POI id)``(:func:`db.models.amap_osm_id`),
+   原始 id 存 ``tags["amap_id"]`` —— **表结构零改动**,唯一键幂等语义原样保留;
 3. 入库**之后**再补 LLM 一句话简介(:func:`services.intro.fill_missing_intros`):
    DB 即缓存,已有 ``intro`` 的 POI 不再调用;失败降级成空简介,**不阻塞入库**;
 4. ``refresh=True`` 可强制重抓(仍按唯一键 upsert,不会产生重复行,也不覆盖已有简介);
@@ -41,6 +45,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import inspect
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -48,8 +53,9 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from data_sources import DataSourceError
+from data_sources import amap
 from data_sources import geocode as ds_geocode
-from data_sources import overpass
+from data_sources import haversine_km
 from data_sources import reverse as ds_reverse
 from data_sources.nominatim import SOURCE_NAME as NOMINATIM_SOURCE
 from data_sources.photon import SOURCE_NAME as PHOTON_SOURCE
@@ -57,7 +63,16 @@ from data_sources.photon import geocode as ds_photon_geocode
 from data_sources.photon import reverse as ds_photon_reverse
 from db import init_db, make_engine, open_session
 from db import repository as repo
-from db.models import FALLBACK_OSM_TYPE, OSM_ELEMENT_TYPES, UNCATEGORIZED, SegmentFetch
+from db.models import (
+    AMAP_OSM_TYPE,
+    AMAP_SOURCE,
+    FALLBACK_OSM_TYPE,
+    OSM_ELEMENT_TYPES,
+    UNCATEGORIZED,
+    SegmentFetch,
+    amap_osm_id,
+)
+from services import amap_categories
 from services import classify
 from services import intro as intro_service
 from services import seed_data
@@ -66,17 +81,21 @@ from services.bands import (
     band_keys,
     band_radius_m,
     filter_to_band,
+    in_band,
     require_band,
 )
-from services.classify import classify_places
+from services.classify import classify_amap_places
 
-# 四分类检索线索(docs/STAGE1-PLAN.md 第 3 节):按 band 环形差集**一次**查完并集。
-# 分组各带配额,避免 ``sport=*``/餐厅这类高频 tag 把总量刷爆、山峰古镇一条不剩;
-# 同一实体被多组命中时由 classify_places 按 OSM (type, id) 去重后只归一类。
+# 四分类检索线索(TASK-9b 起走**高德** typecode/keywords 组,docs/TASK-9-CONTRACT.md §3):
+# 分组各带配额,避免餐饮这类高频大类把总量刷爆、滑雪场/古镇一条不剩;
+# 同一实体被多组命中时按高德 POI id 去重(:func:`services.classify.classify_amap_places`)后只归一类。
 SEARCH_GROUPS: list[dict[str, Any]] = classify.search_groups()
+# ``/api/places/meta`` 的 ``search_tags`` 键仍要有值(**响应键名零变化**):
+# 这里给的是遗留 OSM 选择器并集,只作口径展示,检索链路已不使用。
 SEARCH_TAGS: list[classify.TagSelector] = classify.search_tags()
 ELEMENT_TYPES = classify.DEFAULT_ELEMENT_TYPES
-FETCH_LIMIT = overpass.MAX_FETCH
+# 高德**单查询**取数上限(实测 page≥9 恒空,8×25=200 条;``radius`` 也被截断在 50km)
+FETCH_LIMIT = amap.MAX_ROWS_PER_QUERY
 # 渐进抓取(TASK-6b,BUG-1 主修复):冷启动一次抓满 :data:`SEARCH_GROUPS` 的合计配额
 # (540)会让首屏等上几分钟,所以首查只抓一小轮 —— 把各组配额**按比例**缩到目标总量
 # (首轮 30),之后每"加载更多"越界一次再抓一轮(30 × 轮数)。缩放后每组至少留
@@ -84,15 +103,24 @@ FETCH_LIMIT = overpass.MAX_FETCH
 FULL_SEARCH_BUDGET: int = classify.search_budget()
 MIN_GROUP_BUDGET = 2
 PROGRESSIVE_STEP = 30
-GROUP_QUERY_TIMEOUT = overpass.DEFAULT_GROUP_QUERY_TIMEOUT
-GROUP_REQUEST_TIMEOUT = overpass.DEFAULT_GROUP_REQUEST_TIMEOUT_S
-# 环形差集要在服务端扫两个圆,比单圆慢一档,超时也放宽一档(仍是批量抓取路径,
-# 交互路径 nearby_places 不受影响)。
-RING_QUERY_TIMEOUT = overpass.DEFAULT_RING_QUERY_TIMEOUT
-RING_REQUEST_TIMEOUT = overpass.DEFAULT_RING_REQUEST_TIMEOUT_S
+# --- 分格抓取(TASK-9b):band 下限 > 0 时高德没有「环形差集」,只能包围盒切格逐格捞 --- #
+# 每格目标边长(km):格子小到「单查询 200 条」装得下,又不至于格数爆炸。
+GRID_CELL_KM = 25.0
+GRID_MIN_SIDE = 2
+GRID_MAX_SIDE = 12
+# 本轮最多抓几格 = GRID_CELLS_PER_ROUND × (fetch_rounds + 1):与 :func:`progressive_target_total`
+# 同口径的**递增扩格** —— 配额没抓满且还有未抓格子时,下一轮「加载更多」自动多抓几格。
+GRID_CELLS_PER_ROUND = 4
+# 环带收敛会把格子里「太近/太远」的行丢掉,所以分格路径比配额多翻一页兜住损耗。
+RING_PAGE_SLACK = 1
+# 经纬度换算(与 :mod:`services.stays` 同口径):1 度纬度 ≈ 111.32 km;高纬度时
+# cos(lat) 太小会让经度包围盒炸开,夹一个下限保证格子数仍收敛。
+METERS_PER_DEGREE = 111_320.0
+MIN_COS_LAT = 0.05
 # 交互式抓取时一次最多补多少条简介(全量回填走 ``python -m services.intro``)
 INTRO_BATCH_LIMIT = 40
-SOURCE_OVERPASS = "overpass"
+# ``SegmentFetch.source`` / API 的 ``source`` 字段:TASK-9b 起抓取来源是 "amap"(§6.7)
+SOURCE_AMAP = "amap"
 SOURCE_DB = "db"
 SOURCE_SEED = "seed"
 FINGERPRINT_HEX_LEN = 12
@@ -377,46 +405,277 @@ def resolve_reverse_origin_with_source(
     return origin, str(geo.get("geocoder") or GEOCODER_NOMINATIM)
 
 
+def band_bbox(lat: float, lng: float, radius_m: float) -> tuple[float, float, float, float]:
+    """外半径的经纬度包围盒 ``(min_lat, min_lng, max_lat, max_lng)``(:func:`amap.grid_polygons` 的入参)。
+
+    经度方向按 ``cos(lat)`` 修正,高纬度夹 :data:`MIN_COS_LAT` 下限(与
+    :func:`services.stays.select_stays` 的包围盒粗筛同口径),免得格子数在极地附近炸开。
+    """
+    latitude = float(lat)
+    longitude = float(lng)
+    radius = max(0.0, float(radius_m))
+    lat_delta = radius / METERS_PER_DEGREE
+    cos_lat = max(MIN_COS_LAT, abs(math.cos(math.radians(latitude))))
+    lng_delta = radius / (METERS_PER_DEGREE * cos_lat)
+    min_lat = max(-89.999, latitude - lat_delta)
+    max_lat = min(89.999, latitude + lat_delta)
+    min_lng = max(-179.999, longitude - lng_delta)
+    max_lng = min(179.999, longitude + lng_delta)
+    if min_lat >= max_lat or min_lng >= max_lng:
+        raise ValueError(
+            f"起点太靠近极点/日期线,无法为半径 {radius:.0f}m 构造包围盒:{latitude},{longitude}"
+        )
+    return min_lat, min_lng, max_lat, max_lng
+
+
+def grid_side(radius_m: float) -> int:
+    """包围盒切几行几列:让每格边长 ≈ :data:`GRID_CELL_KM`,夹在 [:data:`GRID_MIN_SIDE`, :data:`GRID_MAX_SIDE`]。
+
+    格子边长要小到「单查询 200 条」装得下(高德硬上限,见 :data:`amap.MAX_ROWS_PER_QUERY`),
+    又不能格数爆炸(每格每页都是一次 0.6s 节流的请求)—— 远环 POI 稀疏,格子大些无妨。
+    """
+    diameter_km = 2.0 * max(0.0, float(radius_m)) / 1000.0
+    if diameter_km <= 0:
+        return GRID_MIN_SIDE
+    side = math.ceil(diameter_km / GRID_CELL_KM)
+    return max(GRID_MIN_SIDE, min(GRID_MAX_SIDE, int(side)))
+
+
+def cell_distance_range(
+    cell: Sequence[Sequence[float]], lat: float, lng: float
+) -> tuple[float, float]:
+    """一个矩形格到起点的 ``(最近, 最远)`` 大圆距离(km)——用来筛掉整格都不在环内的格子。
+
+    最近点 = 把起点坐标夹进矩形(起点在格内则为 0);最远点必在四个角上。
+    """
+    lngs = [float(point[0]) for point in cell]
+    lats = [float(point[1]) for point in cell]
+    near_lat = min(max(float(lat), min(lats)), max(lats))
+    near_lng = min(max(float(lng), min(lngs)), max(lngs))
+    nearest = haversine_km(float(lat), float(lng), near_lat, near_lng)
+    farthest = max(
+        haversine_km(float(lat), float(lng), corner_lat, corner_lng)
+        for corner_lat in (min(lats), max(lats))
+        for corner_lng in (min(lngs), max(lngs))
+    )
+    return nearest, farthest
+
+
+def ring_cells(
+    lat: float,
+    lng: float,
+    band: Mapping[str, Any],
+    *,
+    side: Optional[int] = None,
+) -> list[list[tuple[float, float]]]:
+    """band(下限 > 0)的**分格计划**:切格 → 只留与环带相交的 → 按最近距离升序。
+
+    高德没有 Overpass 那种「环形差集」查询,只能包围盒切格逐格捞,再本地 haversine 收敛。
+    排序按「格子到起点的最近距离」升序:整格都落在 ``[low, high)`` 之外的直接丢掉
+    (太近 = 上一段的地盘,太远 = 下一段),于是**前几格总是环带里离起点最近的部分**,
+    配合 :func:`grid_cell_limit` 就是「本轮抓几格、下一轮扩几格」的递增扩格。
+    """
+    radius_m = band_radius_m(band)
+    inner_km = band_inner_radius_m(band) / 1000.0
+    outer_km = radius_m / 1000.0
+    rows = max(1, int(side)) if side is not None else grid_side(radius_m)
+    min_lat, min_lng, max_lat, max_lng = band_bbox(lat, lng, radius_m)
+    cells = amap.grid_polygons(min_lat, min_lng, max_lat, max_lng, rows, rows)
+    usable: list[tuple[float, int, list[tuple[float, float]]]] = []
+    for index, cell in enumerate(cells):
+        nearest, farthest = cell_distance_range(cell, lat, lng)
+        if farthest < inner_km or nearest >= outer_km:
+            continue
+        usable.append((nearest, index, cell))
+    usable.sort(key=lambda item: (item[0], item[1]))
+    return [cell for _, _, cell in usable]
+
+
+def grid_cell_limit(fetch_rounds: Optional[int] = None) -> int:
+    """本轮最多抓几格::data:`GRID_CELLS_PER_ROUND` × (已完成轮数 + 1) → 4 / 8 / 12 ...
+
+    与 :func:`progressive_target_total`(``30 × (轮数 + 1)``)同口径的**递增扩格**:
+    上一轮配额没抓满、又还有未抓的格子时,下一轮「加载更多」自动多抓几格。
+    """
+    return GRID_CELLS_PER_ROUND * (max(0, int(fetch_rounds or 0)) + 1)
+
+
+def page_limit(budget: Optional[int], *, slack: int = 0) -> int:
+    """一组配额最多翻几页:``ceil(budget / 25) + slack``,夹在 ``[1, amap.MAX_PAGE]``。
+
+    v3 固定 25 条/页、``page >= 9`` 服务端恒空(:data:`amap.MAX_ROWS_PER_QUERY` = 200),
+    所以既不能硬翻,也别为 8 条配额翻满 8 页。``slack`` 给分格路径用:环带收敛会丢掉
+    「太近/太远」的行,多翻一页兜住这部分损耗。
+    """
+    wanted = max(1, int(budget or 0))
+    pages = math.ceil(wanted / amap.PAGE_SIZE) + max(0, int(slack))
+    return max(1, min(amap.MAX_PAGE, int(pages)))
+
+
+def _paged(
+    search_fn: Callable[..., list[dict[str, Any]]],
+    *,
+    budget: int,
+    page_cap: int,
+    keep: Optional[Callable[[Mapping[str, Any]], bool]] = None,
+) -> list[dict[str, Any]]:
+    """翻页取一组:每页 :data:`amap.PAGE_SIZE` 条,**配额抓满 / 某页没拿满 / 到页数上限**就停。
+
+    ``keep`` 是本地过滤(分格路径用它把环外的行丢掉):被过滤掉的行**不占配额**,
+    否则近处的密集 POI 会把整组配额吃光 —— 这正是 Overpass 时代「远环只剩个位数」的根因。
+    组内按 :func:`services.amap_categories.dedupe_key`(``("amap", POI id)``)去重。
+    """
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for page in range(1, max(1, int(page_cap)) + 1):
+        batch = list(search_fn(page=page, offset=amap.PAGE_SIZE) or [])
+        for poi in batch:
+            if keep is not None and not keep(poi):
+                continue
+            key = amap_categories.dedupe_key(poi)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(dict(poi))
+            if budget and len(rows) >= budget:
+                return rows
+        if len(batch) < amap.PAGE_SIZE:
+            return rows
+    return rows
+
+
+def _group_params(group: Mapping[str, Any]) -> tuple[Optional[list[str]], Optional[str]]:
+    """一组的检索参数 ``(types, keywords)``;§6.3:两者**二选一**,空值一律传 ``None``。"""
+    types = [str(code) for code in (group.get("types") or ()) if str(code).strip()]
+    keywords = str(group.get("keywords") or "").strip()
+    return (types or None), (keywords or None)
+
+
+def fetch_group_around(
+    lat: float,
+    lng: float,
+    radius_m: float,
+    group: Mapping[str, Any],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+) -> list[dict[str, Any]]:
+    """band 下限 = 0:一组一次 ``place/around`` 圆形检索(半径 > 50km 由 amap 内部钳制)。"""
+    budget = max(0, int(group.get("budget") or 0))
+    if not budget:
+        return []
+    types, keywords = _group_params(group)
+    return _paged(
+        lambda **params: amap.search_around(
+            lat, lng, radius_m=radius_m, types=types, keywords=keywords,
+            environ=environ, session=session, **params,
+        ),
+        budget=budget,
+        page_cap=page_limit(budget),
+    )
+
+
+def fetch_group_polygon(
+    cells: Sequence[Sequence[Sequence[float]]],
+    lat: float,
+    lng: float,
+    band: Mapping[str, Any],
+    group: Mapping[str, Any],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+) -> list[dict[str, Any]]:
+    """band 下限 > 0:一组**逐格** ``place/polygon`` + 本地 haversine 收敛到 ``[low, high)``。
+
+    配额是整组共享的:抓满就**停止扩格**(剩下的格子留给下一轮 :data:`SegmentFetch.fetch_rounds`),
+    环外的行不占配额(见 :func:`_paged` 的 ``keep``);相邻格子共用边界,贴着格线的 POI
+    会被两格各返回一次,所以组内**跨格**再按 :func:`amap_categories.dedupe_key` 去一遍重,
+    免得同一条 POI 白占两个配额(:func:`_paged` 只在单格单组内去重)。
+    """
+    budget = max(0, int(group.get("budget") or 0))
+    if not budget or not cells:
+        return []
+    types, keywords = _group_params(group)
+
+    def keep(poi: Mapping[str, Any]) -> bool:
+        distance = haversine_km(lat, lng, float(poi["lat"]), float(poi["lng"]))
+        return in_band(distance, band)
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for cell in cells:
+        remaining = budget - len(rows)
+        if remaining <= 0:
+            break
+        for poi in _paged(
+            lambda cell=cell, **params: amap.search_polygon(
+                cell, types=types, keywords=keywords,
+                environ=environ, session=session, **params,
+            ),
+            budget=remaining,
+            page_cap=page_limit(remaining, slack=RING_PAGE_SLACK),
+            keep=keep,
+        ):
+            key = amap_categories.dedupe_key(poi)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(poi)
+            if len(rows) >= budget:
+                break
+    return rows[:budget]
+
+
 def default_fetcher(
     lat: float,
     lng: float,
     band: Mapping[str, Any],
     *,
-    client: Optional[overpass.OverpassClient] = None,
     groups: Optional[Iterable[Mapping[str, Any]]] = None,
-    query_timeout: Optional[float] = None,
-    request_timeout: Optional[float] = None,
+    fetch_rounds: Optional[int] = None,
+    cell_limit: Optional[int] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
 ) -> list[dict[str, Any]]:
-    """真实抓取:一次查四分类 tag 并集(分组配额 + ``with_id`` 防重),远环用**环形差集**。
+    """真实抓取(TASK-9b 起走**高德 v3**):分组检索 → 合并 → 按 POI id 去重。
 
-    ``low > 0`` 的分段走**环形差集**(上限圆 - 下限圆,TASK-1d):在此之前只按上限半径
-    ``around`` 取数,每组配额都被 0~low 的近处 POI 占满,本地收敛到环内后只剩个位数
-    (实测北京 200-300 只有 1 条、上海 5 条);差集把配额全部花在环内。
-    ``low == 0`` 时 :func:`services.bands.band_inner_radius_m` 给 0,overpass 自动退化成
-    单圆并集查询(一次请求),行为与 TASK-1b 一致。
+    * band 下限 ``== 0``(:data:`services.bands` 的 ``0_50``)→ 每组一次
+      :func:`amap.search_around`(半径 = band 上限;超过 50km 由 amap 钳到 50000);
+    * band 下限 ``> 0`` → 外半径**包围盒** :func:`ring_cells` 切格,逐组逐格
+      :func:`amap.search_polygon`,本地 haversine 收敛到 ``[low, high)``;
+      本轮只抓前 :func:`grid_cell_limit` 格(``fetch_rounds`` 越大抓得越多 = **递增扩格**),
+      配额抓满即停,不再打剩下的格子;
+    * 每组翻页上限 :func:`page_limit`(单查询 200 条硬上限,拿不满不硬翻);
+    * 多组结果合并后按 ``("amap", POI id)`` 去重(同一实体被多组命中只留一行),
+      归类交给 :func:`services.classify.classify_amap_places`(优先级 滑雪>运动>人文美食>自然)。
 
-    环内复核仍由 :func:`services.bands.filter_to_band` 用 haversine 在本地做一次:
-    way/relation 的 ``around`` 命中看的是**几何范围**(有一个节点在圈内就算),
-    按圆心距离复核才与地图上画的环一致。超时缺省按形态解析(环形更宽)。
+    ``groups`` 是 :func:`scale_search_groups` 缩放后的分组(渐进配额);
+    ``environ``/``session`` 透传给 :mod:`data_sources.amap`,测试可注入假 session。
     """
-    overpass_client = client or overpass.default_client()
-    inner_radius_m = band_inner_radius_m(band)
-    ring = inner_radius_m > 0
-    if query_timeout is None:
-        query_timeout = RING_QUERY_TIMEOUT if ring else GROUP_QUERY_TIMEOUT
-    if request_timeout is None:
-        request_timeout = RING_REQUEST_TIMEOUT if ring else GROUP_REQUEST_TIMEOUT
-    return overpass_client.nearby_places_ring(
-        lat,
-        lng,
-        band_radius_m(band),
-        inner_radius_m,
-        list(groups) if groups is not None else SEARCH_GROUPS,
-        require_name=True,
-        query_timeout=query_timeout,
-        request_timeout=request_timeout,
-        with_id=True,
-    )
+    wanted = list(groups) if groups is not None else list(SEARCH_GROUPS)
+    radius_m = band_radius_m(band)
+    if band_inner_radius_m(band) <= 0:
+        batches = [
+            fetch_group_around(lat, lng, radius_m, group, environ=environ, session=session)
+            for group in wanted
+        ]
+    else:
+        cells = ring_cells(lat, lng, band)
+        limit = grid_cell_limit(fetch_rounds) if cell_limit is None else max(0, int(cell_limit))
+        batches = [
+            fetch_group_polygon(cells[:limit], lat, lng, band, group, environ=environ, session=session)
+            for group in wanted
+        ]
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for batch in batches:
+        for poi in batch:
+            key = amap_categories.dedupe_key(poi)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(dict(poi))
+    return merged
 
 
 def scale_search_groups(target_total: Optional[int]) -> Optional[list[dict[str, Any]]]:
@@ -445,20 +704,44 @@ def progressive_target_total(fetch_rounds: Optional[int] = None) -> int:
     return PROGRESSIVE_STEP * (max(0, int(fetch_rounds or 0)) + 1)
 
 
-def _accepts_groups(fetch_fn: FetchFn) -> bool:
-    """抓取实现是否认 ``groups`` 关键字。
+def _accepts_kwarg(fetch_fn: FetchFn, name: str) -> bool:
+    """抓取实现是否认某个关键字参数。
 
-    既有单测的替身是 ``(lat, lng, band)`` 三参签名,不能因为加了配额缩放就报错;
-    真链路 :func:`default_fetcher` 带 ``groups``,缩放后的分组从这里传下去。
+    既有单测的替身是 ``(lat, lng, band)`` 三参签名,不能因为加了配额缩放(``groups``)
+    或递增扩格(``fetch_rounds``)就报错;真链路 :func:`default_fetcher` 两个都认。
     """
     try:
         parameters = list(inspect.signature(fetch_fn).parameters.values())
     except (TypeError, ValueError):  # pragma: no cover - 拿不到签名的内建对象
         return False
     return any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "groups"
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == name
         for parameter in parameters
     )
+
+
+def _accepts_groups(fetch_fn: FetchFn) -> bool:
+    """抓取实现是否认 ``groups`` 关键字(:func:`_accepts_kwarg` 的兼容别名)。"""
+    return _accepts_kwarg(fetch_fn, "groups")
+
+
+def _fetcher_kwargs(
+    fetch_fn: FetchFn, *, groups: Optional[list[dict[str, Any]]], fetch_rounds: int
+) -> dict[str, Any]:
+    """按替身签名挑它**认**的关键字:渐进配额(``groups``)与扩格轮数(``fetch_rounds``)。"""
+    kwargs: dict[str, Any] = {}
+    if groups is not None and _accepts_kwarg(fetch_fn, "groups"):
+        kwargs["groups"] = groups
+    if _accepts_kwarg(fetch_fn, "fetch_rounds"):
+        kwargs["fetch_rounds"] = fetch_rounds
+    return kwargs
+
+
+def stored_fetch_rounds(recorded: Optional[SegmentFetch]) -> int:
+    """水位里已完成的抓取轮数(首抓 / 旧库缺列时按 0)—— 递增扩格与目标配额都靠它推。"""
+    if recorded is None:
+        return 0
+    return int(getattr(recorded, "fetch_rounds", 0) or 0)
 
 
 def place_identity(place: Mapping[str, Any]) -> tuple[str, int]:
@@ -476,16 +759,42 @@ def place_identity(place: Mapping[str, Any]) -> tuple[str, int]:
     return FALLBACK_OSM_TYPE, -int(digest[:FINGERPRINT_HEX_LEN], 16)
 
 
-def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """环内候选 → 入库条目:先按 OSM ``(type, id)`` **去重**,再按优先级**归类**。
+def amap_tags(row: Mapping[str, Any]) -> dict[str, Any]:
+    """高德行的入库 ``tags``:``{"source":"高德","amap_id":…,"typecode":…,"type":…}``。
 
-    去重与归类都由 :func:`services.classify.classify_places` 完成(一地只入一类,
-    合并后的 tags 让优先级判定看到全部线索);这里只补入库身份与字段形状。
+    原始 POI id **必须**留在这里:``osm_id`` 是 crc32 哈希(不可逆),前端身份脚注、
+    排查与「同实体跨 band 认亲」都靠 ``tags["amap_id"]`` 还原原文;``type``/``typecode``
+    是高德的分类原文,给 :mod:`services.intro` / :mod:`services.details` 的 prompt 当事实线索。
+    ``source="高德"`` 让 :func:`db.models.place_source` 派生出「高德」来源标注
+    (存量「种子」/「OSM」行的标注不受影响)。
+    """
+    return {
+        "source": AMAP_SOURCE,
+        "amap_id": classify.amap_poi_id(row),
+        "typecode": str(row.get("typecode") or "").strip(),
+        "type": str(row.get("type") or "").strip(),
+    }
+
+
+def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """环内候选 → 入库条目:先按高德 POI id **去重**,再按优先级**归类**,最后派生入库身份。
+
+    去重与归类由 :func:`services.classify.classify_amap_places` 完成(一地只入一类);
+    身份是 §3 TASK-9b 的硬约束 —— ``Place.osm_id`` 是 Integer 列而高德 POI id 是字符串,
+    所以 ``osm_type="amap"``、``osm_id = crc32(id)``(:func:`db.models.amap_osm_id`),
+    原文进 ``tags["amap_id"]``(**表结构零改动**,唯一键与收藏 ref_key 口径原样保留)。
+    没有高德身份的行(人工种子 / 存量 OSM 形状)退回 :func:`place_identity` 的旧口径。
     ``intro`` 不在此生成 —— 入库后由 :mod:`services.intro` 按 POI 缓存补。
     """
     items: list[dict[str, Any]] = []
-    for row in classify_places(candidates):
-        osm_type, osm_id = place_identity(row)
+    for row in classify_amap_places(candidates):
+        poi_id = classify.amap_poi_id(row)
+        if poi_id:
+            osm_type, osm_id = AMAP_OSM_TYPE, amap_osm_id(poi_id)
+            tags = amap_tags(row)
+        else:
+            osm_type, osm_id = place_identity(row)
+            tags = dict(row.get("tags") or {})
         items.append(
             {
                 "osm_type": osm_type,
@@ -494,7 +803,7 @@ def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, An
                 "lat": row["lat"],
                 "lng": row["lng"],
                 "category": row["category"],
-                "tags": dict(row.get("tags") or {}),
+                "tags": tags,
             }
         )
     return items
@@ -537,7 +846,7 @@ def ensure_seeded(
     """给某个 (起点, band) 幂等补种:只写库里还没有的种子,返回**新增**条数。
 
     纯本地操作(不触网、不调 LLM),所以已入库的分段二次查询时也能顺手补种,
-    存量库不必重抓 Overpass。去重口径与 :func:`services.seed_data.attach_seeds` 一致:
+    存量库不必重抓高德。去重口径与 :func:`services.seed_data.attach_seeds` 一致:
     库里已有同名(相等或互相包含)且距离 ≤ 2 km 的行,就认为已覆盖、不再补。
     """
     seed_rows = list(seeds) if seeds is not None else seed_data.load_seeds()
@@ -564,7 +873,7 @@ def ensure_seeded(
 def record_seed_segment(
     session: Session, *, city: str, band: Mapping[str, Any], origin: Mapping[str, Any]
 ) -> SegmentFetch:
-    """给"只有种子、还没抓过 Overpass"的分段建一条水位(``source="seed"``)。"""
+    """给"只有种子、还没抓过高德"的分段建一条水位(``source="seed"``)。"""
     return repo.record_segment(
         session,
         origin_city=city,
@@ -600,15 +909,16 @@ def load_segment(
 
     ``seeds`` 留空就用 :func:`services.seed_data.load_seeds`(受 ``WHERE2GO_SEEDS``
     开关控制);传 ``[]`` 可显式关掉本次的种子合并。抓取与读库两条路径都合并种子,
-    所以已入库的分段也能拿到种子,不必重抓 Overpass。
+    所以已入库的分段也能拿到种子,不必重抓高德。
 
     ``target_total``(TASK-6b 渐进抓取)只在**真的要抓**时生效:给定了就把
     :data:`SEARCH_GROUPS` 各组配额按比例缩到总量 ≈ ``target_total``
-    (见 :func:`scale_search_groups`),仍然只发**一次** Overpass 请求;留空 = 用满
-    配额(540)的旧口径。归类/去重/环内收敛/upsert 口径完全不变,所以扩抓轮
-    重复命中同一实体也不会产生重复行、不会覆盖已有 ``intro``。
-    每完成一轮抓取,:attr:`db.models.SegmentFetch.fetch_rounds` +1
-    (:func:`db.repository.bump_fetch_rounds`),下一轮的目标总量由它推出来。
+    (见 :func:`scale_search_groups`);留空 = 用满配额(540)的旧口径。
+    归类/去重/环内收敛/upsert 口径完全不变,所以扩抓轮重复命中同一实体也不会
+    产生重复行、不会覆盖已有 ``intro``。每完成一轮抓取,
+    :attr:`db.models.SegmentFetch.fetch_rounds` +1(:func:`db.repository.bump_fetch_rounds`),
+    下一轮的**目标总量**(``30 × (轮数+1)``)与**抓几格**(:func:`grid_cell_limit`,
+    递增扩格)都由它推出来;``refresh=True`` 时沿用库内轮数,不会把扩格进度归零。
 
     失败语义:分段/城市非法抛 :class:`ValueError`;数据源不可用抛
     :class:`data_sources.DataSourceError`(由 API 层翻成中文 HTTP 错误)。
@@ -623,7 +933,7 @@ def load_segment(
     recorded = repo.get_segment(session, origin_city=city_clean, band=band_def["key"])
     if recorded is not None and not refresh:
         origin = stored_origin(recorded)
-        # 读库路径也补种:纯本地、幂等(第二次必然补 0 条),存量库不必重抓 Overpass
+        # 读库路径也补种:纯本地、幂等(第二次必然补 0 条),存量库不必重抓高德
         seeded = ensure_seeded(session, origin=origin, band=band_def, seeds=seed_rows)
         if seeded:
             recorded.place_count = int(recorded.place_count or 0) + seeded
@@ -641,10 +951,15 @@ def load_segment(
 
     origin = _reuse_origin(session, city_clean, recorded=recorded, lat=lat, lng=lng, geocoder=geocoder)
     groups = scale_search_groups(target_total)
-    if groups is not None and _accepts_groups(fetch_fn):
-        payload = fetch_fn(origin["lat"], origin["lng"], band_def, groups=groups)
-    else:
-        payload = fetch_fn(origin["lat"], origin["lng"], band_def)
+    # 扩格轮数跟着水位走:这一轮的分组配额与「抓几格」都由它推出来(递增扩格)
+    payload = fetch_fn(
+        origin["lat"],
+        origin["lng"],
+        band_def,
+        **_fetcher_kwargs(
+            fetch_fn, groups=groups, fetch_rounds=stored_fetch_rounds(recorded)
+        ),
+    )
     candidates = filter_to_band(payload or [], origin["lat"], origin["lng"], band_def)
     fresh_seeds = _fresh_seeds(candidates, seed_rows, origin, band_def)
     seeded_items = to_seed_items(fresh_seeds)
@@ -667,7 +982,7 @@ def load_segment(
             if target_total is not None
             else len(candidates) + len(seeded_items)
         ),
-        source=SOURCE_OVERPASS,
+        source=SOURCE_AMAP,
     )
     repo.bump_fetch_rounds(session, record)
     session.commit()
@@ -686,7 +1001,7 @@ def load_segment(
         origin=origin,
         band=band_def,
         category=category,
-        source=SOURCE_OVERPASS,
+        source=SOURCE_AMAP,
         network_used=True,
         segment=repo.segment_to_dict(record),
         written=written,
@@ -811,7 +1126,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(
         f"[完成] {outcome.origin['name']} · {outcome.band['label']} · "
-        f"{len(outcome.places)} 条 · 来源={'数据库' if outcome.source == SOURCE_DB else 'Overpass 实时抓取'} · "
+        f"{len(outcome.places)} 条 · 来源={'数据库' if outcome.source == SOURCE_DB else '高德实时抓取'} · "
         f"本次写入 {outcome.written} 条"
     )
     print(f"[分类] {' · '.join(f'{name} {total}' for name, total in sorted(outcome.counts_by_category.items()))}")

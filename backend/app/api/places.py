@@ -3,8 +3,9 @@
 与 POC 的 `/api/discover`、`/api/categories` 并存,五条路由:
 
 * ``GET /api/places?origin=&band=&category=`` —— 返回该 (城市, band) 内**已入库**的目的地
-  (``category`` 为四分类优先级归类的结果,一地只属一类);未入库时按需抓一次 Overpass
-  四分类 tag 并集落库,之后同一 (城市, band) 直接读 SQLite、不触网。
+  (``category`` 为四分类优先级归类的结果,一地只属一类);未入库时按需抓一次**高德**
+  四分类检索落库(TASK-9b:``place/around`` / 包围盒分格 ``place/polygon``),
+  之后同一 (城市, band) 直接读 SQLite、不触网。**响应键名与形状零变化**。
   可选 ``lat``/``lng``(前端已地理编码过就带上,省一次 Nominatim)、``refresh=true``(强制重抓)
   与 ``intros=false``(抓取后不调 LLM 补简介)。
   渐进抓取(TASK-6b):可选 ``page_size``(默认 15,1~100)/``offset``(默认 0,≥0)/
@@ -64,7 +65,8 @@ router = APIRouter()
 PLACES_NOTE = (
     "已入库的 (城市, band) 直接读 SQLite、不再触网;distance_km 为距起点的大圆直线距离"
     "(环形分段,不含城区)。分类为四分类优先级归类(滑雪 > 运动 > 人文美食 > 自然),"
-    "按 OSM (type, id) 去重,一地只属一类;intro 为 LLM 一句话简介,按 POI 缓存。"
+    "按高德 POI id 去重(osm_type=amap、osm_id 为其 crc32、原文在 tags.amap_id),"
+    "一地只属一类;intro 为 LLM 一句话简介,按 POI 缓存。"
 )
 # 渐进抓取(TASK-6b,BUG-1 主修复)的分页口径:只在**带了分页参数**时追加到 note,
 # 不带 page_size/offset/more 的老调用连 note 文案都保持原样。
@@ -95,7 +97,8 @@ ORIGIN_CACHE_GEOCODERS = frozenset(
     {place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
 )
 META_NOTE = (
-    "分段:环形互斥,检索按 band 上限半径一次查四分类 tag 并集(每组独立配额);"
+    "分段:环形互斥,检索按 band 分组打高德 v3(下限 0 走 place/around 单圆,下限 > 0 走"
+    "包围盒分格 place/polygon + 本地环带收敛;每组独立配额,selectors = 该组的 typecode 数 + 关键词组数);"
     "分类:四分类优先级归类的可选值(color/emoji 供前端 pin 使用);"
     "简介:LLM 生成后缓存在 Place.intro,已有简介不再调用,失败降级为空。"
 )
@@ -245,9 +248,11 @@ def places_meta() -> dict[str, Any]:
         "categories": [dict(item) for item in CATEGORIES],
         "category_priority": list(CATEGORY_PRIORITY),
         "search_tags": place_loader.SEARCH_TAGS,
+        # ``selectors`` 的语义随检索侧换成高德而变(键名不变):该组的 typecode 个数
+        # + 关键词组数(小城古镇走 keywords,types 为空)。
         "search_groups": [
             {"group": group["group"], "category": group["category"], "budget": group["budget"],
-             "selectors": len(group["tags"])}
+             "selectors": len(group.get("types") or []) + (1 if group.get("keywords") else 0)}
             for group in search_groups()
         ],
         "search_budget": search_budget(),

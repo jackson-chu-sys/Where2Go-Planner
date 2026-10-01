@@ -16,12 +16,13 @@
 
 价格是 **AI 估算**,不是报价:每行带 ``estimated`` 标注,顶层 ``note`` 写明参考价口径
 (架构文档"AI 幻觉"对策:事实字段绑结构化来源,估算字段必须自带标注)。
-本模块自己不触网,触网的是服务层(Overpass 检索 + LLM 估价),测试里可整体替换。
+本模块自己不触网,触网的是服务层(**高德** ``place/around`` 检索 + LLM 估价,TASK-9b),
+测试里可整体替换。**响应键名与形状零变化**(``source`` 的值随数据源改成 ``amap``)。
 
 TASK-6c 的三件透传(**只在空结果/降级/后台估价中/阶梯扩档时出现**,正常结果的顶层形状
 保持原样,前端老代码零改动):
 
-* ``reason`` —— 三档空态:``no_data``(真的没有)/ ``datasource_error``(Overpass 报错,
+* ``reason`` —— 三档空态:``no_data``(真的没有)/ ``datasource_error``(高德报错,
   可重试)/ ``timeout``(超时,稍后再试);正常结果为 ``null``。
 * ``nearest_km`` —— 最近一家的直线距离(km,1 位);空结果时是**库里已知**的最近一家,
   给"最近的在 X km 外"文案用。
@@ -65,14 +66,15 @@ ITEM_KEYS: tuple[str, ...] = (
     "distance_km", "price_estimate", "price_kind", "currency", "intro",
 )
 STAYS_NOTE = (
-    "价格与简介是 AI 依据名称/住宿类型/星级等 OSM 标签给出的**参考价估算**"
+    "价格与简介是 AI 依据名称/住宿类型/星级等标签给出的**参考价估算**"
     "(形如 约¥A-B/晚,人民币、一晚),不是实时报价,下单前请以携程/Booking/Agoda 等 OTA 实时价格为准;"
     "估不出来的行 price_estimate 为 null(不编数字)。"
     "price_kind 标明价格出处:rule = 命中品牌/星级/类型规则表(离线算的,不花 token),"
     "llm = AI 估的,null = 还没估出来;两者都是估算口径。"
     "distance_km 是距起点的大圆直线距离,不是步行/驾车里程。"
     "DB 即缓存:该坐标半径内已入库就直接读库(source=db,零次网络与 LLM),"
-    "否则现场检索 Overpass 并入库估价(source=overpass);"
+    "否则现场检索高德 place/around(types=100000 住宿服务大类)并入库估价(source=amap,"
+    "osm_type=amap、osm_id 为高德 POI id 的 crc32、原文在 tags.amap_id);"
     "refresh=true 强制重抓,但已有价格的行不会再调 LLM(不重复花 token)。"
 )
 # 空结果/降级时追加的口径说明(TASK-6c):三档 reason 怎么读、nearest_km 是什么、
@@ -80,7 +82,7 @@ STAYS_NOTE = (
 STAYS_DEGRADED_NOTE = (
     "本次为空结果或降级返回,附带 reason/nearest_km/estimating 三个判别字段:"
     "reason=no_data 表示该半径内确实没有住宿(nearest_km 是库里已知的最近一家距离,单位 km,"
-    "为 null 表示阶梯最大档内也没有);reason=datasource_error 表示 Overpass 检索报错,可重试;"
+    "为 null 表示阶梯最大档内也没有);reason=datasource_error 表示高德检索报错,可重试;"
     "reason=timeout 表示检索超时,请稍后再试。"
     "空结果与失败都会写负缓存,6 小时内同坐标同半径直接回缓存态、不再重复触网。"
     "estimating=true 表示价格正在后台批量回填(每批 5 家一次 LLM 调用,不阻塞本请求),"
@@ -229,7 +231,7 @@ def list_stays(
         refresh=force_refresh,
     )
     items = [_item(row) for row in rows]
-    # 空结果没有可归属的行,按 db 口径报(既没抓到也没读到,不谎报 overpass)
+    # 空结果没有可归属的行,按 db 口径报(既没抓到也没读到,不谎报 amap)
     source = str(rows[0].get("source") or stay_service.SOURCE_DB) if rows else stay_service.SOURCE_DB
     reason = getattr(rows, "reason", None)
     nearest_km = getattr(rows, "nearest_km", None)

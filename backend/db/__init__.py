@@ -6,7 +6,7 @@
   ``Stay`` / ``TripPlan`` 表定义;
 * :mod:`db.base` —— 引擎、会话工厂、建表与 FastAPI 依赖;
 * :mod:`db.repository` —— 读写封装(upsert 防重、按 (城市, band, 分类) 查询,
-  并按分类/来源(OSM / 种子)计数;收藏的幂等 upsert、按类型过滤与分组维护)。
+  并按分类/来源(高德 / OSM / 种子)计数;收藏的幂等 upsert、按类型过滤与分组维护)。
 
 用法::
 
@@ -33,6 +33,8 @@ from .base import (
     set_engine,
 )
 from .models import (
+    AMAP_OSM_TYPE,
+    AMAP_SOURCE,
     CAT_AUTO,
     CAT_MANUAL,
     COLLECTION_CAT_SOURCES,
@@ -52,6 +54,7 @@ from .models import (
     SegmentFetch,
     Stay,
     TripPlan,
+    amap_osm_id,
     clean_text,
     collection_kind,
     collection_ref_key,
@@ -101,6 +104,8 @@ __all__ = [
     "SOURCE_TAG",
     "SEED_SOURCE",
     "OSM_SOURCE",
+    "AMAP_OSM_TYPE",
+    "AMAP_SOURCE",
     "KIND_ROUTE",
     "KIND_PLACE",
     "COLLECTION_KINDS",
@@ -111,6 +116,7 @@ __all__ = [
     "DEFAULT_CURRENCY",
     "is_seed",
     "place_source",
+    "amap_osm_id",
     "clean_text",
     "collection_kind",
     "collection_ref_key",

@@ -3,10 +3,12 @@
 全程不触网、不调真 LLM:
 
 * ``no_network`` 把 :meth:`requests.Session.request` 换成直接抛错,任何偷偷联网当场失败;
-* Overpass 用假客户端(只实现 ``execute``),LLM 用假 client(只实现 ``enabled``/``chat``);
+* 高德检索用假 ``fetch_fn``(签名 ``(lat, lng, radius_m) -> 归一化 POI``),
+  LLM 用假 client(只实现 ``enabled``/``chat``);
 * DB 用 ``tmp_path`` 下的临时 SQLite,不碰 ``backend/data/``。
 
-重点覆盖**幂等与降级**:唯一键 ``(osm_type, osm_id)`` 让重抓不产生第二行,LLM 产物
+重点覆盖**幂等与降级**:唯一键 ``(osm_type, osm_id)``(TASK-9b 起是 ``("amap", crc32(POI id))``)
+让重抓不产生第二行,LLM 产物
 (``price_estimate``/``intro``)一旦生成就**不被重抓覆盖**;未配 key / 超时 / 限流 /
 输出格式不对一律降级成空串,绝不抛异常。
 
@@ -28,15 +30,18 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
-from data_sources import DataSourceError  # noqa: E402
+from data_sources import DataSourceError, TransientDataSourceError, amap  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db.models import (  # noqa: E402
+    AMAP_OSM_TYPE,
+    AMAP_SOURCE,
     COORD_PRECISION,
     DEFAULT_CURRENCY,
     KIND_LEN,
     NAME_LEN,
     PRICE_LEN,
     Stay,
+    amap_osm_id,
     iso_utc,
 )
 from services import stays as stay_service  # noqa: E402
@@ -59,65 +64,101 @@ REQUIRED_DICT_KEYS = {
 }
 
 
-def node(osm_id: int, lat: float, lng: float, tags: dict[str, Any]) -> dict[str, Any]:
-    """一个 Overpass node element。"""
-    return {"type": "node", "id": osm_id, "lat": lat, "lon": lng, "tags": dict(tags)}
+#: 高德返回的中文 ``type`` → 本地 kind(:func:`services.stays.amap_stay_kind` 的关键词口径)。
+#: 只用 ``types=100000`` 大类粗筛,细分 kind 在本地按 type 字符串判(禁编造中类码)。
+STAY_TYPE_TEXTS: dict[str, str] = {
+    "hotel": "住宿服务;宾馆酒店;星级酒店",
+    "hostel": "住宿服务;宾馆酒店;青年旅舍",
+    "guest_house": "住宿服务;宾馆酒店;民宿",
+    "apartment": "住宿服务;公寓式酒店;公寓",
+    "chalet": "住宿服务;宾馆酒店;度假村",
+}
 
 
-def way(osm_id: int, lat: float, lng: float, tags: dict[str, Any]) -> dict[str, Any]:
-    """一个 way element:坐标只在 ``center`` 里(:func:`overpass.parse_element` 会取)。"""
-    return {"type": "way", "id": osm_id, "center": {"lat": lat, "lon": lng}, "tags": dict(tags)}
+def poi(
+    id_text: str,
+    name: str,
+    lat: float,
+    lng: float,
+    *,
+    kind: str = "hotel",
+    type_text: Optional[str] = None,
+    typecode: str = "100000",
+    cityname: str = "",
+) -> dict[str, Any]:
+    """一条**归一化高德 POI**(:func:`data_sources.amap.parse_poi` 的输出形状)。
+
+    ``typecode`` 一律用 §1.4 实测过的住宿大类 ``100000``(细分 kind 靠 type 中文串);
+    ``cityname`` 默认留空,免得城市线级系数(上海 ×1.2)改动既有的规则价断言 ——
+    带城市线索的价带另有专门用例覆盖。
+    """
+    return {
+        "id": id_text,
+        "name": name,
+        "lat": lat,
+        "lng": lng,
+        "type": STAY_TYPE_TEXTS[kind] if type_text is None else type_text,
+        "typecode": typecode,
+        "address": "",
+        "cityname": cityname,
+        "adname": "",
+        "distance_m": None,
+    }
 
 
-SAMPLE_ELEMENTS: list[dict[str, Any]] = [
-    node(1, 31.2400, 121.4900, {"tourism": "hotel", "name": "外滩华尔道夫酒店", "stars": "5"}),
-    node(2, 31.2350, 121.4800, {"tourism": "hostel", "name": "老船长青旅"}),
-    way(3, 31.2600, 121.5000, {"tourism": "guest_house", "name": "衡山路小筑"}),
-    node(4, 31.2200, 121.4600, {"tourism": "apartment"}),
+# 高德**已按由近及远排序**返回,服务层不再重排 → 样本顺序即预期顺序。
+SAMPLE_POIS: list[dict[str, Any]] = [
+    poi("B0FFH0BOAT", "老船长青旅", 31.2350, 121.4800, kind="hostel"),
+    poi("B0FFH0APT0", "", 31.2200, 121.4600, kind="apartment"),
+    poi("B0FFH0WALD", "外滩华尔道夫酒店", 31.2400, 121.4900),
+    poi("B0FFH0HOME", "衡山路小筑", 31.2600, 121.5000, kind="guest_house"),
 ]
+SAMPLE_IDS = [item["id"] for item in SAMPLE_POIS]
 # 由近及远的预期顺序(见各用例断言)
 SAMPLE_ORDER = ["老船长青旅", "", "外滩华尔道夫酒店", "衡山路小筑"]
 
 
-def sample_payload() -> dict[str, Any]:
-    return {"elements": [dict(item) for item in SAMPLE_ELEMENTS]}
+def sample_pois() -> list[dict[str, Any]]:
+    return [dict(item) for item in SAMPLE_POIS]
 
 
 def row(**overrides: Any) -> dict[str, Any]:
     """一条 upsert 入参(:func:`stays.search_stays` 的输出形状)。"""
     body: dict[str, Any] = {
-        "osm_type": "node",
-        "osm_id": 11,
+        "osm_type": AMAP_OSM_TYPE,
+        "osm_id": amap_osm_id("B0FFH0DEMO"),
         "name": "示例酒店",
         "kind": "hotel",
         "lat": 31.2400,
         "lng": 121.4900,
-        "tags": {"tourism": "hotel"},
+        "tags": {"source": AMAP_SOURCE, "amap_id": "B0FFH0DEMO", "type": STAY_TYPE_TEXTS["hotel"]},
         "distance_km": 1.234,
     }
     body.update(overrides)
     return body
 
 
-class FakeOverpass:
-    """假 Overpass 客户端:记录查询与调用次数,可注入响应或异常。"""
+class FakeAmapFetch:
+    """高德检索替身:签名 = :data:`services.stays.StayFetchFn`(``(lat, lng, radius_m) -> POI 列表``)。
 
-    def __init__(self, payload: Optional[Any] = None, *, error: Optional[BaseException] = None):
-        self.payload = {"elements": []} if payload is None else payload
+    记录每次调用的坐标与半径(验半径阶梯/显式半径),``error`` 让所有请求抛错(验降级)。
+    """
+
+    def __init__(self, pois: Optional[list[dict[str, Any]]] = None,
+                 *, error: Optional[BaseException] = None):
+        self.pois = [] if pois is None else list(pois)
         self.error = error
-        self.queries: list[str] = []
-        self.timeouts: list[Optional[float]] = []
-        self.calls = 0
+        self.calls: list[tuple[float, float, float]] = []
 
-    def execute(
-        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
-    ) -> Any:
-        self.calls += 1
-        self.queries.append(query)
-        self.timeouts.append(timeout)
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    def __call__(self, lat: float, lng: float, radius_m: Any = None) -> list[dict[str, Any]]:
+        self.calls.append((lat, lng, radius_m))
         if self.error is not None:
             raise self.error
-        return self.payload
+        return [dict(item) for item in self.pois]
 
 
 class FakeLLM:
@@ -230,92 +271,150 @@ def test_unique_key_blocks_raw_duplicates_but_allows_other_osm_types(session) ->
 
 
 # --------------------------------------------------------------------------- #
-# 检索:Overpass QL 与解析
+# 检索:高德 place/around 参数、翻页与归一化
 # --------------------------------------------------------------------------- #
 
 
-def test_build_stay_query_is_single_group_union_without_name_filter() -> None:
-    query = stay_service.build_stay_query(ORIGIN_LAT, ORIGIN_LNG, 8000)
-    assert query.count("out center") == 1
-    assert "(around:8000," in query.replace(" ", "") or "around:8000" in query
-    for tag in stay_service.STAY_TAGS:
-        assert f'["tourism"="{tag}"]' in query
-    # 民宿/公寓常没有 name tag:服务端不得再加 ["name"] 过滤
-    assert '["name"]' not in query
-    assert len(stay_service.stay_groups()) == 1
+def test_fetch_stay_pois_uses_amap_around_with_lodging_typecode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """检索参数口径:``place/around`` + ``types=100000``(住宿**大类**粗筛)、v3 25 条/页。"""
+    calls: list[dict[str, Any]] = []
+
+    def fake_search(lat: Any, lng: Any, *, radius_m: Any = None, types: Any = None,
+                    keywords: Any = None, page: int = 1, offset: Any = None,
+                    environ: Any = None, session: Any = None) -> list[dict[str, Any]]:
+        calls.append({"lat": lat, "lng": lng, "radius_m": radius_m, "types": types,
+                      "keywords": keywords, "page": page, "offset": offset})
+        return []
+
+    monkeypatch.setattr(amap, "search_around", fake_search)
+    assert stay_service.fetch_stay_pois(ORIGIN_LAT, ORIGIN_LNG, 8000) == []
+    assert calls == [{"lat": ORIGIN_LAT, "lng": ORIGIN_LNG, "radius_m": 8000,
+                      "types": stay_service.STAY_TYPES, "keywords": None,
+                      "page": 1, "offset": amap.PAGE_SIZE}], "第一页就空 → 不再翻页"
+    assert stay_service.STAY_TYPES == "100000", "§1.4 实测锚点:住宿服务大类(不编造中类码)"
+    assert stay_service.SOURCE_FETCH == "amap", "§6.7:Stay.source / API source 写 amap"
+    assert stay_service.GROUP_BUDGET == amap.MAX_ROWS_PER_QUERY == 200
+    assert stay_service.stay_page_limit() == amap.MAX_PAGE == 8, "单查询 200 条硬上限"
+    assert stay_service.stay_page_limit(30) == 2 and stay_service.stay_page_limit(0) == 1
+    assert stay_service.STAY_REQUEST_TIMEOUT_S == 30.0, "交互路径的客户端超时口径不变"
+
+
+def test_fetch_stay_pois_pages_until_budget_or_short_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """翻页:配额抓满即停;某页没拿满也停(``page>=9`` 服务端恒空,硬翻只是白烧配额)。"""
+    rows = [
+        poi(f"B0FFH{index:05d}", f"测试酒店{index}", ORIGIN_LAT + index * 0.001, ORIGIN_LNG)
+        for index in range(60)
+    ]
+    pages: list[int] = []
+
+    def fake_search(lat: Any, lng: Any, *, radius_m: Any = None, types: Any = None,
+                    keywords: Any = None, page: int = 1, offset: Any = None,
+                    environ: Any = None, session: Any = None) -> list[dict[str, Any]]:
+        pages.append(page)
+        start = (page - 1) * int(offset)
+        return [dict(row) for row in rows[start:start + int(offset)]]
+
+    monkeypatch.setattr(amap, "search_around", fake_search)
+    assert len(stay_service.fetch_stay_pois(ORIGIN_LAT, ORIGIN_LNG, 8000)) == 60
+    assert pages == [1, 2, 3], "25 + 25 + 10:最后一页没拿满就停"
+
+    pages.clear()
+    capped = stay_service.fetch_stay_pois(ORIGIN_LAT, ORIGIN_LNG, 8000, budget=30)
+    assert len(capped) == 30 and pages == [1, 2], "配额抓满即停"
+    assert [row["id"] for row in capped] == [row["id"] for row in rows[:30]]
 
 
 def test_stay_tags_are_the_five_tourism_values() -> None:
     assert stay_service.STAY_TAGS == ("hotel", "guest_house", "hostel", "apartment", "chalet")
 
 
-def test_search_stays_parses_elements_sorted_by_distance() -> None:
-    client = FakeOverpass(sample_payload())
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, client=client)
-    assert client.calls == 1
-    assert [item["name"] for item in rows] == SAMPLE_ORDER
-    assert [item["osm_id"] for item in rows] == [2, 4, 1, 3]
+def test_search_stays_normalizes_amap_pois_by_distance() -> None:
+    fake = FakeAmapFetch(sample_pois())
+    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, 8000, fetch_fn=fake)
+    assert fake.calls == [(ORIGIN_LAT, ORIGIN_LNG, 8000)], "半径原样交给检索层"
+    assert [item["name"] for item in rows] == SAMPLE_ORDER, "高德已由近及远返回,服务层不再重排"
+    assert [item["tags"]["amap_id"] for item in rows] == SAMPLE_IDS
     distances = [item["distance_km"] for item in rows]
     assert distances == sorted(distances)
     assert all(round(value, 2) == value for value in distances)
+    assert distances[0] == pytest.approx(0.79, abs=0.02)
 
 
-def test_search_stays_keeps_osm_identity_and_tags() -> None:
-    client = FakeOverpass(sample_payload())
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, client=client)
+def test_search_stays_uses_default_radius_when_omitted() -> None:
+    fake = FakeAmapFetch(sample_pois())
+    stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, fetch_fn=fake)
+    assert fake.calls[-1][2] == stay_service.DEFAULT_RADIUS_M == 8000
+
+
+def test_search_stays_keeps_amap_identity_and_tags() -> None:
+    rows = stay_service.search_stays(
+        ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois())
+    )
     first = rows[0]
-    assert first["osm_type"] == "node" and first["osm_id"] == 2
-    assert first["tags"]["tourism"] == "hostel"
-    assert first["kind"] == "hostel"
+    assert (first["osm_type"], first["osm_id"]) == (AMAP_OSM_TYPE, amap_osm_id("B0FFH0BOAT")), \
+        "入库身份 = osm_type『amap』 + osm_id『crc32(POI id)』(表结构零改动)"
+    assert first["tags"]["amap_id"] == "B0FFH0BOAT", "crc32 不可逆 → 原文必须留在 tags"
+    assert first["tags"]["source"] == AMAP_SOURCE == "高德"
+    assert first["tags"]["type"] == STAY_TYPE_TEXTS["hostel"]
+    assert first["tags"]["typecode"] == "100000"
+    assert first["kind"] == "hostel", "kind 由中文 type 归一到既有五个值(不是中类码)"
     assert first["lat"] == 31.2350 and first["lng"] == 121.4800
-    # way 的坐标来自 center
-    guest_house = [item for item in rows if item["osm_id"] == 3][0]
-    assert guest_house["osm_type"] == "way"
+    guest_house = [item for item in rows if item["tags"]["amap_id"] == "B0FFH0HOME"][0]
+    assert guest_house["kind"] == "guest_house"
     assert guest_house["lat"] == 31.2600 and guest_house["lng"] == 121.5000
 
 
 def test_search_stays_keeps_unnamed_stays() -> None:
-    client = FakeOverpass(sample_payload())
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, client=client)
-    apartment = [item for item in rows if item["osm_id"] == 4][0]
-    assert apartment["name"] == ""
+    rows = stay_service.search_stays(
+        ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois())
+    )
+    apartment = [item for item in rows if item["tags"]["amap_id"] == "B0FFH0APT0"][0]
+    assert apartment["name"] == "", "没有名称的行照收(规则层与 LLM 都不会替它猜价)"
     assert apartment["kind"] == "apartment"
+    assert "name" not in apartment["tags"], "空名称不写进 tags"
 
 
-def test_search_stays_dedupes_by_osm_identity() -> None:
-    payload = {"elements": [dict(SAMPLE_ELEMENTS[0]), dict(SAMPLE_ELEMENTS[0])]}
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(payload))
-    assert len(rows) == 1
-
-
-def test_search_stays_uses_client_timeout_for_interactive_path() -> None:
-    client = FakeOverpass(sample_payload())
-    stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, client=client)
-    assert client.timeouts == [stay_service.STAY_REQUEST_TIMEOUT_S]
+def test_search_stays_dedupes_by_amap_id() -> None:
+    doubled = [dict(SAMPLE_POIS[0]), dict(SAMPLE_POIS[0])]
+    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(doubled))
+    assert len(rows) == 1, "同一条 POI 只留一行(去重键 = 高德 POI id)"
 
 
 @pytest.mark.parametrize(
-    "payload",
-    [{"nope": 1}, "不是对象", None, {"elements": "不是列表"}],
+    "pois",
+    [[], [None], ["不是对象"], [{"name": "缺 id"}],
+     [{"id": "  ", "name": "空 id", "lat": 31.2, "lng": 121.4}]],
 )
-def test_search_stays_degrades_to_empty_on_bad_payload(payload: Any) -> None:
-    rows = stay_service.search_stays(ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(payload))
-    assert rows == []
+def test_search_stays_degrades_to_empty_on_bad_rows(pois: Any) -> None:
+    """脏行(没有 POI id / 根本不是对象)一律降级成空列表,绝不抛给调用方。"""
+    assert stay_service.search_stays(
+        ORIGIN_LAT, ORIGIN_LNG, fetch_fn=lambda *args: list(pois)
+    ) == []
 
 
 def test_search_stays_degrades_to_empty_on_any_error() -> None:
-    for error in (DataSourceError("overpass", "端点全挂"), RuntimeError("boom")):
+    errors = (
+        DataSourceError("amap", "未配置 WHERE2GO_AMAP_KEY(高德 Web 服务 key)"),
+        TransientDataSourceError("amap", "请求超时(>30s):https://restapi.amap.com/v3/place/around"),
+        DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=10021"),
+        RuntimeError("boom"),
+    )
+    for error in errors:
         rows = stay_service.search_stays(
-            ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(error=error)
+            ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(error=error)
         )
-        assert rows == []
+        assert rows == [], f"检索失败必须降级成空列表:{error}"
 
 
 @pytest.mark.parametrize("lat,lng", [(999.0, 121.4737), (31.2304, 999.0), (None, 121.4737)])
-def test_search_stays_rejects_bad_origin_without_calling_client(lat: Any, lng: Any) -> None:
-    client = FakeOverpass(sample_payload())
-    assert stay_service.search_stays(lat, lng, client=client) == []
-    assert client.calls == 0
+def test_search_stays_rejects_bad_origin_without_calling_fetch_fn(lat: Any, lng: Any) -> None:
+    fake = FakeAmapFetch(sample_pois())
+    assert stay_service.search_stays(lat, lng, fetch_fn=fake) == []
+    assert fake.calls == [], "起点非法就不该触网"
 
 
 def test_stay_kind_normalizes_tourism_values() -> None:
@@ -336,13 +435,17 @@ def test_normalize_kind_prefers_explicit_value_and_truncates() -> None:
 
 
 def test_stay_identity_rejects_incomplete_or_zero_id() -> None:
-    assert stay_service.stay_identity(row()) == ("node", 11)
-    assert stay_service.stay_identity(row(osm_id="12")) == ("node", 12)
-    assert stay_service.stay_identity(row(osm_type="WAY")) == ("way", 11)
+    assert stay_service.stay_identity(row()) == (AMAP_OSM_TYPE, amap_osm_id("B0FFH0DEMO"))
+    assert stay_service.stay_identity(row(osm_id="12")) == (AMAP_OSM_TYPE, 12)
+    assert stay_service.stay_identity(row(osm_type="AMAP")) == (
+        AMAP_OSM_TYPE, amap_osm_id("B0FFH0DEMO")
+    )
     assert stay_service.stay_identity(row(osm_id=None)) is None
     assert stay_service.stay_identity(row(osm_id=0)) is None
     assert stay_service.stay_identity(row(osm_id="abc")) is None
     assert stay_service.stay_identity(row(osm_type="")) is None
+    # 存量 OSM 行(清库脚本跑之前)的身份口径不变
+    assert stay_service.stay_identity({"osm_type": "node", "osm_id": 11}) == ("node", 11)
 
 
 def test_coordinate_pins_seven_decimals() -> None:
@@ -489,7 +592,9 @@ def test_upsert_stays_inserts_rows_with_defaults(session) -> None:
     assert written == 1
     stay = all_stays(session)[0]
     assert stay.name == "示例酒店" and stay.kind == "hotel"
-    assert stay.tags == {"tourism": "hotel"}
+    assert stay.tags == {
+        "source": AMAP_SOURCE, "amap_id": "B0FFH0DEMO", "type": STAY_TYPE_TEXTS["hotel"],
+    }
     assert stay.currency == DEFAULT_CURRENCY
     assert stay.distance_km == 1.23
     assert stay.price_estimate is None and stay.intro is None
@@ -655,15 +760,15 @@ def test_stay_to_dict_shape_and_estimate_flag(session) -> None:
 
 
 def test_load_or_fetch_stays_fetches_upserts_and_estimates(session) -> None:
-    client = FakeOverpass(sample_payload())
+    client = FakeAmapFetch(sample_pois())
     llm = FakeLLM()
     items = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=client, llm=llm
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client, llm=llm
     )
-    assert client.calls == 1
+    assert client.call_count == 1
     assert len(items) == 4 == len(all_stays(session))
     assert [item["name"] for item in items] == SAMPLE_ORDER
-    assert all(item["source"] == "overpass" for item in items)
+    assert all(item["source"] == stay_service.SOURCE_FETCH for item in items)
     # TASK-6g:三行有名称的住宿全部命中规则表(青旅/华尔道夫/民宿)→ **0 次 LLM 调用**
     assert llm.calls == 0
     assert items[0]["price_estimate"] == "约¥50-150/晚", "hostel 类型档(床位价)"
@@ -680,14 +785,14 @@ def test_load_or_fetch_stays_fetches_upserts_and_estimates(session) -> None:
 
 def test_load_or_fetch_stays_cache_hit_is_offline_and_llm_free(session) -> None:
     first = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(sample_payload()), llm=FakeLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois()), llm=FakeLLM()
     )
-    cached_client = FakeOverpass(sample_payload())
+    cached_client = FakeAmapFetch(sample_pois())
     cached_llm = FakeLLM()
     second = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=cached_client, llm=cached_llm
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=cached_client, llm=cached_llm
     )
-    assert cached_client.calls == 0
+    assert cached_client.call_count == 0
     assert cached_llm.calls == 0
     assert [item["id"] for item in second] == [item["id"] for item in first]
     assert all(item["source"] == "db" for item in second)
@@ -696,44 +801,44 @@ def test_load_or_fetch_stays_cache_hit_is_offline_and_llm_free(session) -> None:
 
 def test_load_or_fetch_stays_refresh_refetches_without_re_estimating(session) -> None:
     stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(sample_payload()), llm=FakeLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois()), llm=FakeLLM()
     )
-    client = FakeOverpass(sample_payload())
+    client = FakeAmapFetch(sample_pois())
     llm = FakeLLM()
     items = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, refresh=True, client=client, llm=llm
+        session, ORIGIN_LAT, ORIGIN_LNG, refresh=True, fetch_fn=client, llm=llm
     )
-    assert client.calls == 1
+    assert client.call_count == 1
     assert llm.calls == 0  # 已有价格的行永不再调 LLM
     assert len(items) == 4 == len(all_stays(session))
-    assert all(item["source"] == "overpass" for item in items)
+    assert all(item["source"] == stay_service.SOURCE_FETCH for item in items)
 
 
 def test_load_or_fetch_stays_refresh_keeps_db_rows_when_fetch_fails(session) -> None:
     stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(sample_payload()), llm=FakeLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois()), llm=FakeLLM()
     )
-    broken = FakeOverpass(error=DataSourceError("overpass", "端点全挂"))
+    broken = FakeAmapFetch(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
     items = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, refresh=True, client=broken, llm=FakeLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, refresh=True, fetch_fn=broken, llm=FakeLLM()
     )
-    assert broken.calls == 1
+    assert broken.call_count == 1
     assert len(items) == 4
     assert all(item["source"] == "db" for item in items)
 
 
 def test_load_or_fetch_stays_degrades_to_empty(session) -> None:
-    broken = FakeOverpass(error=DataSourceError("overpass", "端点全挂"))
-    assert stay_service.load_or_fetch_stays(session, ORIGIN_LAT, ORIGIN_LNG, client=broken) == []
-    assert stay_service.load_or_fetch_stays(session, 999.0, 0.0, client=broken) == []
-    assert broken.calls == 1
+    broken = FakeAmapFetch(error=DataSourceError("amap", "周边检索失败:高德返回 status=0 · infocode=40000"))
+    assert stay_service.load_or_fetch_stays(session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=broken) == []
+    assert stay_service.load_or_fetch_stays(session, 999.0, 0.0, fetch_fn=broken) == []
+    assert broken.call_count == 1
     assert all_stays(session) == []
 
 
 def test_load_or_fetch_stays_survives_missing_llm_key(session) -> None:
-    client = FakeOverpass(sample_payload())
+    client = FakeAmapFetch(sample_pois())
     items = stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=client, llm=FakeLLM(enabled=False)
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=client, llm=FakeLLM(enabled=False)
     )
     assert len(items) == 4
     assert [item["name"] for item in items] == SAMPLE_ORDER
@@ -750,13 +855,13 @@ def test_load_or_fetch_stays_survives_missing_llm_key(session) -> None:
 
 def test_load_or_fetch_stays_estimates_only_new_rows_on_second_origin(session) -> None:
     stay_service.load_or_fetch_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, client=FakeOverpass(sample_payload()), llm=FakeLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, fetch_fn=FakeAmapFetch(sample_pois()), llm=FakeLLM()
     )
     # 换个起点(半径盖住同一批住宿),但强制重抓:老行不再调 LLM
-    client = FakeOverpass(sample_payload())
+    client = FakeAmapFetch(sample_pois())
     llm = FakeLLM()
     items = stay_service.load_or_fetch_stays(
-        session, 31.2400, 121.4800, refresh=True, client=client, llm=llm
+        session, 31.2400, 121.4800, refresh=True, fetch_fn=client, llm=llm
     )
     assert llm.calls == 0
     assert len(items) == 4

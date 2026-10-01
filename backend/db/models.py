@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import zlib
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -59,6 +60,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 OSM_ELEMENT_TYPES: tuple[str, ...] = ("node", "way", "relation")
 FALLBACK_OSM_TYPE = "point"
 UNCATEGORIZED = "其他"
+# 高德切源(TASK-9b):POI 身份写在既有 ``osm_type``/``osm_id`` 两列里 —— ``osm_type`` 固定
+# ``"amap"``,``osm_id`` 是**高德 POI id 的 crc32**(列是 Integer,而高德 id 是 ``B023B17WWK``
+# 这样的字符串,见 :func:`amap_osm_id`);原始 id 存 ``tags["amap_id"]``,表结构零改动。
+AMAP_OSM_TYPE = "amap"
 NAME_LEN = 255
 CITY_LEN = 120
 COORD_PRECISION = 7
@@ -67,6 +72,24 @@ COORD_PRECISION = 7
 SOURCE_TAG = "source"
 SEED_SOURCE = "种子"
 OSM_SOURCE = "OSM"
+# TASK-9b 起抓取行的 ``tags["source"]`` 写「高德」(:func:`place_source` 据此派生来源标注);
+# 存量行的「种子」/「OSM」标注与优先级都不受影响。
+AMAP_SOURCE = "高德"
+
+
+def amap_osm_id(poi_id: Any) -> int:
+    """高德 POI id(字符串)→ ``Place.osm_id`` / ``Stay.osm_id`` 的**无符号 32 位整数身份**。
+
+    两张表的 ``osm_id`` 都是 ``Integer`` 列,而高德 id 是 ``B023B17WWK`` 这样的字符串
+    → 用 :func:`zlib.crc32` 哈希成确定性整数(``& 0xFFFFFFFF`` 保证非负、可重入):
+    同一个 POI 每次抓取都算出同一个 id,唯一键 ``(osm_type, osm_id, origin_city)`` 的
+    幂等语义因此原样保留,**表结构零改动**。原文另存 ``tags["amap_id"]``
+    (前端身份脚注与收藏引用都靠它自洽)。空 id 抛 :class:`ValueError`(调用方应跳过该行)。
+    """
+    text = str(poi_id if poi_id is not None else "").strip()
+    if not text:
+        raise ValueError("高德 POI id 不能为空(无法派生入库身份)")
+    return zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF
 
 
 class Base(DeclarativeBase):
@@ -88,13 +111,18 @@ def iso_utc(value: Optional[datetime]) -> Optional[str]:
 
 
 def place_source(tags: Optional[Mapping[str, Any]]) -> str:
-    """从 ``tags`` 派生来源标注:``种子`` 或 ``OSM``。
+    """从 ``tags`` 派生来源标注:``种子`` / ``高德`` / ``OSM``。
 
     OSM 抓取来的行没有 ``source`` 键,或写的是 ``survey`` 之类的原始 tag 值,
     一律按 :data:`OSM_SOURCE` 处理 —— 存量库不改一行数据也能正确标注。
+    TASK-9b 起新抓的行写 ``tags["source"]="高德"``(:data:`AMAP_SOURCE`)。
     """
     value = str(dict(tags or {}).get(SOURCE_TAG) or "").strip()
-    return SEED_SOURCE if value == SEED_SOURCE else OSM_SOURCE
+    if value == SEED_SOURCE:
+        return SEED_SOURCE
+    if value == AMAP_SOURCE:
+        return AMAP_SOURCE
+    return OSM_SOURCE
 
 
 def is_seed(tags: Optional[Mapping[str, Any]]) -> bool:
@@ -174,7 +202,9 @@ CAT_MANUAL = "manual"
 CAT_AUTO = "auto"
 COLLECTION_CAT_SOURCES: tuple[str, ...] = (CAT_MANUAL, CAT_AUTO)
 # 收藏引用可以指向种子/无名 POI 的指纹身份(point/-1234,见 services.place_loader.place_identity)
-OSM_REF_TYPES: tuple[str, ...] = OSM_ELEMENT_TYPES + (FALLBACK_OSM_TYPE,)
+# TASK-9b:高德行的身份是 ``amap/<crc32>``,前端把 /api/places 的 osm_type 原样带回收藏,
+# 所以白名单必须收 ``amap`` —— ref_key 口径(``place:<type>/<id>``)与唯一键都不变。
+OSM_REF_TYPES: tuple[str, ...] = OSM_ELEMENT_TYPES + (FALLBACK_OSM_TYPE, AMAP_OSM_TYPE)
 
 REF_KEY_LEN = 200
 CAT_NAME_LEN = 60

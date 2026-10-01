@@ -6,7 +6,7 @@
 * ``llm_key_absent`` 清掉所有 LLM key 环境变量(要 key 的用例自己 ``monkeypatch.setenv``);
 * LLM 用两种假客户端 —— :class:`CountingLLM`(记调用次数、按 prompt 里的家数回规范输出)
   与 :class:`ExplodingLLM`(被调用就记一笔并报错,用来证明**规则命中路径 0 LLM 调用**);
-* Overpass 用假客户端,DB 用 ``tmp_path`` 下的临时 SQLite。
+* 高德检索用假 fetch_fn(``services.stays.fetch_stay_pois`` 被 monkeypatch),DB 用 ``tmp_path`` 下的临时 SQLite。
 
 覆盖:品牌表规模与中英文别名(大小写不敏感、包含匹配、最长别名优先)、星级档
 (``四星``/``5*``/``hotel:stars`` 变体)、类型兜底档、城市线级三档系数(一线 ×1.2 /
@@ -34,7 +34,7 @@ if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
 from app.api import stays as stays_api  # noqa: E402
-from data_sources import overpass as overpass_module  # noqa: E402
+from data_sources import haversine_km  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db.base import COLUMN_MIGRATIONS  # noqa: E402
 from db.models import (  # noqa: E402
@@ -82,13 +82,36 @@ LEGACY_STAYS_DDL = (
 )
 
 
+#: 高德中文 ``type`` → 本地 kind(与 services.stays.AMAP_KIND_HINTS 口径一致)
+KIND_TYPE_TEXTS: dict[str, str] = {
+    "hotel": "住宿服务;宾馆酒店;星级酒店",
+    "hostel": "住宿服务;宾馆酒店;青年旅舍",
+    "guest_house": "住宿服务;宾馆酒店;民宿",
+    "apartment": "住宿服务;公寓式酒店;公寓",
+}
+
+
 def element(osm_id: int, name: str, tourism: str = "hotel", **tags: Any) -> dict[str, Any]:
-    """起点附近的一家住宿(Overpass node element 形状)。"""
-    body: dict[str, Any] = {"tourism": tourism}
-    if name:
-        body["name"] = name
-    body.update(tags)
-    return {"type": "node", "id": osm_id, "lat": ORIGIN_LAT + 0.004, "lon": ORIGIN_LNG, "tags": body}
+    """起点附近的一家住宿(**归一化高德 POI** 形状,TASK-9b 后检索替身的返回值)。
+
+    ``tourism`` 形参名保留(既有用例都按它给住宿类型),值换成高德中文 ``type`` 文本;
+    额外 ``**tags`` 里的 ``type`` 可覆盖(测星级等线索)。
+    """
+    lat = ORIGIN_LAT + 0.004
+    poi: dict[str, Any] = {
+        "id": f"B0FFH{osm_id:05d}",
+        "name": name,
+        "lat": lat,
+        "lng": ORIGIN_LNG,
+        "type": KIND_TYPE_TEXTS.get(tourism, tourism),
+        "typecode": stay_service.STAY_TYPES,
+        "address": "",
+        "cityname": "",
+        "adname": "",
+        "distance_m": int(haversine_km(ORIGIN_LAT, ORIGIN_LNG, lat, ORIGIN_LNG) * 1000),
+    }
+    poi.update(tags)
+    return poi
 
 
 def row(osm_id: int = 1, name: str = "示例酒店", kind: str = "hotel", **overrides: Any) -> dict[str, Any]:
@@ -108,19 +131,26 @@ def row(osm_id: int = 1, name: str = "示例酒店", kind: str = "hotel", **over
 
 
 class FakeOverpass:
-    """假 Overpass:固定回一批元素,并记下调用次数。"""
+    """假高德检索(:data:`services.stays.StayFetchFn` 签名):固定回一批 POI,记调用与半径。
+
+    类名保留 ``FakeOverpass`` 只为最小化既有断言改动;行为已是 TASK-9b 的高德替身。
+    """
 
     def __init__(self, elements: Optional[list[dict[str, Any]]] = None):
         self.elements = list(elements or [])
-        self.queries: list[str] = []
+        self.radii: list[Optional[int]] = []
         self.calls = 0
 
-    def execute(
-        self, query: str, *, timeout: Optional[float] = None, reject_runtime_errors: bool = False
-    ) -> Any:
+    def __call__(self, lat: float, lng: float, radius_m: Any = None, **kwargs: Any) -> list[dict[str, Any]]:
         self.calls += 1
-        self.queries.append(query)
-        return {"elements": [dict(item) for item in self.elements]}
+        self.radii.append(None if radius_m is None else int(radius_m))
+        rows = []
+        for item in self.elements:
+            km = haversine_km(lat, lng, float(item["lat"]), float(item["lng"]))
+            if radius_m is None or km * 1000 <= float(radius_m):
+                rows.append(dict(item))
+        rows.sort(key=lambda row: haversine_km(lat, lng, float(row["lat"]), float(row["lng"])))
+        return rows
 
 
 class CountingLLM:
@@ -545,7 +575,7 @@ def test_load_stays_rule_only_rows_skip_llm_and_backfill(session: Session) -> No
     recorder = RecordingExecutor()
     result = stay_service.load_stays(
         session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000,
-        client=client, llm=llm, executor=recorder,
+        fetch_fn=client, llm=llm, executor=recorder,
     )
     assert client.calls == 1 and len(result.items) == 7
     assert llm.calls == 0, "规则命中路径 0 LLM 调用"
@@ -557,7 +587,7 @@ def test_load_stays_rule_only_rows_skip_llm_and_backfill(session: Session) -> No
     # 第二次请求:命中 DB 正缓存(0 网络、0 LLM),价格原样返回
     offline = FakeOverpass([])
     again = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=offline, llm=ExplodingLLM()
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=offline, llm=ExplodingLLM()
     )
     assert offline.calls == 0 and again.from_cache is True and again.estimating is False
     assert [item["price_estimate"] for item in again.items] == [
@@ -573,21 +603,21 @@ def test_load_stays_mixed_rows_send_only_misses_to_llm(session: Session) -> None
             element(2, "亚朵酒店"),
             element(3, "老船长青旅", tourism="hostel"),
             element(4, "希尔顿酒店"),
-            element(5, "湖畔客栈"),
+            element(5, "湖畔商务酒店"),
             element(6, "某某宾馆"),
         ]
     )
     llm = CountingLLM()
     result = stay_service.load_stays(
-        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, client=client, llm=llm
+        session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000, fetch_fn=client, llm=llm
     )
     assert llm.calls == 2, "6 家里只有 2 家规则未命中"
     assert result.estimating is False
     by_name = {item["name"]: item for item in result.items}
     assert by_name["汉庭酒店"]["price_kind"] == PRICE_KIND_RULE
     assert by_name["希尔顿酒店"]["price_estimate"] == "约¥600-1200/晚"
-    assert by_name["湖畔客栈"]["price_kind"] == PRICE_KIND_LLM
-    assert by_name["湖畔客栈"]["intro"], "LLM 那一路照旧给简介"
+    assert by_name["湖畔商务酒店"]["price_kind"] == PRICE_KIND_LLM
+    assert by_name["湖畔商务酒店"]["intro"], "LLM 那一路照旧给简介"
 
 
 def test_price_fill_job_fills_rules_without_llm_key(session: Session) -> None:
@@ -739,7 +769,7 @@ def test_cached_rule_price_survives_rule_table_change(
 
     result = stay_service.load_stays(
         session, ORIGIN_LAT, ORIGIN_LNG, radius_m=5000,
-        client=FakeOverpass([]), llm=ExplodingLLM(),
+        fetch_fn=FakeOverpass([]), llm=ExplodingLLM(),
     )
     assert result.from_cache is True
     assert result.items[0]["price_estimate"] == before, "缓存命中不重算"
@@ -772,7 +802,7 @@ def test_api_items_expose_price_kind(session: Session, monkeypatch: pytest.Monke
     """API 白名单透出 ``price_kind``(``rule``/``llm``/null),note 里写明口径。"""
     assert "price_kind" in stays_api.ITEM_KEYS
     client = FakeOverpass([element(1, "汉庭酒店"), element(2, "某某宾馆")])
-    monkeypatch.setattr(overpass_module, "default_client", lambda: client)
+    monkeypatch.setattr(stay_service, "fetch_stay_pois", client)
     llm = CountingLLM()
     monkeypatch.setattr(stay_service, "default_llm_client", lambda: llm)
 
@@ -798,7 +828,7 @@ def test_api_without_llm_key_still_returns_rule_prices(
 ) -> None:
     """没配 key:规则层照旧出价(0 token),未命中的行留 null —— 接口照常 200。"""
     client = FakeOverpass([element(1, "汉庭酒店"), element(2, "某某宾馆")])
-    monkeypatch.setattr(overpass_module, "default_client", lambda: client)
+    monkeypatch.setattr(stay_service, "fetch_stay_pois", client)
 
     body = stays_api.list_stays(
         session=session, lat=str(ORIGIN_LAT), lng=str(ORIGIN_LNG), radius_km="8"

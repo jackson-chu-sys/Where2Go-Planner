@@ -642,19 +642,25 @@
 ## [TASK-9b] POI/住宿检索链切高德:入库身份改 amap + 分格多边形 + 渐进口径不变 + 清库脚本
 - 依赖: TASK-9a(amap.py 与 amap_categories 已建)
 
-- 状态: running
+- 状态: done
 - 目标: `services/classify.py` 检索组换 `AMAP_TYPE_GROUPS`(优先级/去重/预算语义保留);`services/place_loader.py` 的 `default_fetcher` 换高德:`low==0` → `search_around(radius=high)`,`low>0` → 包围盒 `grid_polygons` 分格 + `search_polygon` + 本地 haversine 收敛 `[low,high)`,扩格随 `fetch_rounds` 递增(口径同 `progressive_target_total`);入库 `osm_type="amap"`/`osm_id=<高德 id>`(表结构零改动)、`tags.source="高德"`、`place_source()` 加「高德」分支;`stays.py::search_stays` 换 `search_around(types="100000")`(半径阶梯/负缓存/估价口径全不变);新增 `tools/amap_cutover.py`(默认 --dry-run 报数,--apply 清派生行,**保留 Collection/CollectionCat/TripPlan**)。
 - 只读清单: `backend/services/place_loader.py`、`backend/services/classify.py`、`backend/services/stays.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§3「TASK-9b」逐字执行)。
 - 涉及: backend/services/(classify.py、place_loader.py、stays.py、amap_categories 已建)、backend/db/repository.py(place_source)、backend/app/api/(仅在不得已时改动,**响应键名必须零变化**)、tools/amap_cutover.py(新)、backend/test_places*.py/test_stays*.py/test_classify.py(改替身为 amap + 新增 ≥30 用例)
 - 验收: pytest 零回归 + ≥30 新增;**`/api/places`、`/api/places/meta`、`/api/places/intros`、`/api/stays` 响应键名/形状逐键断言零变化**(前端零改动的证据);同 (城市,band) 二次查询读库零网络;`page_size/offset/more` 行为与旧口径一致;清库脚本 `--dry-run`/`--apply` 各有用例且不删用户数据。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-01 夜班,Codex 第1轮写实现(40min 止损被 kill,产物完整)+Codex 第2轮改测试(再触止损)+执行器手写收口最后 17 例,commit `31c3ab9`)。
+  - 检索链:classify.py 检索组换 AMAP_TYPE_GROUPS(优先级/去重/budget 语义保留);place_loader.py 的 default_fetcher 换高德——low==0 → search_around(radius=high),low>0 → 包围盒 grid_polygons 分格 + search_polygon + 本地 haversine 收敛 [low,high),扩格随 fetch_rounds 递增;SegmentFetch.source="amap";水位语义不变(二次查询读库零网络);渐进口径(PROGRESSIVE_STEP/page_size/offset/more)不变。
+  - 入库身份:`db/models.py` 加 `amap_osm_id()`(zlib.crc32 & 0xFFFFFFFF)与 AMAP_OSM_TYPE/AMAP_SOURCE 常量(**列结构零改动**);osm_type="amap"、原始 id 存 tags.amap_id、tags.source="高德";repository.place_source() 加「高德」分支(存量「种子/OSM」标注不受影响)。
+  - 住宿:stays.py::search_stays/fetch_stay_pois 换 amap.search_around(types="100000"),Stay 身份同 crc32 口径;半径阶梯/负缓存三档/批量 LLM 估价/price_kind 规则表全不变;SOURCE_FETCH="amap"。
+  - 清库脚本:tools/amap_cutover.py(默认 --dry-run 报数、--apply 单事务清 9 张派生表、保留 collections/collection_cats/trip_plans、缺表自动跳过、apply 幂等)。
+  - 测试:替身全面改 amap(test_places/classify/progressive/stays 系列),新增 37 例(Codex 31 + 执行器补 test_amap_cutover.py 6);/api/places 与 /api/stays 顶层形状逐键断言保留(LEGACY_TOP_LEVEL_KEYS)。执行器复跑 pytest backend/ = **998 passed**(987 基线零回归 + 11 净增,40s)。index.html 未动、photon/nominatim 未动、overpass/osrm 未删(留 9c)。
+  - **Codex 256K 统计**:第1轮(实现)40.7min 触止损被 kill,产物完整(function_calls 106、首写 8.6min R8 线内、tokens 11.2M total 含 cache);第2轮(测试适配)40min 再触止损被 kill(119 calls、tokens 14.6M total)——**R10 二次熔断触发,剩余 17 例由执行器手写收口**(~35min:stays_api/rule_price/v2 三文件替身适配+6 例清库脚本用例)。教训同 6c/6d/6g:实现+测试同晚一体量必贴线,9b 这种「8 个测试文件替身重写」应在契约里明示分两次调用。
 
 ---
 
 ## [TASK-9c] 地理编码切高德主链路 + 驾车切高德 + 物理删除 overpass.py/osrm.py
 - 依赖: TASK-9a(amap.geocode/driving);与 TASK-9b 无强耦合,可并行/续做
 
-- 状态: pending
+- 状态: running
 - 目标: `resolve_origin_with_source` 主链路改 `amap.geocode`(`geocoder="amap"`),失败/无 key 回落 photon→nominatim(保留不删),`/api/geocode` 响应键与 `resolved` 语义不变;`OriginCache` **保留复用**(geocoder 存 amap,TTL 7 天不变;TASK-7a 的 Overpass 并行部分随 overpass.py 移除);`services/routes.py` 驾车改 `amap.driving`(真实 distance/duration,`kind="real"` 不变;**过路费 = `toll_distance_m` × 区域费率**,`cost_breakdown.mode="amap_toll_distance"`;油费/铁路/飞机估算/600km 阈值/机票公布价/人均/deep-link 全不变);geometry 用解码 polyline(抽稀口径不变);**物理删除(`git rm`)`data_sources/overpass.py`、`data_sources/osrm.py` 及其在测试中的直接引用**(神朱 10/01 二次确认:不保留休眠文件)。
 - 只读清单: `backend/services/place_loader.py`、`backend/services/routes.py`、`backend/app/api/routes.py`、`backend/db/repository.py`、`docs/TASK-9-CONTRACT.md`(§1.5/§1.6 + §3「TASK-9c」逐字执行)。
 - 涉及: backend/services/(place_loader.py、routes.py)、backend/app/api/(geocode/routes 透出)、backend/data_sources/(删 overpass.py、osrm.py)、backend/test_routes*.py/test_photon.py/test_data_sources.py(引用改 amap 替身 + 新增 ≥20 用例)

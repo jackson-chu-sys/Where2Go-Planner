@@ -36,7 +36,7 @@ SNIPPET_LEN: int = 240
 #   * Photon(TASK-6a 新增,地理编码主路径):**直连 1.1s 正常**,走代理 5s 挂
 #     —— 产品环境没有 mihomo 代理,所以 Photon 必须 off;Nominatim 只作降级
 # 所以"一刀切走代理/一刀切不走代理"都不对。这里按**数据源**决定代理口径,可用
-# ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:OVERPASS / OSRM / NOMINATIM / LLM):
+# ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:OVERPASS / OSRM / NOMINATIM / AMAP / LLM):
 #   * ``off``  → 强制直连(忽略环境变量里的全局代理)
 #   * ``env``  → 沿用环境变量(HTTP_PROXY/HTTPS_PROXY/NO_PROXY,requests 默认行为)
 #   * 其他值   → 当作该数据源专用代理 URL(如 ``http://192.168.1.210:7892``)
@@ -48,6 +48,7 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "osrm": PROXY_OFF,       # 直连更快(0.7s vs 2.7s),且目标站点不受限
     "nominatim": PROXY_ENV,  # 实测直连不通,必须走代理
     "photon": PROXY_OFF,     # 实测直连 1.1s、走代理 5s 挂(产品环境无代理)
+    "amap": PROXY_OFF,       # 高德 REST 国内直连(2026-10-01 实测),TASK-9a 起的主数据源
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
 }
 
@@ -96,7 +97,7 @@ def build_session(user_agent: str = USER_AGENT, *, source: Optional[str] = None)
     """创建带统一 User-Agent 与 JSON Accept 头的 :class:`requests.Session`。
 
     ``source`` 给定时按 :func:`apply_proxy_policy` 应用该数据源的代理口径
-    (``overpass`` / ``osrm`` / ``nominatim`` / ``photon`` / ``llm``);不传 = 维持 requests 默认
+    (``overpass`` / ``osrm`` / ``nominatim`` / ``photon`` / ``amap`` / ``llm``);不传 = 维持 requests 默认
     (读环境变量代理),现有调用与单测行为不变。
     """
     session = requests.Session()

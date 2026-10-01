@@ -632,6 +632,7 @@
 ---
 
 ## [TASK-9b] POI/住宿检索链切高德:入库身份改 amap + 分格多边形 + 渐进口径不变 + 清库脚本
+- 依赖: TASK-9a(amap.py 与 amap_categories 已建)
 
 - 状态: pending
 - 目标: `services/classify.py` 检索组换 `AMAP_TYPE_GROUPS`(优先级/去重/预算语义保留);`services/place_loader.py` 的 `default_fetcher` 换高德:`low==0` → `search_around(radius=high)`,`low>0` → 包围盒 `grid_polygons` 分格 + `search_polygon` + 本地 haversine 收敛 `[low,high)`,扩格随 `fetch_rounds` 递增(口径同 `progressive_target_total`);入库 `osm_type="amap"`/`osm_id=<高德 id>`(表结构零改动)、`tags.source="高德"`、`place_source()` 加「高德」分支;`stays.py::search_stays` 换 `search_around(types="100000")`(半径阶梯/负缓存/估价口径全不变);新增 `tools/amap_cutover.py`(默认 --dry-run 报数,--apply 清派生行,**保留 Collection/CollectionCat/TripPlan**)。
@@ -643,6 +644,7 @@
 ---
 
 ## [TASK-9c] 地理编码切高德主链路 + 驾车切高德 + 删 overpass.py/osrm.py
+- 依赖: TASK-9a(amap.geocode/driving);与 TASK-9b 无强耦合,可并行/续做
 
 - 状态: pending
 - 目标: `resolve_origin_with_source` 主链路改 `amap.geocode`(`geocoder="amap"`),失败/无 key 回落 photon→nominatim(保留不删),`/api/geocode` 响应键与 `resolved` 语义不变;`OriginCache` **保留复用**(geocoder 存 amap,TTL 7 天不变;TASK-7a 的 Overpass 并行部分随 overpass.py 移除);`services/routes.py` 驾车改 `amap.driving`(真实 distance/duration,`kind="real"` 不变;**过路费 = `toll_distance_m` × 区域费率**,`cost_breakdown.mode="amap_toll_distance"`;油费/铁路/飞机估算/600km 阈值/机票公布价/人均/deep-link 全不变);geometry 用解码 polyline(抽稀口径不变);删除 `data_sources/overpass.py`、`data_sources/osrm.py` 及其直接引用。
@@ -654,6 +656,7 @@
 ---
 
 ## [TASK-9d] 前端地图切高德 JS API 2.0:Leaflet 退役 + /api/map-config 运行时注入 JS key(与本晚 9c 连做)
+- 依赖: TASK-9b + TASK-9c(后端接口就绪;本项目前端零改动的约束由 9b 保证)
 
 - 状态: pending
 - 目标: `index.html` 移除 Leaflet(CDN+OSM 瓦片)改高德 JS API 2.0;新增后端 `GET /api/map-config` 返回 `{"amap_js_key","amap_security_js_code"}`(取自 env,**不进 git**),前端运行时取 key 后动态注入 `<script>`、无 key 给明确降级文案;环圈→`AMap.Circle`(外实内虚)、pin→`AMap.Marker`(保留分类色/emoji 自绘)、点 pin→`AMap.InfoWindow` 承载现有 `popupHtml()`(含收藏/路线/「📄 查看详情」按钮,为 TASK-8b 铺路)、路线→`AMap.Polyline`(驾车实线/铁路虚线/飞机 `arcPoints` 弧线)、`fitView` 用环圈 bounds;`identityHtml()` 改「来源:高德 · POI <id> · GCJ-02」,种子行加 WGS-84 偏差提示;状态栏数据源文案改高德口径。

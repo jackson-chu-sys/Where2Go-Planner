@@ -705,6 +705,42 @@
 
 ---
 
+## [TASK-10a] AI 行程规划后端服务:多轮对话编排 + PlannerSession/PlannerMessage 表 + 结构化行程解析(神朱 2026-10-01 拍板 M4.09)
+
+- 状态: pending
+- 依赖: TASK-8b 之后(与 TASK-8 无耦合,神朱定「明晚/后晚做」)
+- 目标: 新建 `backend/services/planner.py`:多轮对话编排(带 `HISTORY_LIMIT=12` 条历史)、系统提示硬约束(**只纳入用户点名/引用的收藏,未点名一律不得纳入**;**本阶段只排「每天的目的地」,不出交通/住宿/报价**;拿不到的写「待核实」禁编造;每天 2~4 点按顺路排序;只输出一个 JSON 对象)、`parse_itinerary` 容错解析(剥围栏/取首个 `{`…末个 `}`/字段校验,失败不抛)、LLM 预算 `PLANNER_MAX_TOKENS=1200 / PLANNER_TIMEOUT_S=180`(必须按调用放大)、降级四态 no_key/timeout/error/parse_error 一律不抛;新增表 `PlannerSession`/`PlannerMessage`。
+- 只读清单: `backend/services/intro.py`(LLM Provider 抽象,唯一入口)、`backend/services/trips.py`、`backend/db/models.py`、`backend/app/api/trips.py`(风格样板)、`docs/TASK-10-CONTRACT.md`(§3「TASK-10a」逐字执行)。
+- 涉及: backend/services/planner.py(新)、backend/db/models.py(加两表)、backend/db/repository.py(如需)、backend/test_planner.py(≥18 用例,LLM 全 mock 不触网)
+- 验收: pytest 零回归 + ≥18 新增;`plan_turn` 返回键名逐字符合契约;降级四态各有专门用例(断言不抛且 `reply` 非空);`parse_itinerary` 对「带 ```json 围栏 / 前后有解释文字 / 非 JSON / days 缺字段」各有用例;历史超 12 条只送最近 12;prompt 里确实含「未点名不得纳入」与「本阶段不排交通住宿」两条硬约束(用例断言 prompt 文本)。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-10b] AI 行程规划 API:POST/GET/DELETE /api/planner/messages + POST /api/planner/save(匹配入库并落 TripPlan)
+
+- 状态: pending
+- 依赖: TASK-10a
+- 目标: 新建 `backend/app/api/planner.py`(裸 JSON + 400 中文,风格照 trips.py):`POST /api/planner/messages`(`session_key` 空则后端 `uuid4().hex`;`collection_ids` 给了只用这些做素材、没给取当前全部收藏,但 **prompt 仍硬约束未点名不得纳入**;message 空/超长 400)、`GET /api/planner/messages`(未知 session 返回空 items 不 404)、`DELETE /api/planner/messages`、`POST /api/planner/save`(无 `collection_id` 的 stop 按名称在库内 Place 匹配→**幂等**建 `Collection(kind="place")`→调既有 `services.trips.upsert_trip_plan()`→返回 `{trip_plan, matched, unmatched}`,一个都匹配不到则 400 中文);`app/main.py` 挂 `/api`。
+- 只读清单: `backend/app/api/trips.py`、`backend/app/api/collections.py`(收藏 upsert/ref_key 口径)、`backend/services/trips.py`、`backend/services/planner.py`(10a 产物)、`docs/TASK-10-CONTRACT.md`(§3「TASK-10b」逐字执行)。
+- 涉及: backend/app/api/planner.py(新)、backend/app/main.py、backend/test_planner_api.py(≥18 用例,全 mock 不触网)
+- 验收: pytest 零回归 + ≥18 新增;400 文案有用例;`collection_ids` 有无两条路径都有用例;save 的同名重复保存**幂等**有用例(不产生新 Place/Collection/TripPlan 行);`/api/trip-plans` 与 `/api/collections` **响应键逐键零变化**断言;save 返回的 quote 复用既有 `estimate` 口径与免责文案。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-10c] AI 行程前端对话框:收藏面板第三个 tab「🤖 AI 行程」+ 多轮对话 + 点名收藏 + 行程卡片 + 存为方案
+
+- 状态: pending
+- 依赖: TASK-10b
+- 目标: `index.html` 收藏面板加第三个 tab「🤖 AI 行程」(沿用现有 tab 机制,与「我的收藏」「行程方案」并列互斥):消息流(用户/助手气泡,助手气泡渲染按天行程卡片 `Day N · base` + stops 名称/一句理由 + tip;`degraded` 显示可见原因,绝不静默)、输入区(Enter 发送/Shift+Enter 换行/发送中「AI 规划中…(首次约 1 分钟)」)、**点名收藏标签**(点一下把该条加入本次 `collection_ids` 并插入 @引用文本,**未点名的收藏绝不自动进请求**)、底部「⭐ 存为行程方案」(POST /api/planner/save,显示方案名+总预算估算+unmatched 提示)与「🗑 清空对话」、切 tab 时 GET 回放历史;`session_key` 存 localStorage。
+- 只读清单: `backend/app/static/index.html`(收藏面板 tab 区块)、`backend/test_frontend_routes.py`、`docs/TASK-10-CONTRACT.md`(§3「TASK-10c」逐字执行)。
+- 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 静态断言 + node --check)
+- 验收: pytest 零回归 + ≥12 新增断言;browser_exec 真机 QA(受信任点击):开页 0 error → 切 tab → 「3 天 亲子 不要太累」→ 出按天行程卡片 → 追问「第二天换成古镇」→ 卡片更新 → 点收藏标签再问 → 行程含该收藏 → 「⭐ 存为行程方案」→ 出现方案与预算 → 「🗑 清空对话」→ `window.__errs` 0 条;既有收藏/行程方案 tab 零回归。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

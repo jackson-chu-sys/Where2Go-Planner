@@ -4,7 +4,8 @@ Python 3.13 + FastAPI + SQLAlchemy 2.0 + SQLite。venv 在仓库根 `.venv/`。
 测试:`cd backend && ../.venv/bin/python -m pytest -q`(基线 **792** passed,全 mock 不触网)。
 规格唯一事实源:01/02 需求架构文档 + docs/STAGE*-PLAN.md;任务契约见 docs/NIGHTLY-QUEUE.md。
 **2026-10-01 起数据源全面切高德**(POI 检索/地理编码/驾车路线/前端地图;Overpass 与 OSRM 移除、Photon/Nominatim 留作降级)
-→ 动 TASK-9* 代码前**必读 `docs/TASK-9-CONTRACT.md`**(v3 only、单查询 200 条上限、radius≤50km 需分格、高德 `tolls` 恒 0 用 `toll_distance` 算过路费、JS key 不进 git 走 /api/map-config)。
+→ 动 TASK-9* 代码前**必读 `docs/TASK-9-CONTRACT.md`**
+TASK-10 = AI 对话式行程规划(`services/planner.py` + `/api/planner/*` + 收藏面板第三个 tab),规范见 `docs/TASK-10-CONTRACT.md`(只纳入点名收藏、阶段 A 只排每日目的地、不自动落库)(v3 only、单查询 200 条上限、radius≤50km 需分格、高德 `tolls` 恒 0 用 `toll_distance` 算过路费、JS key 不进 git 走 /api/map-config)。
 
 ## 目录与模块契约(一行一个,签名以源码为准)
 - `backend/db/models.py` — 全部 ORM 表:Place(唯一键 osm_type+osm_id+origin_city)/ SegmentFetch / Collection(唯一键 kind+ref_key+mode,mode 用空串不用 NULL)/ CollectionCat。工具:`utcnow() iso_utc() clean_text() COORD_PRECISION=7`。**新表也加在这里**。

@@ -1,5 +1,6 @@
 # 密钥——绝不上传
 Github_PAT.txt
+AzureMapsKey.txt
 *.env
 .env*
 

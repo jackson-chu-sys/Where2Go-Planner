@@ -677,12 +677,17 @@
 ## [TASK-9d] 前端地图切高德 JS API 2.0:Leaflet 退役 + /api/map-config 运行时注入 JS key(与本晚 9c 连做)
 - 依赖: TASK-9b + TASK-9c(后端接口就绪;本项目前端零改动的约束由 9b 保证)
 
-- 状态: running
+- 状态: done
 - 目标: `index.html` 移除 Leaflet(CDN+OSM 瓦片)改高德 JS API 2.0(官方路径;真机若报 `INVALID_USER_SCODE` 则降级为「保留 Leaflet + 换高德无 key 栅格瓦片」并注明待升级,不许空过);新增后端 `GET /api/map-config` 返回 `{"amap_js_key","amap_security_js_code"}`(取自 env,**不进 git、不写进 index.html**),前端加载 JS API **前**先写 `window._AMapSecurityConfig={securityJsCode:…}`(**安全密钥已由神朱提供并落 `.env`**)再动态注入 `<script>`、无 key 给明确降级文案;环圈→`AMap.Circle`(外实内虚)、pin→`AMap.Marker`(保留分类色/emoji 自绘)、点 pin→`AMap.InfoWindow` 承载现有 `popupHtml()`(含收藏/路线/「📄 查看详情」按钮,为 TASK-8b 铺路)、路线→`AMap.Polyline`(驾车实线/铁路虚线/飞机 `arcPoints` 弧线)、`fitView` 用环圈 bounds;`identityHtml()` 改「来源:高德 · POI <id> · GCJ-02」,种子行加 WGS-84 偏差提示;状态栏数据源文案改高德口径。
 - 只读清单: `backend/app/static/index.html`、`backend/test_frontend_routes.py`、`backend/app/api/places.py`(加 map-config 的风格)、`docs/TASK-9-CONTRACT.md`(§3「TASK-9d」逐字执行)。
 - 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 新断言 + node --check)、backend/app/api/(新增 map-config 路由)
 - 验收: pytest 零回归 + ≥12 新增断言(`/api/map-config` 调用、`AMap.` 使用、`AMap.InfoWindow`、**index.html 内不得出现 32 位 key 样态字符串**);browser_exec 真机 QA:开页 0 error → 高德地图渲染 → pin+环圈 → 点 pin 出 InfoWindow → 点路线出面板并画线;安全密钥已就绪,若仍报 `INVALID_USER_SCODE` → 按契约授权**当轮降级为「Leaflet + 高德无 key 栅格瓦片」并注明待升级**,不许空过。
-- 结果: (待夜班回填)
+- 结果: **完成·官方 JS API 2.0 路径,未触发降级**(2026-10-01 夜班,Codex 写码(40min 触止损被 kill,实现+测试已完整落盘且自验绿)+执行器复验收口,commit `a352e1f`)。
+  - index.html(+363/-121):Leaflet CDN/OSM 瓦片整体移除;启动先 fetch /api/map-config → 写 window._AMapSecurityConfig → 动态注入 webapi.amap.com/maps?v=2.0 脚本(无 key 给「地图未配置高德 JS key」降级文案,不抛错);环圈 AMap.Circle/CircleMarker(外实内虚+起点圆)、pin AMap.Marker 自绘 content(分类色/emoji 保留)、**marker.on("click") 绑 InfoWindow**(§1.7 坑照做)、路线 AMap.Polyline(驾车实线/铁路虚线/飞机弧线)、fitView 用 setFitView;坐标统一 lngLat() 转 [lng,lat];identityHtml 改「来源:高德 · POI <amap_id> · 坐标(GCJ-02)」、种子行 WGS-84 偏差提示;状态栏/页脚数据源文案全改高德口径(toll_modes 同步 amap_toll_distance);既有功能(收藏/路线面板/住宿区块/tab/加载更多/搜索/定位/补简介)零删改。
+  - 后端:+37 行,GET /api/map-config(运行时读 env WHERE2GO_AMAP_JS_KEY/SECURITY_JS_CODE、strip、无 env 回空串,note 写明 _AMapSecurityConfig 先于脚本口径)。key 不进 git:index.html 内 32 位 hex 样态字符串 0 命中(测试断言)。
+  - 测试:test_frontend_routes.py +250 行(Leaflet 断言删除,高德断言:map-config fetch/AMap 使用/InfoWindow/安全密钥先写/click 绑定/无 key 样态/env 名对齐等 12+);node --check 内联 JS 通过。执行器复跑 pytest backend/ = **989 passed**(971 基线零回归 + 18 净增,49s)。
+  - **真机 QA(browser_exec,CDP chrome,uvicorn 已重启)**:开页 0 error → JS key 运行时注入、_AMapSecurityConfig 就位、**无 INVALID_USER_SCODE**、瓦片渲染 15 块 → 上海 50-100 冷抓(高德,~125s 含 LLM 简介 24/28)→ 切「全部目的地」19 pin + 双环圈 → **受信任真实点击 pin → InfoWindow 打开**(名称/分类/距离/简介/⭐收藏/🚗路线/📄查看详情/「来源:高德 · POI B0IA…」)→ 点「路线对比」→ 面板出驾车卡片(高德 real 1小时2分/¥59/人均¥15/65.4km,note 写明 toll_distance 口径)+ 地图画线 2 条 → Esc 关闭 → 状态栏「来源:高德实时抓取」/页脚高德口径 → 全程 window.__errs **0** 条。QA 提示:pin 若在视口外需先 scrollIntoView 再取坐标点击。
+  - **Codex 256K 统计**:40min 触止损被 kill(function_calls 114、首写 ~9min 在 R8 放宽线 20min 内、tokens 9.30M total 含 cache 重放);kill 时前端+后端+测试全部落盘,只差 commit——四条 TASK-9 全部呈「产物完整、贴 40min 线」形态,256K 窗口下无一次 compact/重读回圈。
 
 ---
 

@@ -19,6 +19,9 @@
 * :func:`get_origin_cache` / :func:`upsert_origin_cache` —— 城市 → 起点坐标的地理编码
   持久缓存(TASK-7a):``city`` 是主键,重复写只刷新坐标/来源与 ``updated_at``;
   过期判定(TTL)在 API 层做,这里只管读写。
+* :func:`get_place_media` / :func:`media_map` / :func:`upsert_place_media` —— 目的地图片
+  缓存(TASK-8a1):``place_id`` 唯一,重复写是 upsert(刷新图源/图片/``fetched_at`` 即续期);
+  TTL 与负缓存口径在 :mod:`services.place_media`,这里只管读写与形状归一。
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ from .models import (
     KIND_ROUTE,
     LAT_LIMIT,
     LNG_LIMIT,
+    MEDIA_PAGE_URL_LEN,
+    MEDIA_SOURCE_NONE,
     NAME_LEN,
     NO_MODE,
     OSM_SOURCE,
@@ -57,6 +62,7 @@ from .models import (
     OriginCache,
     Place,
     PlaceDetail,
+    PlaceMedia,
     PlaceRecommendation,
     SegmentFetch,
     clean_text,
@@ -64,6 +70,8 @@ from .models import (
     collection_ref_key,
     default_collection_name,
     iso_utc,
+    media_reason,
+    media_source,
     optional_coordinate,
     osm_key,
     place_source,
@@ -1006,5 +1014,107 @@ def upsert_origin_cache(
     row.lng = round(float(lng), COORD_PRECISION)
     row.geocoder = clean_text(geocoder, limit=GEOCODER_LEN) or ""
     row.updated_at = utcnow()
+    session.flush()
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# 目的地图片缓存(TASK-8a1):PlaceMedia 的读写
+# --------------------------------------------------------------------------- #
+
+
+def _media_place_id(place_id: Any) -> int:
+    """图片缓存的 ``place_id`` 归一:空 / 非整数 / 非正数抛 :class:`ValueError`(API 层转 400)。"""
+    resolved = _optional_int("place_id", place_id)
+    if resolved is None:
+        raise ValueError("缺少必要参数:place_id")
+    if resolved <= 0:
+        raise ValueError(f"place_id 必须是正整数,收到:{place_id!r}")
+    return resolved
+
+
+def _media_images(images: Any) -> list[dict[str, Any]]:
+    """图片数组归一:只留带合法 ``url`` 的 ``{"url","title","source"}``(**不编造图源**)。"""
+    cleaned: list[dict[str, Any]] = []
+    for item in images or []:
+        if not isinstance(item, Mapping):
+            continue
+        url = clean_text(item.get("url"))
+        if not url:
+            continue
+        cleaned.append({
+            "url": url,
+            "title": clean_text(item.get("title")) or "",
+            "source": clean_text(item.get("source")) or MEDIA_SOURCE_NONE,
+        })
+    return cleaned
+
+
+def media_to_dict(row: PlaceMedia) -> dict[str, Any]:
+    """图片缓存行 → API/前端形状(键**恒定**;``fetched_at`` 统一 ISO UTC)。"""
+    return {
+        "place_id": int(row.place_id),
+        "source": media_source(row.source),
+        "images": _media_images(row.images),
+        "page_url": row.page_url or None,
+        "reason": media_reason(row.reason),
+        "fetched_at": iso_utc(row.fetched_at),
+    }
+
+
+def get_place_media(session: Session, *, place_id: Any) -> Optional[PlaceMedia]:
+    """按 ``place_id`` 取一行图片缓存;没有返回 ``None``。
+
+    **不做**过期判定:TTL / 负缓存口径(``WHERE2GO_PLACE_MEDIA_TTL_S`` 与
+    ``WHERE2GO_PLACE_MEDIA_MISS_TTL_S``)属于服务层策略,这里只按唯一键读行
+    (与 :func:`get_origin_cache` 同一风格)。
+    """
+    wanted = _media_place_id(place_id)
+    return session.scalars(select(PlaceMedia).where(PlaceMedia.place_id == wanted)).first()
+
+
+def media_map(session: Session, place_ids: Iterable[Any]) -> dict[int, PlaceMedia]:
+    """批量取图片缓存行 → ``{place_id: 行}``(一次查询,给 API 的 batch 用)。"""
+    wanted: list[int] = []
+    for item in place_ids or []:
+        try:
+            resolved = _media_place_id(item)
+        except ValueError:
+            continue
+        if resolved not in wanted:
+            wanted.append(resolved)
+    if not wanted:
+        return {}
+    rows = session.scalars(select(PlaceMedia).where(PlaceMedia.place_id.in_(wanted)))
+    return {int(row.place_id): row for row in rows}
+
+
+def upsert_place_media(
+    session: Session,
+    *,
+    place_id: Any,
+    source: Any,
+    images: Any = None,
+    page_url: Any = None,
+    reason: Any = None,
+) -> PlaceMedia:
+    """写入/刷新一个 POI 的图片缓存(唯一键 = ``place_id``,重复写只刷新内容与 ``fetched_at``)。
+
+    ``source`` 按 :func:`db.models.media_source` 归一到四态、``reason`` 按
+    :func:`db.models.media_reason` 归一到三档(有图时调用方给空 → 存 ``NULL``);
+    ``images`` 只留带合法 url 的条目。只 ``flush`` 不 ``commit``:提交时机交给调用方
+    (与 :func:`upsert_origin_cache` 一致)。
+    """
+    wanted = _media_place_id(place_id)
+    cleaned = _media_images(images)
+    row = get_place_media(session, place_id=wanted)
+    if row is None:
+        row = PlaceMedia(place_id=wanted)
+        session.add(row)
+    row.source = media_source(source) if cleaned else MEDIA_SOURCE_NONE
+    row.images = cleaned
+    row.page_url = clean_text(page_url, limit=MEDIA_PAGE_URL_LEN)
+    row.reason = None if cleaned else media_reason(reason)
+    row.fetched_at = utcnow()
     session.flush()
     return row

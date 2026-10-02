@@ -23,6 +23,9 @@
   ``/api/geocode`` 每次实调 Photon(德国)实测 2.7~3.4s,同一城市重复搜索重复付费;
   城市中心坐标基本不变,所以落一行 ``city → name/lat/lng/geocoder``,
   ``WHERE2GO_ORIGIN_CACHE_TTL_S``(缺省 7 天)内直接回缓存、**零网络**。
+* :class:`PlaceMedia` —— 一个 POI 的**图片缓存**(TASK-8a1,详情弹窗用):高德 POI 图为主 +
+  维基/Commons 兜底,``place_id`` 唯一 → 重复写是 upsert;命中缓存 7 天、空结果/失败只缓存
+  6 小时(**负缓存**,别把一次空结果永久钉死),过期判定在 :mod:`services.place_media`。
 * :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
   把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
   报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
@@ -751,3 +754,83 @@ class OriginCache(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
         return f"<OriginCache {self.city} {self.lat:.7f},{self.lng:.7f} by {self.geocoder}>"
+
+
+# --------------------------------------------------------------------------- #
+# 目的地图片缓存(TASK-8a1):PlaceMedia
+# --------------------------------------------------------------------------- #
+
+MEDIA_SOURCE_LEN = 16
+MEDIA_REASON_LEN = 32
+MEDIA_PAGE_URL_LEN = 500
+# 图源四态:前端据此显示「图源:高德」/「维基百科」/「高德 + 维基百科」或「暂无图片」
+MEDIA_SOURCE_AMAP = "amap"
+MEDIA_SOURCE_WIKIMEDIA = "wikimedia"
+MEDIA_SOURCE_MIXED = "mixed"
+MEDIA_SOURCE_NONE = "none"
+MEDIA_SOURCES: tuple[str, ...] = (
+    MEDIA_SOURCE_AMAP, MEDIA_SOURCE_WIKIMEDIA, MEDIA_SOURCE_MIXED, MEDIA_SOURCE_NONE,
+)
+# 没拿到图时的三档 reason(可空):缺 key(配好即可重试)/ 真的没图 / 数据源报错(可重试)
+MEDIA_REASON_NO_KEY = "no_key"
+MEDIA_REASON_NO_DATA = "no_data"
+MEDIA_REASON_ERROR = "error"
+MEDIA_REASONS: tuple[str, ...] = (MEDIA_REASON_NO_KEY, MEDIA_REASON_NO_DATA, MEDIA_REASON_ERROR)
+
+
+def media_source(value: Any) -> str:
+    """图源归一到 :data:`MEDIA_SOURCES`;未知值一律按 :data:`MEDIA_SOURCE_NONE` 收。"""
+    text = str(value or "").strip().lower()
+    return text if text in MEDIA_SOURCES else MEDIA_SOURCE_NONE
+
+
+def media_reason(value: Any) -> Optional[str]:
+    """reason 归一到 :data:`MEDIA_REASONS`;空值 → ``None``(有图时 reason 恒为空)。"""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    return text if text in MEDIA_REASONS else MEDIA_REASON_ERROR
+
+
+class PlaceMedia(Base):
+    """一个 POI 的图片(**DB 即缓存**):高德 POI 图为主 + 维基/Commons 兜底。
+
+    为什么单独一张表:图片是详情弹窗(TASK-8b)才要的**派生数据**,不进 ``Place``
+    (契约 §5:只新增表、不改既有列);而且一次要问两个源(高德 ``/place/text`` 0.1~0.2s
+    + 维基 ~1.5s),必须缓存,否则每开一次弹窗就白等一遍。
+
+    键口径:``place_id`` **唯一**(与 :class:`PlaceDetail` 同风格)→ 重复写是 upsert,
+    只刷新 ``source``/``images``/``page_url``/``reason``/``fetched_at``。
+    ``images`` 存 ``[{"url", "title", "source"}]``,``source`` 标每张图的出处
+    (``amap`` / ``wikimedia``),前端据此拼图源文案;**只存真的从数据源拿到的 url,
+    没图就是空数组**(绝不编造图源)。``page_url`` 是维基页外链(可空,给「资料来源」用)。
+
+    TTL 不在这里判:命中 :data:`services.place_media.MEDIA_TTL_DEFAULT_S`(7 天)、
+    空结果/失败只缓存 :data:`services.place_media.MEDIA_MISS_TTL_DEFAULT_S`(6 小时**负缓存**
+    —— 别把一次空结果永久钉死,同 TASK-6c 的教训),读写口径见
+    :func:`db.repository.get_place_media` / :func:`db.repository.upsert_place_media`。
+    旧库靠 ``create_all`` 自动建表,**不迁移存量**。
+    """
+
+    __tablename__ = "place_media"
+    __table_args__ = (UniqueConstraint("place_id", name="uq_place_media"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    place_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(
+        String(MEDIA_SOURCE_LEN), nullable=False, default=MEDIA_SOURCE_NONE
+    )
+    images: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    page_url: Mapped[Optional[str]] = mapped_column(String(MEDIA_PAGE_URL_LEN), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(MEDIA_REASON_LEN), nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return (
+            f"<PlaceMedia place={self.place_id} {self.source} "
+            f"{len(self.images or [])}张 reason={self.reason}>"
+        )

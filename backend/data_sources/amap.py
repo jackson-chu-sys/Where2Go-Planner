@@ -48,6 +48,7 @@ from ._common import (
     DataSourceError,
     TransientDataSourceError,
     build_session,
+    haversine_km,
     http_json,
     normalize_timeout,
 )
@@ -57,6 +58,8 @@ DEFAULT_ENDPOINT = "https://restapi.amap.com/v3"
 ENV_ENDPOINT = "WHERE2GO_AMAP_ENDPOINT"
 ENV_AMAP_KEY = "WHERE2GO_AMAP_KEY"
 ENV_MIN_INTERVAL = "WHERE2GO_AMAP_MIN_INTERVAL_S"
+#: POI 图片检索(TASK-8a1)的坐标门控阈值(米)可用这个环境变量覆盖
+ENV_AMAP_MAX_MATCH_M = "WHERE2GO_AMAP_MAX_MATCH_M"
 
 #: 实测 ``radius`` 超过 50000 会被服务端截断 → 客户端先钳住,免得以为查到了更大范围
 AUTO_MAX_RADIUS_M = 50000
@@ -80,6 +83,7 @@ GEOCODE_PATH = "/geocode/geo"
 REGEO_PATH = "/geocode/regeo"
 SEARCH_AROUND_PATH = "/place/around"
 SEARCH_POLYGON_PATH = "/place/polygon"
+SEARCH_TEXT_PATH = "/place/text"
 DRIVING_PATH = "/direction/driving"
 
 EXTENSIONS_BASE = "base"
@@ -94,6 +98,13 @@ POLYGON_DIAGONAL_SEPARATOR = "~"
 POLYGON_MIN_POINTS = 4
 #: 驾车 ``strategy`` 默认值(仅为签名兼容,**请求时不传**,见 §6.5)
 DEFAULT_DRIVING_STRATEGY = 11
+#: POI 图片检索(TASK-8a1,``/place/text`` + ``extensions=all``)的口径:
+#: 只要最匹配的一条(``offset=1``),图片就在 ``pois[0].photos`` 里(契约 §1 实测 0.1~0.2s)
+PHOTO_OFFSET = 1
+DEFAULT_PHOTO_RADIUS_M = 20000
+#: 坐标门控阈值(米):高德按关键词可能返回**同名异地**的 POI(契约 §1:在汤泽坐标查
+#: 「汤泽高原滑雪场」命中「狂飙乐园滑雪场」),超阈值就当没查到,绝不把别处的图贴上来
+DEFAULT_MAX_MATCH_M = 5000
 
 # --------------------------------------------------------------------------- #
 # infocode 分派(§6.2 细分表,比契约 §3 更全,以此为准)
@@ -449,6 +460,8 @@ _last_request_at = float("-inf")
 
 _session_lock = threading.Lock()
 _default_session: Optional[Any] = None
+#: ``_request(soft_status=True)`` 用来区分"HTTP 层就失败了(必须抛)"与"高德业务失败(当没查到)"
+_NO_PAYLOAD: Any = object()
 
 
 def min_interval_s(environ: Optional[Mapping[str, str]] = None) -> float:
@@ -552,8 +565,15 @@ def _request(
     session: Optional[Any] = None,
     timeout: Optional[float] = None,
     action: str = "高德请求",
+    soft_status: bool = False,
 ) -> Any:
-    """发一次 v3 请求:节流 → 带 key 拼参 → 瞬时错误退避重试(2s/5s,最多 3 次)。"""
+    """发一次 v3 请求:节流 → 带 key 拼参 → 瞬时错误退避重试(2s/5s,最多 3 次)。
+
+    ``soft_status=True``(TASK-8a1 的 POI 图片检索用)时,**高德业务失败**(缺 key、
+    配额耗尽、限流重试打满、无结果)不再抛异常,而是把原始 payload 交回调用方按
+    "没查到"处理 —— 图片是详情弹窗的装饰,拿不到就交给维基兜底,不该炸整条链路。
+    HTTP 错误 / 超时 / 非 JSON(:func:`http_json` 抛的那一档)**照常抛**,由调用方降级。
+    """
     env = dict(os.environ if environ is None else environ)
     key = resolve_key(env)
     url = f"{resolve_endpoint(env)}{path}"
@@ -564,6 +584,7 @@ def _request(
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         _throttle(env)
+        payload: Any = _NO_PAYLOAD
         try:
             payload = http_json(
                 resolved_session,
@@ -575,8 +596,15 @@ def _request(
             return check_status(payload, action=action)
         except TransientDataSourceError:
             if attempt >= MAX_ATTEMPTS:
+                if soft_status and payload is not _NO_PAYLOAD:
+                    return payload
                 raise
             _SLEEP(retry_backoff_s(attempt))
+        except DataSourceError:
+            # 只有"拿到了响应体、是高德业务层说没图/没权限"才软化;HTTP 层失败照常抛
+            if soft_status and payload is not _NO_PAYLOAD:
+                return payload
+            raise
     raise DataSourceError(SOURCE_NAME, f"{action}失败:重试次数用尽仍无结果")  # pragma: no cover
 
 
@@ -890,3 +918,151 @@ def driving(
         DRIVING_PATH, params, environ=environ, session=session, action="驾车路线"
     )
     return parse_driving(payload, with_geometry=with_geometry, action="驾车路线")
+
+
+# --------------------------------------------------------------------------- #
+# POI 图片(TASK-8a1):GET /place/text + extensions=all → pois[0].photos
+# --------------------------------------------------------------------------- #
+# 实测口径(2026-10-01 容器内实跑,见 docs/TASK-8-CONTRACT.md §1,**勿改**):
+#   /v3/place/text?key=…&keywords=西湖&location=120.149,30.246&radius=20000&offset=1&extensions=all
+#   → ``pois[0].photos = [{"title": "…", "url": "http://…"}]``(西湖 3 张 / 崇儒乡 1 张,0.1~0.2s)
+# 两个坑:
+#   * ``photos[].url`` 是 **http://** 明文 → 前端 https 页面里会被浏览器当混合内容拦掉,
+#     统一升成 ``https://``(高德图床两个协议都可用);
+#   * 高德按关键词会返回**同名异地**的 POI → 必须做**坐标门控**
+#     (:func:`parse_poi_photos`),距离超 :func:`resolve_max_match_m` 就当没查到。
+
+
+def resolve_max_match_m(environ: Optional[Mapping[str, str]] = None) -> int:
+    """坐标门控阈值(米):``WHERE2GO_AMAP_MAX_MATCH_M`` 可覆盖,非法值回落 :data:`DEFAULT_MAX_MATCH_M`。"""
+    env = os.environ if environ is None else environ
+    raw = str(env.get(ENV_AMAP_MAX_MATCH_M) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_MATCH_M
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_MAX_MATCH_M
+    return int(max(0.0, value))
+
+
+def normalize_photo_url(url: Any) -> Optional[str]:
+    """图片 URL 归一:``http://`` → ``https://``;空值/相对路径/非 http(s) → ``None``。
+
+    **绝不编造图源**:认不出来的 url 直接丢掉(宁可少一张图,也不给前端一个 404 或
+    被浏览器拦掉的混合内容请求)。
+    """
+    text = _text(url)
+    if not text:
+        return None
+    if text.startswith("http://"):
+        text = "https://" + text[len("http://"):]
+    if not text.startswith("https://") or len(text) <= len("https://"):
+        return None
+    return text
+
+
+def parse_photos(raw: Any) -> list[dict[str, str]]:
+    """``photos`` 数组 → ``[{"url", "title"}]``(按 url 去重保序,只留有效 url)。
+
+    高德对空值常给 ``[]``,脏数据也可能是裸字符串或缺 ``url`` 的对象 → 一律跳过。
+    """
+    if not isinstance(raw, list):
+        return []
+    photos: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, AbcMapping):
+            url = normalize_photo_url(item.get("url"))
+            title = _text(item.get("title"))
+        elif isinstance(item, str):
+            url, title = normalize_photo_url(item), ""
+        else:
+            continue
+        if url is None or url in seen:
+            continue
+        seen.add(url)
+        photos.append({"url": url, "title": title})
+    return photos
+
+
+def parse_poi_photos(
+    payload: Any,
+    *,
+    lat: float,
+    lng: float,
+    max_match_m: Any = DEFAULT_MAX_MATCH_M,
+) -> list[dict[str, str]]:
+    """``/place/text`` 响应 → 图片列表;以下情况**一律 ``[]``(不抛)**:
+
+    * ``status != "1"``(缺 key / 配额 / 限流 / 参数非法);
+    * ``pois`` 为空或 ``pois[0]`` 是脏数据;
+    * ``pois[0].photos`` 为空(实测崇儒乡只有 1 张,不少乡镇 POI 是 0 张);
+    * **坐标门控**未过:``pois[0]`` 与入参坐标的 haversine 距离 > ``max_match_m``
+      (同名异地误配),或该 POI 连 ``location`` 都没有(无法判定 = 不用它的图)。
+    """
+    if not isinstance(payload, dict):
+        return []
+    if _text(payload.get("status")) != STATUS_OK:
+        return []
+    pois = payload.get("pois")
+    if not isinstance(pois, list) or not pois:
+        return []
+    first = pois[0]
+    if not isinstance(first, AbcMapping):
+        return []
+    photos = parse_photos(first.get("photos"))
+    if not photos:
+        return []
+    pair = parse_location(first.get("location"))
+    if pair is None:
+        return []
+    poi_lng, poi_lat = pair
+    try:
+        threshold_m = float(max_match_m)
+    except (TypeError, ValueError):
+        threshold_m = float(DEFAULT_MAX_MATCH_M)
+    latitude, longitude = require_coordinates(lat, lng)
+    if haversine_km(latitude, longitude, poi_lat, poi_lng) * 1000.0 > threshold_m:
+        return []
+    return photos
+
+
+def search_poi_photos(
+    name: str,
+    lat: float,
+    lng: float,
+    *,
+    radius_m: Any = DEFAULT_PHOTO_RADIUS_M,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+) -> list[dict[str, str]]:
+    """按「名称 + 坐标」查一个 POI 的图片:``GET /place/text``(``extensions=all``)。
+
+    返回 ``[{"url", "title"}]``(``http://`` 已升 ``https://``,按 url 去重);
+    **没有图 / 误配到异地同名 POI / 高德业务失败(缺 key、配额、无结果)都返回 ``[]``,
+    不抛** —— 图片只是详情弹窗的装饰,拿不到就交给维基兜底
+    (:func:`data_sources.wikimedia.wikipedia_media`)。
+    只有 HTTP 错误 / 超时 / 非 JSON 才抛 :class:`DataSourceError`,由调用方降级。
+
+    ``radius_m`` 走 :func:`clamp_radius`(>50000 钳到 50000);命中判定与坐标门控见
+    :func:`parse_poi_photos`,阈值 :func:`resolve_max_match_m`(缺省 5000m)。
+    """
+    text = _text(name)
+    if not text:
+        raise ValueError("search_poi_photos 的 name 不能为空")
+    latitude, longitude = require_coordinates(lat, lng)
+    params = {
+        "keywords": text,
+        "location": format_lnglat(longitude, latitude),
+        "radius": clamp_radius(radius_m),
+        "offset": PHOTO_OFFSET,
+        "extensions": EXTENSIONS_ALL,
+    }
+    payload = _request(
+        SEARCH_TEXT_PATH, params, environ=environ, session=session,
+        action=f"POI 图片检索 {text!r}", soft_status=True,
+    )
+    return parse_poi_photos(
+        payload, lat=latitude, lng=longitude, max_match_m=resolve_max_match_m(environ)
+    )

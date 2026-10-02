@@ -47,6 +47,7 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "nominatim": PROXY_ENV,  # 实测直连不通,必须走代理
     "photon": PROXY_OFF,     # 实测直连 1.1s、走代理 5s 挂(产品环境无代理)
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
+    "wikimedia": PROXY_ENV,  # 维基/Commons(TASK-8a1 图片兜底):沿用环境变量代理口径
 }
 
 

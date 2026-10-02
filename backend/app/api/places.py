@@ -53,6 +53,7 @@ from db.base import get_session
 from services import details as detail_service
 from services import intro as intro_service
 from services import place_loader
+from services import place_media as media_service
 from services import recommend as recommend_service
 from services import seed_data
 from services.bands import DISTANCE_BANDS, band_keys, find_band
@@ -131,6 +132,23 @@ DETAILS_NOTE = (
     "单次最多 limit 条(前端分批懒加载);失败降级为不写行、下次可重试,"
     "reason 区分 no_key / all_failed / ok,便于前端给出可操作提示。"
 )
+# 图片链路(TASK-8a1):一次最多 20 个 POI(详情弹窗按需拉,不做全量预热)
+MEDIA_BATCH_MAX = 20
+MEDIA_NOTE = (
+    "目的地图片按 POI 缓存(DB 即缓存):读库优先,只有缓存缺失/过期才触网 —— "
+    "高德 /place/text 的 POI 图为主(带坐标门控,同名异地误配当没查到),"
+    "维基 geosearch 近邻页 + Commons 相册兜底。"
+    "source 标图源:amap = 只有高德图、wikimedia = 只有维基图、mixed = 两边都有、"
+    "none = 没有图(前端显示「暂无图片」占位,**不会编造图片 URL**);"
+    "images 每条带 source 标明单张图的出处,page_url 是维基页外链(可空)。"
+    "reason 只在没图时给:no_key = 未配置 WHERE2GO_AMAP_KEY(配好即可用)、"
+    "no_data = 两个源都没有这个 POI 的图、error = 数据源报错(可重试)。"
+    f"命中缓存 {media_service.MEDIA_TTL_DEFAULT_S // 86400} 天,"
+    f"空结果/失败只缓存 {media_service.MEDIA_MISS_TTL_DEFAULT_S // 3600} 小时(负缓存,过期后可重试);"
+    f"单 POI 最多 {media_service.MEDIA_MAX_IMAGES_DEFAULT} 张图。"
+    f"place_ids 逗号分隔、一次最多 {MEDIA_BATCH_MAX} 个,items **按入参顺序**返回(重复 id 只回一条);"
+    "单条失败只影响该条(reason=error),不影响其余。"
+)
 MAP_CONFIG_NOTE = (
     "前端地图(高德 JS API 2.0)的运行时配置:amap_js_key 与 amap_security_js_code "
     "只在**每次请求时**从环境变量 WHERE2GO_AMAP_JS_KEY / WHERE2GO_AMAP_SECURITY_JS_CODE 读取,"
@@ -144,6 +162,32 @@ MAP_CONFIG_NOTE = (
 def _clean(text: Optional[str]) -> Optional[str]:
     value = (text or "").strip()
     return value or None
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    """可选文本参数归一:只认真正的 ``str``(同 :mod:`app.api.stays`)。
+
+    直接调用端点函数(单测 / 脚本)时,FastAPI 的 ``Query(None)`` 默认值不会被解析,
+    传进来是 ``FieldInfo`` 对象;这里统一把"没给"归一成 ``None``。
+    """
+    return value if isinstance(value, str) else None
+
+
+def _media_ids(raw: str) -> list[int]:
+    """``place_ids`` 解析:逗号(含中文逗号)分隔的正整数,**保序去重**;非法片段一律 400 中文。"""
+    ids: list[int] = []
+    for chunk in str(raw).replace("，", ",").split(","):
+        text = chunk.strip()
+        if not text:
+            continue
+        if not text.isdigit():
+            raise HTTPException(400, f"place_ids 只能是逗号分隔的正整数,收到:{text!r}")
+        value = int(text)
+        if value <= 0:
+            raise HTTPException(400, f"place_ids 必须是正整数,收到:{value}")
+        if value not in ids:
+            ids.append(value)
+    return ids
 
 
 def origin_cache_ttl_s() -> int:
@@ -576,6 +620,41 @@ def fill_details(
         **{key: value for key, value in stats.items() if key != "filled_ids"},
         "elapsed_s": round(time.monotonic() - started, 2),
         "note": DETAILS_NOTE,
+    }
+
+
+@router.get("/places/media")
+def places_media(
+    place_ids: Optional[str] = Query(
+        None, description=f"POI id 列表,逗号分隔(一次最多 {MEDIA_BATCH_MAX} 个)"
+    ),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """目的地图片(高德 POI 图为主 + 维基/Commons 兜底),给详情弹窗按需拉。
+
+    **读库优先**:命中 :class:`db.models.PlaceMedia` 的未过期行直接回、零网络;只有
+    miss / 过期才触网(:func:`services.place_media.fetch_media_for_place`)。
+    ``items`` 严格按入参 id 顺序返回,响应形状恒定(``source`` / ``images`` /
+    ``page_url`` / ``reason`` / ``cached`` / ``fetched_at``),前端只读固定键。
+    单条失败只让该条 ``reason="error"``,不影响其余(批量里第 N 条炸了照样出前面几条的图)。
+    """
+    raw = _optional_text(place_ids)
+    if raw is None:
+        raise HTTPException(400, "缺少必要参数:place_ids(逗号分隔的 POI id,如 place_ids=1,2,3)")
+    ids = _media_ids(raw)
+    if not ids:
+        raise HTTPException(400, f"place_ids 解析后为空:请传逗号分隔的正整数 id,收到:{raw!r}")
+    if len(ids) > MEDIA_BATCH_MAX:
+        raise HTTPException(
+            400, f"place_ids 一次最多 {MEDIA_BATCH_MAX} 个,收到 {len(ids)} 个(请分批请求)"
+        )
+    started = time.monotonic()
+    items = media_service.fetch_media_for_places(session, ids)
+    return {
+        "items": items,
+        "count": len(items),
+        "elapsed_s": round(time.monotonic() - started, 2),
+        "note": MEDIA_NOTE,
     }
 
 

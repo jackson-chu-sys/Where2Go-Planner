@@ -741,13 +741,17 @@
 
 ## [TASK-10a] AI 行程规划后端服务:多轮对话编排 + PlannerSession/PlannerMessage 表 + 结构化行程解析(神朱 2026-10-01 拍板 M4.09)
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-8b 之后(与 TASK-8 无耦合,神朱定「明晚/后晚做」)
 - 目标: 新建 `backend/services/planner.py`:多轮对话编排(带 `HISTORY_LIMIT=12` 条历史)、系统提示硬约束(**只纳入用户点名/引用的收藏,未点名一律不得纳入**;**本阶段只排「每天的目的地」,不出交通/住宿/报价**;拿不到的写「待核实」禁编造;每天 2~4 点按顺路排序;只输出一个 JSON 对象)、`parse_itinerary` 容错解析(剥围栏/取首个 `{`…末个 `}`/字段校验,失败不抛)、LLM 预算 `PLANNER_MAX_TOKENS=1200 / PLANNER_TIMEOUT_S=180`(必须按调用放大)、降级四态 no_key/timeout/error/parse_error 一律不抛;新增表 `PlannerSession`/`PlannerMessage`。
 - 只读清单: `backend/services/intro.py`(LLM Provider 抽象,唯一入口)、`backend/services/trips.py`、`backend/db/models.py`、`backend/app/api/trips.py`(风格样板)、`docs/TASK-10-CONTRACT.md`(§3「TASK-10a」逐字执行)。
 - 涉及: backend/services/planner.py(新)、backend/db/models.py(加两表)、backend/db/repository.py(如需)、backend/test_planner.py(≥18 用例,LLM 全 mock 不触网)
 - 验收: pytest 零回归 + ≥18 新增;`plan_turn` 返回键名逐字符合契约;降级四态各有专门用例(断言不抛且 `reply` 非空);`parse_itinerary` 对「带 ```json 围栏 / 前后有解释文字 / 非 JSON / days 缺字段」各有用例;历史超 12 条只送最近 12;prompt 里确实含「未点名不得纳入」与「本阶段不排交通住宿」两条硬约束(用例断言 prompt 文本)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-02 夜班,Codex 执行,**~14.4min 自行完成实现+测试+commit,未触止损线**,commit `07058ba`)。
+  - models.py 追加 PlannerSession(session_key unique+index/title/created_at/updated_at)与 PlannerMessage(session_id index/role/content/payload JSON nullable/created_at),两表不建外键、create_all 自动建、既有列零改动。
+  - 新 `services/planner.py`:八常量逐字落地(1200/180/12/2000/3/15/2/4);plan_turn(取建会话→存 user→组 prompt→LLMClient.chat(system=SYSTEM_PROMPT, max_tokens=1200, timeout=180) 按调用放大→parse_itinerary→存 assistant(payload 带 itinerary/degraded/reason)→自 commit);返回键名逐字契约形状;SYSTEM_PROMPT 六条硬约束逐条写入且 prompt 尾部复述「未点名不得纳入」「不排交通/住宿/预算」;parse_itinerary 纯函数(剥围栏→首{末}→days 非空+每天有 day/stops,days_count 重算,失败 (None,前200字) 不抛);降级四态 no_key/timeout/error/parse_error 一律不抛、reply 中文兜底含原因码+可重试、消息照样落库;nights 阶段 A 不进 prompt(只存 payload 留给阶段 B);list_messages/clear_session(只删消息保留会话行)。
+  - 测试 test_planner.py **47 例**(超 ≥18;含预算按调用传入断言、六条系统约束+两条 prompt 硬约束文本断言、summary 截 120 字、历史超 12 只送最近 12 且排除本轮、跨 session 可见证明 commit、降级四态参数化 6 剧本)。执行器复跑 pytest backend/ = **1196 passed**(1149 基线零回归,63s)。未动 index.html/API 路由(10b)/TripPlan/Collection。
+  - **Codex 256K 统计**:单次调用 ~14.4min(16:09-16:24 UTC),function_calls **30**,首写 **4.3min**(R8 线内),tokens **1.19M total**(含 cache 重放);中途曾陷入 ruff 默认规则告警(仓库无 lint 配置),自行放弃未扩散。连续两条(8a2/10a)「拆小条目→远低于止损线」,与 6c/6d/6g/9b/9c/9d/8a1/8b 的贴线形态对比进一步印证拆条口径。
 
 ---
 

@@ -26,6 +26,10 @@
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
   **逆**地理编码(同样高德主 + Photon/Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
+* ``GET /api/places/highlights?place_ids=1,2`` —— 详情弹窗的**类别专属要点**(TASK-8a2):
+  LLM 按分类出固定字段表(``自然``→最佳季节/门票/开放信息/游玩建议 等),按 POI **永久缓存**
+  在 ``PlaceHighlight``(读库优先,命中零 LLM);batch ≤ 10、超限 400 中文,
+  ``value=null`` = 该字段**待核实**(绝不编造票价/雪道数/店名),失败降级 ``fields=[]``。
 * ``GET /api/map-config`` —— 前端**高德 JS API 2.0** 的运行时配置(TASK-9d):
   ``amap_js_key`` / ``amap_security_js_code`` 只在**每次请求时**从环境变量读
   (``WHERE2GO_AMAP_JS_KEY`` / ``WHERE2GO_AMAP_SECURITY_JS_CODE``),
@@ -51,6 +55,7 @@ from data_sources import DataSourceError
 from db import repository as repo
 from db.base import get_session
 from services import details as detail_service
+from services import highlights as highlight_service
 from services import intro as intro_service
 from services import place_loader
 from services import place_media as media_service
@@ -148,6 +153,19 @@ MEDIA_NOTE = (
     f"单 POI 最多 {media_service.MEDIA_MAX_IMAGES_DEFAULT} 张图。"
     f"place_ids 逗号分隔、一次最多 {MEDIA_BATCH_MAX} 个,items **按入参顺序**返回(重复 id 只回一条);"
     "单条失败只影响该条(reason=error),不影响其余。"
+)
+# 类别专属要点(TASK-8a2):一次最多 10 个 POI(要点要调 LLM,比图片更贵,批量收得更紧)
+HIGHLIGHT_BATCH_MAX = 10
+HIGHLIGHT_NOTE = (
+    "类别专属要点(LLM 结构化字段)按 POI **永久缓存**在 PlaceHighlight:读库优先,"
+    "命中直接回(cached=true、零 LLM 调用),只有 miss 才调 LLM 生成。"
+    "字段表按分类固定(自然→最佳季节/门票/开放信息/游玩建议;人文美食→人文背景/必吃/代表小店;"
+    "滑雪→雪道数与分级/开放期/适合人群;运动→项目/场地装备/适宜人群;其余→亮点/建议),"
+    "items[].fields 恒按该表顺序返回 {label, value}。"
+    "**value=null 表示该字段查不到**(note 里标「待核实」),前端弱化显示;"
+    "绝不编造票价/雪道数/店名。LLM 异常或坏 JSON 降级为 fields=[] + note=解析失败(不写缓存、下次可重试)。"
+    f"place_ids 逗号分隔、一次最多 {HIGHLIGHT_BATCH_MAX} 个,items **按入参顺序**返回(重复 id 只回一条);"
+    "单条失败只影响该条,不影响其余。"
 )
 MAP_CONFIG_NOTE = (
     "前端地图(高德 JS API 2.0)的运行时配置:amap_js_key 与 amap_security_js_code "
@@ -655,6 +673,41 @@ def places_media(
         "count": len(items),
         "elapsed_s": round(time.monotonic() - started, 2),
         "note": MEDIA_NOTE,
+    }
+
+
+@router.get("/places/highlights")
+def places_highlights(
+    place_ids: Optional[str] = Query(
+        None, description=f"POI id 列表,逗号分隔(一次最多 {HIGHLIGHT_BATCH_MAX} 个)"
+    ),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """类别专属要点(自然/人文美食/滑雪/运动各自的固定字段表),给详情弹窗按需拉。
+
+    **读库优先**:命中 :class:`db.models.PlaceHighlight` 的行直接回(``cached=true``、
+    **零 LLM**);只有 miss 才调 LLM 生成并永久落库。``items`` 严格按入参 id 顺序返回,
+    形状恒定(``place_id`` / ``category`` / ``fields`` / ``note`` / ``cached`` / ``generated_at``)。
+    单条失败只让该条 ``fields=[]`` + note(解析失败/生成失败),不影响其余,更不会 500。
+    """
+    raw = _optional_text(place_ids)
+    if raw is None:
+        raise HTTPException(400, "缺少必要参数:place_ids(逗号分隔的 POI id,如 place_ids=1,2)")
+    ids = _media_ids(raw)  # 与图片链路同一套解析:逗号(含中文逗号)分隔正整数、保序去重、非法即 400
+    if not ids:
+        raise HTTPException(400, f"place_ids 解析后为空:请传逗号分隔的正整数 id,收到:{raw!r}")
+    if len(ids) > HIGHLIGHT_BATCH_MAX:
+        raise HTTPException(
+            400,
+            f"place_ids 一次最多 {HIGHLIGHT_BATCH_MAX} 个,收到 {len(ids)} 个(要点要调 LLM,请分批请求)",
+        )
+    started = time.monotonic()
+    items = highlight_service.fetch_highlights_for_places(session, ids)
+    return {
+        "items": items,
+        "count": len(items),
+        "elapsed_s": round(time.monotonic() - started, 2),
+        "note": HIGHLIGHT_NOTE,
     }
 
 

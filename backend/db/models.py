@@ -26,6 +26,9 @@
 * :class:`PlaceMedia` —— 一个 POI 的**图片缓存**(TASK-8a1,详情弹窗用):高德 POI 图为主 +
   维基/Commons 兜底,``place_id`` 唯一 → 重复写是 upsert;命中缓存 7 天、空结果/失败只缓存
   6 小时(**负缓存**,别把一次空结果永久钉死),过期判定在 :mod:`services.place_media`。
+* :class:`PlaceHighlight` —— 一个 POI 的**类别专属要点**(TASK-8a2,详情弹窗用):LLM 按
+  分类出固定字段表(``[{label, value}]``),``place_id`` 唯一 → 重复写是 upsert;
+  **永久缓存**(要点是编辑性内容、没有 TTL),``value=None`` = 该字段待核实,绝不编造。
 * :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
   把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
   报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
@@ -834,3 +837,53 @@ class PlaceMedia(Base):
             f"<PlaceMedia place={self.place_id} {self.source} "
             f"{len(self.images or [])}张 reason={self.reason}>"
         )
+
+
+# --------------------------------------------------------------------------- #
+# 类别专属要点(TASK-8a2):PlaceHighlight
+# --------------------------------------------------------------------------- #
+
+HIGHLIGHT_CATEGORY_LEN = 32
+HIGHLIGHT_NOTE_LEN = 200
+# 单条要点的字段名 / 字段值长度上限(字段名就是 CATEGORY_FIELDS 里的中文标签,值是一句话)
+HIGHLIGHT_LABEL_LEN = 40
+HIGHLIGHT_VALUE_LEN = 400
+
+
+class PlaceHighlight(Base):
+    """一个 POI 的**类别专属要点**(LLM 结构化字段,详情弹窗第 4 块用)。
+
+    与 :class:`PlaceDetail`(2~3 句长介绍)并存但**不共用一行**:介绍是自由文本、要点是
+    按分类固定字段的 ``[{"label", "value"}]``,两者的 prompt、输出预算、渲染方式都不同,
+    分开存就不会出现"要点被当成长介绍渲染"的串味(同 :class:`PlaceDetail` 的分工理由)。
+
+    键口径:``place_id`` **唯一**(与 :class:`PlaceDetail` / :class:`PlaceMedia` 同风格)
+    → 重复写是 upsert。``fields`` 存 ``[{"label", "value"}]``,``value=None`` 表示
+    **该字段查不到**(:data:`services.highlights` 里 note 标「待核实」)—— 宁可留空也
+    **绝不编造**票价 / 雪道数 / 店名。``category`` 存生成当时用的分类名(字段表按它选),
+    ``note`` 存口径说明(「待核实」/「解析失败」),``generated_at`` 是生成时刻。
+
+    **永久缓存**:要点是编辑性内容、不随实时数据变,所以没有 TTL 列(与图片缓存的
+    7 天 / 负缓存口径不同);命中即回、**零 LLM 调用**。生成失败(解析失败 / 没 key /
+    异常)由服务层**不写行**,下次可重试(同 :class:`PlaceDetail` 的降级口径)。
+    旧库靠 ``create_all`` 自动建表,**不迁移存量**。
+    """
+
+    __tablename__ = "place_highlights"
+    __table_args__ = (UniqueConstraint("place_id", name="uq_place_highlight"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    place_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("places.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    category: Mapped[str] = mapped_column(
+        String(HIGHLIGHT_CATEGORY_LEN), nullable=False, default=UNCATEGORIZED
+    )
+    fields: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    note: Mapped[str] = mapped_column(String(HIGHLIGHT_NOTE_LEN), nullable=False, default="")
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<PlaceHighlight place={self.place_id} {self.category} {len(self.fields or [])}项>"

@@ -22,6 +22,9 @@
 * :func:`get_place_media` / :func:`media_map` / :func:`upsert_place_media` —— 目的地图片
   缓存(TASK-8a1):``place_id`` 唯一,重复写是 upsert(刷新图源/图片/``fetched_at`` 即续期);
   TTL 与负缓存口径在 :mod:`services.place_media`,这里只管读写与形状归一。
+* :func:`get_place_highlight` / :func:`highlight_map` / :func:`upsert_place_highlight` ——
+  类别专属要点(TASK-8a2):``place_id`` 唯一,**永久缓存**(无 TTL → 命中即回、零 LLM);
+  ``value=None`` 是合法值(= 待核实),字段表与降级口径在 :mod:`services.highlights`。
 """
 
 from __future__ import annotations
@@ -42,6 +45,10 @@ from .models import (
     COLLECTION_CAT_SOURCES,
     COORD_PRECISION,
     GEOCODER_LEN,
+    HIGHLIGHT_CATEGORY_LEN,
+    HIGHLIGHT_LABEL_LEN,
+    HIGHLIGHT_NOTE_LEN,
+    HIGHLIGHT_VALUE_LEN,
     KIND_PLACE,
     KIND_ROUTE,
     LAT_LIMIT,
@@ -62,6 +69,7 @@ from .models import (
     OriginCache,
     Place,
     PlaceDetail,
+    PlaceHighlight,
     PlaceMedia,
     PlaceRecommendation,
     SegmentFetch,
@@ -1116,5 +1124,100 @@ def upsert_place_media(
     row.page_url = clean_text(page_url, limit=MEDIA_PAGE_URL_LEN)
     row.reason = None if cleaned else media_reason(reason)
     row.fetched_at = utcnow()
+    session.flush()
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# 类别专属要点(TASK-8a2):PlaceHighlight 的读写
+# --------------------------------------------------------------------------- #
+
+
+def _highlight_fields(fields: Any) -> list[dict[str, Any]]:
+    """要点字段归一:``[{"label", "value"}]``,label 为空的条目丢掉(**顺序照调用方给的**)。
+
+    ``value=None`` 是**合法值**(= 该字段查不到,前端按「待核实」弱化显示),不当成脏数据剔除;
+    非字符串的 value(模型偶尔回数字/数组)统一 ``str`` 化后截断,免得 JSON 列里混进怪类型。
+    """
+    cleaned: list[dict[str, Any]] = []
+    for item in fields or []:
+        if not isinstance(item, Mapping):
+            continue
+        label = clean_text(item.get("label"), limit=HIGHLIGHT_LABEL_LEN)
+        if not label:
+            continue
+        raw = item.get("value")
+        if raw is None:
+            value: Optional[str] = None
+        else:
+            value = clean_text(raw if isinstance(raw, str) else str(raw), limit=HIGHLIGHT_VALUE_LEN)
+        cleaned.append({"label": label, "value": value})
+    return cleaned
+
+
+def highlight_to_dict(row: PlaceHighlight) -> dict[str, Any]:
+    """要点缓存行 → API/前端形状(键**恒定**;``generated_at`` 统一 ISO UTC)。"""
+    return {
+        "place_id": int(row.place_id),
+        "category": row.category or UNCATEGORIZED,
+        "fields": _highlight_fields(row.fields),
+        "note": row.note or "",
+        "generated_at": iso_utc(row.generated_at),
+    }
+
+
+def get_place_highlight(session: Session, *, place_id: Any) -> Optional[PlaceHighlight]:
+    """按 ``place_id`` 取一行要点缓存;没有返回 ``None``。
+
+    **永久缓存 → 没有过期判定**:命中即回、零 LLM(与 :func:`get_place_media` 的
+    TTL 口径不同,理由见 :class:`db.models.PlaceHighlight` 的 docstring)。
+    """
+    wanted = _media_place_id(place_id)
+    return session.scalars(
+        select(PlaceHighlight).where(PlaceHighlight.place_id == wanted)
+    ).first()
+
+
+def highlight_map(session: Session, place_ids: Iterable[Any]) -> dict[int, PlaceHighlight]:
+    """批量取要点缓存行 → ``{place_id: 行}``(一次查询,给 API 的 batch 用)。"""
+    wanted: list[int] = []
+    for item in place_ids or []:
+        try:
+            resolved = _media_place_id(item)
+        except ValueError:
+            continue
+        if resolved not in wanted:
+            wanted.append(resolved)
+    if not wanted:
+        return {}
+    rows = session.scalars(select(PlaceHighlight).where(PlaceHighlight.place_id.in_(wanted)))
+    return {int(row.place_id): row for row in rows}
+
+
+def upsert_place_highlight(
+    session: Session,
+    *,
+    place_id: Any,
+    fields: Any = None,
+    category: Any = None,
+    note: Any = None,
+) -> PlaceHighlight:
+    """写入/刷新一个 POI 的类别专属要点(唯一键 = ``place_id``,重复写只刷新内容与时间戳)。
+
+    ``fields`` 按 :func:`_highlight_fields` 归一(``value=None`` 保留 = 待核实);``category``
+    空值兜 :data:`UNCATEGORIZED`。只 ``flush`` 不 ``commit``:提交时机交给调用方
+    (与 :func:`upsert_place_media` 一致)。**生成失败的空要点由服务层决定不写行**
+    (下次可重试),这里不做拦截。
+    """
+    wanted = _media_place_id(place_id)
+    cleaned = _highlight_fields(fields)
+    row = get_place_highlight(session, place_id=wanted)
+    if row is None:
+        row = PlaceHighlight(place_id=wanted)
+        session.add(row)
+    row.category = clean_text(category, limit=HIGHLIGHT_CATEGORY_LEN) or UNCATEGORIZED
+    row.fields = cleaned
+    row.note = clean_text(note, limit=HIGHLIGHT_NOTE_LEN)
+    row.generated_at = utcnow()
     session.flush()
     return row

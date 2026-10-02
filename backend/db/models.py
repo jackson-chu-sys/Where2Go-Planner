@@ -887,3 +887,74 @@ class PlaceHighlight(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
         return f"<PlaceHighlight place={self.place_id} {self.category} {len(self.fields or [])}项>"
+
+
+# --------------------------------------------------------------------------- #
+# AI 对话式行程规划(TASK-10a):PlannerSession / PlannerMessage
+# --------------------------------------------------------------------------- #
+
+SESSION_KEY_LEN = 64
+PLANNER_TITLE_LEN = 120
+PLANNER_ROLE_LEN = 16
+PLANNER_ROLES: tuple[str, ...] = ("user", "assistant")
+
+
+class PlannerSession(Base):
+    """一次「🤖 AI 行程」多轮对话(TASK-10a,M4.09 修订⑦:阶段 A = 只排每天的目的地)。
+
+    键口径:``session_key`` **唯一 + 索引**(前端生成/后端补发的 ``uuid4().hex``,存
+    ``localStorage`` 刷新不丢对话);同一 key 再来一轮 = **复用同一行**(只顶 ``updated_at``),
+    空 key 才新建 —— 与 :class:`Collection` / :class:`TripPlan` 的 upsert 幂等口径一致。
+    ``title`` 取首轮用户消息的前若干字(列表/回放时好认),不是唯一键。
+
+    **故意不建外键**:消息行按 ``session_id`` 引用本表,清空对话(:func:`services.planner.clear_session`)
+    只删消息、保留会话行,这样 ``session_key`` 依然可用(前端不必换 key 重开一轮)。
+    旧库靠 ``create_all`` 自动建表,**不迁移存量**。
+    """
+
+    __tablename__ = "planner_sessions"
+    __table_args__ = (UniqueConstraint("session_key", name="uq_planner_session_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_key: Mapped[str] = mapped_column(
+        String(SESSION_KEY_LEN), nullable=False, unique=True, index=True
+    )
+    title: Mapped[str] = mapped_column(String(PLANNER_TITLE_LEN), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<PlannerSession {self.id} {self.session_key[:8]}… {self.title!r}>"
+
+
+class PlannerMessage(Base):
+    """AI 行程对话里的一条消息(用户一轮 / 助手一轮),多轮上下文的**唯一事实源**。
+
+    ``role`` 只认 :data:`PLANNER_ROLES`(``user`` / ``assistant``);``content`` 是给用户看的
+    中文文本(助手轮 = 行程摘要或降级兜底文案),``payload`` 存**结构化行程**
+    (:func:`services.planner.parse_itinerary` 的产物 + ``degraded`` / ``reason``),
+    前端回放时据它重画行程卡片,降级时据它显示可见原因(**绝不静默**)。
+
+    ``session_id`` 索引但**不建外键**(同 :class:`TripPlan` 引用 ``Collection`` 的理由):
+    删会话不该因为一条孤儿消息而报错。送进 prompt 的历史只取最近
+    :data:`services.planner.HISTORY_LIMIT` 条,所以这里不需要额外的截断列。
+    """
+
+    __tablename__ = "planner_messages"
+    __table_args__ = (Index("ix_planner_message_session", "session_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(PLANNER_ROLE_LEN), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性
+        return f"<PlannerMessage {self.id} s{self.session_id} {self.role} {len(self.content or '')}字>"

@@ -188,7 +188,11 @@
   /* AI 推荐 + 地图下方列表(TASK-FE 功能2/3):推荐 pin 更大更醒目,列表里推荐条置顶 */
   .pin.reco{width:34px;height:34px;border:3px solid #f59e0b;box-shadow:0 2px 9px rgba(0,0,0,.5)}
   .pin.reco span{font-size:15px}
-  .pl-row{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:8px;background:#fff}
+  /* 整行可点开详情弹窗(TASK-8b):给指针与键盘焦点态;行内按钮各自 stopPropagation */
+  .pl-row{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:8px;background:#fff;
+          cursor:pointer}
+  .pl-row:hover{border-color:#5eead4}
+  .pl-row:focus-visible{outline:2px solid #0f766e;outline-offset:2px}
   .pl-row.reco{border-color:#fcd34d;background:#fffbeb}
   /* 「📄 查看详情」把这一行滚进视野后短暂高亮一下(1.6s 后自动去掉) */
   .pl-row.pl-focus{border-color:#0f766e;box-shadow:0 0 0 2px #99f6e4}
@@ -210,6 +214,49 @@
   .fp-kid-ttl{font-size:12px;font-weight:700;color:#0f766e;margin-top:8px}
   .fp-kids .fp-item{border-style:dashed;background:#fcfefd}
   .fp-orphan-note{color:#9ca3af;font-size:11px;margin-top:4px}
+  /* 目的地详情弹窗(TASK-8b):遮罩 + 居中白盒,风格与 #favPanel 一致(不引第三方 CSS/JS)。
+     z-index 高于收藏弹层(2000)与路线面板(1000);Esc 也按「详情弹窗 → 收藏弹层 → 路线面板」逐层收。 */
+  .modal-mask{position:fixed;top:0;left:0;right:0;bottom:0;z-index:2100;overflow:auto;
+              background:rgba(15,23,42,.45);padding:0 16px;box-sizing:border-box}
+  .modal-mask[hidden]{display:none}
+  body.pm-lock{overflow:hidden}
+  .pm-box{background:#fff;max-width:620px;width:100%;margin:6vh auto;border-radius:12px;
+          padding:14px 16px;box-shadow:0 8px 30px rgba(0,0,0,.3);box-sizing:border-box}
+  .pm-head{margin-top:7px}
+  .pm-top{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  /* 类别 badge 与 pin 同色:.cat 的样式原本只在 .pop 里,弹窗内补一份同观感的 */
+  .pm-head .cat{display:inline-block;color:#fff;font-size:12px;padding:1px 8px;border-radius:10px}
+  .pm-sec{margin-top:12px;border-top:1px solid #e5e7eb;padding-top:9px}
+  .pm-sec-ttl{font-weight:700;font-size:13px;color:#0f766e;display:flex;gap:6px;align-items:center;
+              flex-wrap:wrap}
+  .pm-cnt{font-weight:400;color:#9ca3af;font-size:11px}
+  .pm-sub{color:#6b7280;font-size:11px;line-height:1.55;margin-top:5px}
+  .pm-empty{color:#9ca3af;font-size:13px;font-style:italic;margin-top:6px}
+  /* 骨架态:图片/要点在飞时先给灰块占位 + 「加载中…」文案(不做动画,免得闪屏/抢焦点) */
+  .pm-skel{background:#eef2f4;border-radius:10px;color:#9ca3af;font-size:12px;padding:8px 10px;margin-top:6px}
+  .pm-skel-hero{height:180px;display:flex;align-items:center;justify-content:center}
+  .pm-skel-line{height:12px;background:#eef2f4;border-radius:6px;margin-top:6px}
+  .pm-hero{display:block;width:100%;max-height:280px;object-fit:cover;border-radius:10px;
+           background:#f3f4f6;margin-top:6px}
+  .pm-thumbs{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+  .pm-thumb{width:66px;height:48px;padding:0;border:2px solid #e5e7eb;border-radius:8px;
+            background:#f3f4f6;overflow:hidden;cursor:pointer}
+  .pm-thumb.sel{border-color:#0f766e}
+  .pm-thumb img{display:block;width:100%;height:100%;object-fit:cover}
+  .pm-src-line{color:#6b7280;font-size:11px;margin-top:7px}
+  .pm-src-line a{color:#0f766e}
+  .pm-fields{margin-top:6px}
+  .pm-field{display:flex;gap:8px;align-items:flex-start;margin-top:6px;font-size:13px}
+  .pm-k{flex:0 0 96px;color:#6b7280;font-size:12px}
+  .pm-v{flex:1;color:#1f2937;line-height:1.55}
+  .pm-todo{color:#9ca3af;font-style:italic}   /* 要点 value=null → 「待核实」弱化样式 */
+  .pm-acts{margin-top:12px;border-top:1px solid #e5e7eb;padding-top:9px;
+           display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .pm-acts .pop-go{flex:1 1 auto}
+  /* 来源脚注复用 identityHtml()(它原本是 .pop 里的样式),在弹窗里补一份同观感的 */
+  .pm-box .src,.pm-box .osm{margin-top:10px;border-top:1px dashed #e5e7eb;padding-top:6px;font-size:11px}
+  .pm-box .src{color:#0f766e}
+  .pm-box .osm{color:#9ca3af}
   @media (max-width:680px){
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
@@ -374,6 +421,32 @@
       </div>
     </div>
   </div>
+  <!-- 目的地详情弹窗(TASK-8b):两个入口共用这一个居中 modal ——
+       ① 地图 pin 的 InfoWindow(popupHtml)里的「📄 查看详情」.js-detail-modal;
+       ② 地图下方列表 .pl-row **整行可点**(行内既有按钮一律 stopPropagation)。
+       Esc / 点遮罩空白处 / ✕ 关闭;打开时记住来源焦点、关闭时归还。
+       图片(GET /api/places/media)与类别专属要点(GET /api/places/highlights)都是
+       **打开弹窗时才**按 place_ids 拉,加载中给骨架态;缺图给「暂无图片」+ reason,不编造 URL。 -->
+  <div id="placeModal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="placeModalTitle" hidden>
+    <div class="pm-box">
+      <div class="rp-head">
+        <div class="rp-ttl" id="placeModalTitle">📄 目的地详情</div>
+        <button type="button" id="placeModalClose" class="rp-x" title="关闭详情弹窗(Esc / 点遮罩空白处)">✕</button>
+      </div>
+      <!-- ① 类别 badge(与 pin 同色)+ 距起点 / 分段 -->
+      <div class="pm-head" id="placeModalHead"></div>
+      <!-- ② 图片区:主图 + 缩略图条 + 图源标注(+ 维基页外链) -->
+      <div class="pm-sec" id="placeModalMedia"></div>
+      <!-- ③ 详细介绍:复用 detailTextOf();缺则「生成介绍」沿用 /api/places/details -->
+      <div class="pm-sec" id="placeModalDetail"></div>
+      <!-- ④ 类别专属要点:自然/人文美食/滑雪/运动各自的固定字段表,value=null 显示「待核实」 -->
+      <div class="pm-sec" id="placeModalHighlights"></div>
+      <!-- ⑤ 动作行:⭐收藏 + 🚗 路线 / 🛏️ 住宿(复用既有 js-place-fav / js-routes 委托) -->
+      <div class="pm-acts" id="placeModalActs"></div>
+      <!-- ⑥ 来源脚注:复用 identityHtml() -->
+      <div id="placeModalSource"></div>
+    </div>
+  </div>
 </main>
 <footer>
   Where2Go 阶段2b · 地图:高德 JS API 2.0(底图与 POI 同源、坐标 GCJ-02;JS key 与安全密钥由
@@ -474,6 +547,8 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
                    busy:false,auto:true,token:0,detailToken:0},
              list:{reco:0,other:0},
              tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false},
+             // 详情弹窗(TASK-8b):token 守卫在飞的 media/highlights 响应;lastFocus 用于关闭后归还焦点
+             modal:{open:false,place:null,index:-1,images:[],hero:0,token:0,lastFocus:null},
              mapNote:""};   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
 // 高德覆盖物句柄:rings/pins/routeLayer 是**数组**(高德没有 Leaflet 的 layerGroup,
 // 清图层 = clearOverlays() 逐个 setMap(null));infoWindow 承载 popupHtml(),hoverTip 代替 bindTooltip。
@@ -703,9 +778,11 @@ function popupHtml(place,index){
     '<div class="acts">'+placeFavButtonHtml(place,index)+
       '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+
       '" title="重新拉一次 /api/routes 并跳到路线面板">🚗 路线对比(时长 / 费用 / 跳转)</button>'+
+      '<button type="button" class="pop-go js-detail-modal" data-i="'+Number(index)+
+      '" title="打开详情弹窗:图片(标图源)+ 详细介绍 + 类别专属要点 + 🚗路线/🛏️住宿/⭐收藏入口">'+
+      "📄 查看详情</button>"+
       '<button type="button" class="pop-go js-place-detail" data-id="'+Number(place.id)+
-      '" title="跳到地图下方列表里的这一条(长介绍 / 收藏 / 路线入口都在那儿;详情弹窗由 TASK-8b 接上)">'+
-      "📄 查看详情</button></div>"+
+      '" title="跳到地图下方列表里的这一条(长介绍 / 收藏 / 路线入口都在那儿)">📍 定位到列表行</button></div>'+
     identityHtml(place)+"</div>";
 }
 
@@ -1341,8 +1418,8 @@ function onDocumentClick(event){
     }
     return;
   }
-  // 「📄 查看详情」(popup 内,TASK-9d):跳到地图下方列表里的这一行并高亮;
-  // TASK-8b 的详情弹窗(图片/类别要点)会接在同一个 class 上,前端不用改调用点。
+  // 「📍 定位到列表行」(popup 内,TASK-9d):跳到地图下方列表里的这一行并高亮。
+  // 详情弹窗(TASK-8b)走**另一个** class(.js-detail-modal),两者互不影响。
   const detailJump=target.closest(".js-place-detail");
   if(detailJump){
     event.stopPropagation();
@@ -1358,10 +1435,25 @@ function onDocumentClick(event){
   }
   const popupButton=target.closest(".js-routes");
   if(popupButton){
+    event.stopPropagation();   // 列表整行可点后(TASK-8b):行内按钮一律不冒泡到行点击
     const place=state.places[Number(popupButton.getAttribute("data-i"))];
     if(place) openRoutePanel(place,{scroll:true});
     return;
   }
+  // 「📄 查看详情」(TASK-8b):popup 里的入口,与列表整行点击共用同一个 openPlaceModal
+  const modalButton=target.closest(".js-detail-modal");
+  if(modalButton){
+    event.stopPropagation();
+    const index=Number(modalButton.getAttribute("data-i"));
+    const place=state.places[index];
+    if(place) openPlaceModal(place,index);
+    else showNote("这一条已经不在当前列表里(可能换了分段/分类或重新抓取过):刷新后再点一次。",true);
+    return;
+  }
+  // 列表整行可点(TASK-8b):行内 .js-place-fav / .js-routes / .js-detail-gen 都已在上面拦截并
+  // stopPropagation,所以走到这里的一定是行的空白处 → 开同一个详情弹窗(既有行为零回归)。
+  const rowTarget=target.closest("#placeListBody .pl-row");
+  if(rowTarget){openPlaceModalFromRow(rowTarget);return;}
   if(target.closest("#routePanel a")) return;   // 跳转链接自己开新页,不算选卡片
   const card=target.closest("#routeCards .rcard");
   if(card) selectRouteMode(card.getAttribute("data-mode"),true);
@@ -1370,6 +1462,8 @@ function onDocumentClick(event){
 // 键盘可达:Enter/空格选中卡片(画线),Esc 关弹层/面板清线
 function onDocumentKeydown(event){
   if(event.key==="Escape"){
+    // 层级(TASK-8b):详情弹窗开着先关它,再关收藏弹层,最后才是路线面板(既有口径不变)
+    if(state.modal.open){closePlaceModal();return;}
     if(state.fav.open){closeFavPanel();return;}   // 先关收藏弹层,再关路线面板
     closeRoutePanel();return;
   }
@@ -1377,6 +1471,9 @@ function onDocumentKeydown(event){
   const target=event.target;
   if(!target||!target.closest) return;
   if(target.closest("button")) return;   // 按钮自己响应 Enter/空格(收藏/取消收藏),不当成选卡片
+  // 列表整行 tabindex=0:Enter/空格与鼠标点击同口径开详情弹窗(TASK-8b)
+  const row=target.closest("#placeListBody .pl-row");
+  if(row){event.preventDefault();openPlaceModalFromRow(row);return;}
   const card=target.closest("#routeCards .rcard");
   if(!card) return;
   event.preventDefault();
@@ -1923,7 +2020,11 @@ function placeRowHtml(place,index,isReco){
     '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+'"'+
     ' title="打开路线面板:驾车/铁路/飞机对比 + 周边住宿(路线与住宿可分别收藏,挂在目的地下面)">'+
     "🚗 路线 / 🛏️ 住宿</button></div>";
-  return '<div class="pl-row'+(isReco?" reco":"")+'" data-id="'+Number(place.id)+'">'+
+  // 整行可点开详情弹窗(TASK-8b):data-i 是 state.places 的序号(与 popup 按钮同口径),
+  // data-id 仍是 POI id(focusPlaceRow / updateDetailCells 用它定位行);行内按钮各自 stopPropagation。
+  return '<div class="pl-row'+(isReco?" reco":"")+'" data-id="'+Number(place.id)+'" '+
+    'data-i="'+Number(index)+'" tabindex="0" aria-haspopup="dialog" '+
+    'title="点开详情弹窗:图片 / 详细介绍 / 类别专属要点 / 🚗路线 🛏️住宿 ⭐收藏">'+
     head+reason+body+acts+"</div>";
 }
 
@@ -2028,6 +2129,7 @@ function updateDetailCells(items){
       cell.textContent=text;
     });
   });
+  syncPlaceModalDetail();   // 详情弹窗正开着同一条时,新生成的长介绍也补进弹窗(TASK-8b)
 }
 function detailReasonText(payload){
   const reason=String((payload&&payload.reason)||"");
@@ -2944,6 +3046,286 @@ function renderBookSection(){
   section.style.display="block";
 }
 
+// --------------------------------------------------------------------------- //
+// 目的地详情弹窗(TASK-8b):两个入口共用一个居中 modal ——
+//   ① 地图 pin 的 InfoWindow(popupHtml)里的「📄 查看详情」.js-detail-modal;
+//   ② 地图下方列表 .pl-row **整行可点**(行内既有按钮一律 stopPropagation)。
+// 内容顺序:①标题/类别 badge(与 pin 同色)/距起点 · 分段 → ②图片区 → ③详细介绍 →
+//   ④类别专属要点 → ⑤动作行(🚗路线 / 🛏️住宿 / ⭐收藏)→ ⑥来源脚注(identityHtml)。
+// 图片与要点都是**打开弹窗时才**按 place_ids 拉一条(batch 接口,单条也走同一套参数口径),
+// 加载中给骨架态;token 守卫:关窗或换条目后在飞的响应一律作废。
+// 缺图/缺要点只降级文案(标 reason、标图源),**绝不编造图片 URL 或票价/雪道数/店名**;
+// 全程不新增前端 key(图片与要点都由后端持 key 触网)。
+// --------------------------------------------------------------------------- //
+const PLACE_MEDIA_API="/api/places/media";
+const PLACE_HIGHLIGHTS_API="/api/places/highlights";
+const MODAL_LOADING_TEXT="加载中…";
+const MODAL_NO_IMAGE_TEXT="暂无图片";
+const MODAL_TODO_TEXT="待核实";
+const MODAL_STALE_HINT="这一条已经不在当前列表里(可能换了分段/分类或重新抓取过):刷新后再点一次。";
+// 图源必须标注:amap = 只有高德图、wikimedia = 只有维基图、mixed = 两边都有、none = 没图
+const MEDIA_SOURCE_LABEL={amap:"图源:高德",wikimedia:"图源:维基百科",
+  mixed:"图源:高德 + 维基百科",none:"图源:无(暂无图片)"};
+// 没图时的 reason 三档(no_key / no_data / error),每档都给可操作的中文下一步
+const MEDIA_REASON_TEXT={
+  no_key:"后端未配置 WHERE2GO_AMAP_KEY(配好并重启后端即可出图)",
+  no_data:"高德 POI 图与维基/Commons 都没有这个目的地的图片",
+  error:"图片数据源本次报错(关掉弹窗稍后重开可重试)"};
+const MEDIA_REASON_FALLBACK="后端没给 reason(按「暂无图片」处理)";
+const HIGHLIGHT_EMPTY_TEXT="这条目的地暂时没有类别专属要点";
+const HIGHLIGHT_FOOTER="要点由 LLM 按分类固定字段表生成、按 POI 永久缓存;查不到的字段显示「待核实」,"+
+  "不编造票价 / 雪道数 / 店名。";
+
+function mediaSourceLabel(source){
+  const key=String(source||"none");
+  return MEDIA_SOURCE_LABEL[key]||("图源:"+key);
+}
+function mediaReasonText(reason){
+  const key=String(reason||"");
+  return MEDIA_REASON_TEXT[key]||MEDIA_REASON_FALLBACK;
+}
+function setModalSection(id,html){
+  const box=$(id);
+  if(box) box.innerHTML=html;
+  return box;
+}
+// 骨架态:图片/要点在飞时先占位(灰块 + 「加载中…」),响应到了就地替换,不整窗重渲染
+function modalMediaLoadingHtml(){
+  return '<div class="pm-sec-ttl">🖼️ 图片<span class="pm-cnt">'+esc(MODAL_LOADING_TEXT)+"</span></div>"+
+    '<div class="pm-skel pm-skel-hero">'+esc(MODAL_LOADING_TEXT)+"(正在拉图片)</div>"+
+    '<div class="pm-skel-line"></div>'+
+    '<div class="pm-sub">高德 POI 图为主 + 维基/Commons 兜底:命中库缓存约 1s,冷条目要触网约 1-3s。</div>';
+}
+function modalHighlightsLoadingHtml(){
+  return '<div class="pm-sec-ttl">🔎 类别专属要点<span class="pm-cnt">'+esc(MODAL_LOADING_TEXT)+"</span></div>"+
+    '<div class="pm-skel">'+esc(MODAL_LOADING_TEXT)+"(按分类固定字段表生成)</div>"+
+    '<div class="pm-skel-line"></div><div class="pm-skel-line"></div>';
+}
+// 空/失败 → 「暂无图片」+ reason 文案(no_key / no_data / error 分档)
+function modalMediaEmptyHtml(reason){
+  const key=String(reason||"");
+  return '<div class="pm-sec-ttl">🖼️ 图片</div>'+
+    '<div class="pm-empty">'+esc(MODAL_NO_IMAGE_TEXT)+"</div>"+
+    '<div class="pm-sub">'+esc(mediaReasonText(key))+(key?(" · reason="+esc(key)):"")+"</div>";
+}
+function modalThumbHtml(image,position){
+  const tip=(image.title?(String(image.title)+" · "):"")+mediaSourceLabel(image.source);
+  return '<button type="button" class="pm-thumb js-media-thumb'+(Number(position)?"":" sel")+'" '+
+    'data-n="'+Number(position)+'" title="'+esc(tip)+'">'+
+    '<img src="'+esc(image.url)+'" alt="'+esc(image.title||"目的地图片")+'"></button>';
+}
+// 图片区:主图 + 缩略图条 + **图源标注**(+ 有 page_url 时给维基页外链,新页打开不带 referrer)
+function modalMediaHtml(item){
+  const images=((item&&item.images)||[]).filter(image=>image&&image.url);
+  if(!images.length) return modalMediaEmptyHtml(item&&item.reason);
+  state.modal.images=images;
+  state.modal.hero=0;
+  const source=String((item&&item.source)||"none");
+  const page=(item&&item.page_url)?String(item.page_url):"";
+  return '<div class="pm-sec-ttl">🖼️ 图片<span class="pm-cnt">'+images.length+" 张 · source="+
+      esc(source)+(item&&item.cached?" · 命中库缓存(7 天)":" · 本次新拉")+"</span></div>"+
+    '<img class="pm-hero" id="pmHero" src="'+esc(images[0].url)+'" '+
+      'alt="'+esc(images[0].title||"目的地图片")+'">'+
+    (images.length>1?('<div class="pm-thumbs">'+images.map(modalThumbHtml).join("")+"</div>"):"")+
+    '<div class="pm-src-line">'+esc(mediaSourceLabel(source))+
+      (page?(' · <a href="'+esc(page)+'" target="_blank" rel="noopener noreferrer">维基页面 ↗</a>'):"")+
+      " · 图片版权归原作者,本页只展示不代管</div>";
+}
+// 图片加载失败(热链失效/防盗链)= 只把这一张隐藏,不弹窗、不抛错、不牵连其余图与其余区块
+function bindModalImageErrors(box){
+  if(!box||!box.querySelectorAll) return;
+  box.querySelectorAll("img").forEach(image=>{
+    image.addEventListener("error",()=>{image.style.display="none";});
+  });
+}
+function renderModalMedia(item){
+  bindModalImageErrors(setModalSection("placeModalMedia",modalMediaHtml(item)));
+}
+function renderModalMediaError(error){
+  setModalSection("placeModalMedia",modalMediaEmptyHtml("error")+
+    '<div class="pm-sub">图片接口失败:'+esc((error&&error.message)||error)+
+    "(GET "+esc(PLACE_MEDIA_API)+";详细介绍与类别要点不受影响)</div>");
+}
+// 要点:value=null → 「待核实」弱化样式;note 原样透出(后端会在里面标「待核实」/「解析失败」)
+function modalFieldHtml(field){
+  const raw=(field&&field.value);
+  const has=(raw!==null&&raw!==undefined&&String(raw).trim());
+  return '<div class="pm-field"><span class="pm-k">'+esc((field&&field.label)||"")+"</span>"+
+    '<span class="pm-v">'+(has?esc(raw):('<span class="pm-todo">'+esc(MODAL_TODO_TEXT)+"</span>"))+
+    "</span></div>";
+}
+function modalHighlightsTitleHtml(item){
+  const category=String((item&&item.category)||"");
+  return '<div class="pm-sec-ttl">🔎 类别专属要点'+(category
+    ? ('<span class="pm-cnt">'+esc(category)+(item&&item.cached?" · 永久缓存命中":"")+"</span>")
+    : (item&&item.cached?'<span class="pm-cnt">永久缓存命中</span>':""))+"</div>";
+}
+function modalHighlightsHtml(item){
+  const fields=((item&&item.fields)||[]).filter(field=>!!field);
+  const note=(item&&item.note)?String(item.note):"";
+  if(!fields.length){
+    return modalHighlightsTitleHtml(item)+'<div class="pm-empty">'+esc(HIGHLIGHT_EMPTY_TEXT)+"</div>"+
+      (note?('<div class="pm-sub">'+esc(note)+"</div>"):"");
+  }
+  return modalHighlightsTitleHtml(item)+
+    '<div class="pm-fields">'+fields.map(modalFieldHtml).join("")+"</div>"+
+    (note?('<div class="pm-sub">'+esc(note)+"</div>"):"")+
+    '<div class="pm-sub">'+esc(HIGHLIGHT_FOOTER)+"</div>";
+}
+function renderModalHighlights(item){
+  setModalSection("placeModalHighlights",item
+    ? modalHighlightsHtml(item)
+    : ('<div class="pm-sec-ttl">🔎 类别专属要点</div><div class="pm-empty">'+
+       esc(HIGHLIGHT_EMPTY_TEXT)+"</div>"));
+}
+function renderModalHighlightsError(error){
+  setModalSection("placeModalHighlights",'<div class="pm-sec-ttl">🔎 类别专属要点</div>'+
+    '<div class="pm-empty">'+esc(HIGHLIGHT_EMPTY_TEXT)+"</div>"+
+    '<div class="pm-sub">要点接口失败:'+esc((error&&error.message)||error)+
+    "(GET "+esc(PLACE_HIGHLIGHTS_API)+";图片与详细介绍不受影响)</div>");
+}
+// batch 响应里按入参顺序回,单条也照同一套解析:优先取 place_id 对得上的那条
+function modalItemOf(payload,placeId){
+  const items=(payload&&Array.isArray(payload.items))?payload.items:[];
+  const wanted=Number(placeId);
+  return items.filter(item=>item&&Number(item.place_id)===wanted)[0]||items[0]||null;
+}
+// 打开弹窗时才拉:place_ids= 单条(后端 batch 上限 media 20 / highlights 10,单条远在限内)
+async function loadPlaceMedia(placeId,token){
+  const id=Number(placeId);
+  if(!isFinite(id)||id<=0){renderModalMedia({images:[],reason:"no_data"});return;}
+  try{
+    const payload=await getJSON(PLACE_MEDIA_API+"?place_ids="+id);
+    if(token!==state.modal.token) return;   // 已关窗/已换条目:作废过期响应
+    renderModalMedia(modalItemOf(payload,id));
+  }catch(error){
+    if(token!==state.modal.token) return;
+    renderModalMediaError(error);
+  }
+}
+async function loadPlaceHighlights(placeId,token){
+  const id=Number(placeId);
+  if(!isFinite(id)||id<=0){renderModalHighlights(null);return;}
+  try{
+    const payload=await getJSON(PLACE_HIGHLIGHTS_API+"?place_ids="+id);
+    if(token!==state.modal.token) return;
+    renderModalHighlights(modalItemOf(payload,id));
+  }catch(error){
+    if(token!==state.modal.token) return;
+    renderModalHighlightsError(error);
+  }
+}
+// ① 标题 + 类别 badge(与 pin 同色,复用 categoryMeta)+ 距起点 / 分段
+function modalHeadHtml(place){
+  const meta=categoryMeta(place.category);
+  const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
+  const km=num(place.distance_km);
+  return '<div class="pm-top">'+
+    '<span class="cat" style="background:'+meta.color+'">'+meta.emoji+" "+esc(meta.label)+"</span>"+
+    '<span class="pl-km">距起点直线 '+esc(isFinite(km)?fmtKm(km):"—")+" · 分段 "+esc(bandLabel)+"</span></div>"+
+    (meta.blurb?('<div class="pm-sub">'+esc(meta.blurb)+"</div>"):"")+
+    (place.intro?('<div class="pm-sub">一句话简介:'+esc(place.intro)+"</div>"):"")+
+    (place.reason?('<div class="pl-reason">推荐理由:'+esc(place.reason)+"</div>"):"");
+}
+// ③ 详细介绍:复用 detailTextOf()(长介绍缓存/推荐响应带回的都用得上);缺则给「生成介绍」按钮,
+//    class 沿用 .js-detail-gen → 既有委托直接调 /api/places/details?place_ids=…,零新增链路
+function modalDetailHtml(place){
+  const text=detailTextOf(place);
+  return '<div class="pm-sec-ttl">📖 详细介绍</div>'+
+    (text
+      ? ('<div class="pl-detail">'+esc(text)+"</div>")
+      : ('<div class="pl-detail empty">长介绍(2~3 句)还没生成'+
+         '<button type="button" class="pl-gen js-detail-gen" data-id="'+Number(place.id)+'"'+
+         ' title="只为这一条调 LLM 生成重点介绍(GET /api/places/details?place_ids=…)">生成介绍</button></div>'));
+}
+// ⑤ 动作行:⭐收藏复用 placeFavButtonHtml(与 popup/列表同源判定),🚗路线/🛏️住宿复用 .js-routes
+function modalActsHtml(place,index){
+  return placeFavButtonHtml(place,index)+
+    '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+'"'+
+    ' title="打开路线面板:🚗 驾车/铁路/飞机对比 + 🛏️ 周边住宿(点它会自动关掉本弹窗,免得挡住面板)">'+
+    "🚗 路线 / 🛏️ 住宿</button>";
+}
+// 「生成介绍」写完库后,弹窗里那一段就地补上(与列表 .pl-detail 同源,都读 detailTextOf)
+function syncPlaceModalDetail(){
+  const place=state.modal.place;
+  if(!state.modal.open||!place) return;
+  setModalSection("placeModalDetail",modalDetailHtml(place));
+}
+function openPlaceModal(place,index){
+  if(!place) return;
+  const modal=$("placeModal");
+  if(!modal) return;
+  const at=(Number(index)>=0)?Number(index):ensurePlaceRow(place);
+  if(!state.modal.open) state.modal.lastFocus=document.activeElement||null;   // 记住来源焦点
+  state.modal.token+=1;
+  const token=state.modal.token;
+  state.modal.open=true;
+  state.modal.place=place;
+  state.modal.index=at;
+  state.modal.images=[];
+  state.modal.hero=0;
+  $("placeModalTitle").textContent="📄 "+(place.name||"(无名)");
+  setModalSection("placeModalHead",modalHeadHtml(place));
+  setModalSection("placeModalMedia",modalMediaLoadingHtml());          // 骨架态
+  setModalSection("placeModalDetail",modalDetailHtml(place));
+  setModalSection("placeModalHighlights",modalHighlightsLoadingHtml());// 骨架态
+  setModalSection("placeModalActs",modalActsHtml(place,at));
+  setModalSection("placeModalSource",identityHtml(place));             // ⑥ 来源脚注
+  modal.hidden=false;
+  document.body.classList.add("pm-lock");      // 背景不跟着滚
+  syncPlaceFavButtons();                       // ⭐ 与 popup/列表同一套「已收藏」判定
+  const close=$("placeModalClose");
+  if(close) close.focus();                     // 焦点进弹窗;关闭时归还来源元素
+  loadPlaceMedia(place.id,token);              // 打开弹窗时才拉图片
+  loadPlaceHighlights(place.id,token);         // 与类别要点(两者各自独立降级)
+}
+function closePlaceModal(){
+  state.modal.token+=1;      // 作废在飞的 media / highlights 响应
+  state.modal.open=false;
+  state.modal.place=null;
+  state.modal.images=[];
+  state.modal.hero=0;
+  const modal=$("placeModal");
+  if(modal) modal.hidden=true;
+  document.body.classList.remove("pm-lock");
+  const back=state.modal.lastFocus;
+  state.modal.lastFocus=null;
+  if(back&&back.focus&&document.contains(back)) back.focus();   // 归还来源焦点(元素没了就静默)
+}
+// 列表整行 → 同一个弹窗:data-i 就是 state.places 的序号(与 popup 按钮同口径)
+function openPlaceModalFromRow(row){
+  const index=Number(row?row.getAttribute("data-i"):-1);
+  const place=(state.places||[])[index];
+  if(!place){showNote(MODAL_STALE_HINT,true);return;}
+  openPlaceModal(place,index);
+}
+// 弹窗内的点击(比 document 委托先触发):遮罩空白处关闭、缩略图切主图、
+// 「🚗 路线 / 🛏️ 住宿」先关窗(否则面板被遮罩挡住)—— 关窗后事件继续冒泡,
+// 既有的 .js-routes → openRoutePanel 委托照常执行,路线/住宿交互零改动。
+function onPlaceModalClick(event){
+  const target=event.target;
+  if(!target||!target.closest) return;
+  if(target===$("placeModal")){closePlaceModal();return;}   // 点遮罩关闭
+  const thumb=target.closest("#placeModalMedia .js-media-thumb");
+  if(thumb){selectModalImage(thumb.getAttribute("data-n"));return;}
+  if(target.closest("#placeModalActs .js-routes")){closePlaceModal();return;}
+}
+// 缩略图切主图:只换 src/alt 与选中态,不重拉接口
+function selectModalImage(position){
+  const image=(state.modal.images||[])[Number(position)];
+  if(!image) return;
+  state.modal.hero=Number(position);
+  const hero=$("pmHero");
+  if(hero){
+    hero.style.display="";      // 之前那张可能因加载失败被隐藏过,换图时恢复
+    hero.src=image.url;
+    hero.alt=image.title||"目的地图片";
+  }
+  document.querySelectorAll("#placeModalMedia .js-media-thumb").forEach(thumb=>{
+    thumb.classList.toggle("sel",Number(thumb.getAttribute("data-n"))===Number(position));
+  });
+}
+
 $("goCity").addEventListener("click",()=>searchCity($("city").value));
 $("locate").addEventListener("click",locateMe);
 $("city").addEventListener("keydown",event=>{if(event.key==="Enter") searchCity($("city").value);});
@@ -2984,6 +3366,10 @@ $("stayRetry").addEventListener("click",()=>{
   state.stays.token+=1;
   openStaySection(place,state.stays.token);   // 住宿失败重试:清缓存重拉 /api/stays
 });
+// 详情弹窗(TASK-8b):✕ 与遮罩空白处关闭(Esc 在 onDocumentKeydown 里按层级收);
+// 缩略图切主图、「🚗 路线 / 🛏️ 住宿」先关窗也走 onPlaceModalClick。
+$("placeModal").addEventListener("click",onPlaceModalClick);
+$("placeModalClose").addEventListener("click",closePlaceModal);
 document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);
 

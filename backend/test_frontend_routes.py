@@ -1555,3 +1555,236 @@ def test_map_config_env_names_match_frontend(html: str) -> None:
     assert ENV_JS_KEY in html and ENV_SECURITY_CODE in html, "降级文案要说清配哪两个 env"
     assert "_AMapSecurityConfig" in places_api.MAP_CONFIG_NOTE, "note 要说清安全密钥必须先于脚本写好"
     assert "/api/map-config" in html, "页面文案里要指到 /api/map-config"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-8b:目的地详情弹窗(#placeModal)—— 图片区(标图源)/ 详细介绍 / 类别专属要点 /
+#          动作行(🚗路线 🛏️住宿 ⭐收藏)/ 来源脚注;popup 按钮与列表整行共用同一个 modal。
+#          (轻量静态断言,同 TASK-9d 模式;交互验证走 browser_exec QA)
+# --------------------------------------------------------------------------- #
+
+MODAL_TAG = ('<div id="placeModal" class="modal-mask" role="dialog" aria-modal="true" '
+             'aria-labelledby="placeModalTitle" hidden>')
+MODAL_SECTION_START = "// 目的地详情弹窗(TASK-8b)"
+MODAL_MEDIA_PATH = "/api/places/media"
+MODAL_HIGHLIGHTS_PATH = "/api/places/highlights"
+MODAL_LOADING_TEXT = "加载中…"
+MODAL_NO_IMAGE_TEXT = "暂无图片"
+MODAL_TODO_TEXT = "待核实"
+# 图源三态(mixed = 高德 + 维基百科)+ 没图那一档;文案必须原样出现在页面里
+MODAL_SOURCE_LABELS = {"amap": "图源:高德", "wikimedia": "图源:维基百科",
+                       "mixed": "图源:高德 + 维基百科", "none": "图源:无(暂无图片)"}
+# 没图时的 reason 分档:no_key(没配高德 key)/ no_data(两个源都没图)/ error(数据源报错)
+MODAL_MEDIA_REASONS = ("no_key", "no_data", "error")
+MODAL_IDS = [
+    "placeModal", "placeModalTitle", "placeModalClose", "placeModalHead", "placeModalMedia",
+    "placeModalDetail", "placeModalHighlights", "placeModalActs", "placeModalSource",
+]
+MODAL_FUNCTIONS = [
+    "openPlaceModal", "closePlaceModal", "openPlaceModalFromRow", "onPlaceModalClick",
+    "selectModalImage", "loadPlaceMedia", "loadPlaceHighlights", "renderModalMedia",
+    "renderModalMediaError", "renderModalHighlights", "renderModalHighlightsError",
+    "modalMediaHtml", "modalMediaEmptyHtml", "modalMediaLoadingHtml", "modalHighlightsHtml",
+    "modalHighlightsLoadingHtml", "modalHeadHtml", "modalDetailHtml", "modalActsHtml",
+    "mediaSourceLabel", "mediaReasonText", "modalItemOf", "syncPlaceModalDetail",
+    "setModalSection", "bindModalImageErrors", "modalFieldHtml", "modalThumbHtml",
+]
+
+
+def modal_section(html: str) -> str:
+    """切出「目的地详情弹窗(TASK-8b)」那一段 JS(常量 + 渲染 + 打开/关闭 + 缩略图)。"""
+    start = html.index(MODAL_SECTION_START)
+    return html[start:html.index('$("goCity").addEventListener', start)]
+
+
+def modal_fn(html: str, name: str, end: str) -> str:
+    """在弹窗段里切出某个函数体(到下一个标记为止)。"""
+    section = modal_section(html)
+    return section[section.index(f"function {name}("):section.index(end)]
+
+
+def click_section(html: str) -> str:
+    return html[html.index("function onDocumentClick(event){")
+                :html.index("function onDocumentKeydown(event){")]
+
+
+def keydown_section(html: str) -> str:
+    return html[html.index("function onDocumentKeydown(event){"):html.index("function drawPins(")]
+
+
+def branch(section: str, marker: str, span: int = 240) -> str:
+    start = section.index(marker)
+    return section[start:start + span]
+
+
+def css_z_index(html: str, selector: str) -> int:
+    match = re.search(re.escape(selector) + r"\{[^}]*z-index:(\d+)", html)
+    assert match, f"CSS 里找不到 {selector} 的 z-index"
+    return int(match.group(1))
+
+
+def test_place_modal_dom_and_a11y(html: str) -> None:
+    assert MODAL_TAG in html, "详情弹窗的 DOM 要按契约写死(id/class/role/aria-modal/aria-labelledby/hidden)"
+    for element_id in MODAL_IDS:
+        assert f'id="{element_id}"' in html, f"缺少详情弹窗 DOM id:{element_id}"
+    assert re.search(r"\.modal-mask\[hidden\]\{display:none\}", html), "hidden 时不占屏(默认关闭)"
+    # 层级:详情弹窗盖在收藏弹层(2000)与路线面板(1000)之上,Esc 才能按层级逐层收
+    assert css_z_index(html, ".modal-mask") > css_z_index(html, "#favPanel") > css_z_index(html, "#routePanel")
+    # 挂在收藏弹层之后、</main> 之前(与既有弹层同一层容器,样式全在本页 <style> 里)
+    assert html.index('id="favPanel"') < html.index('id="placeModal"') < html.index("</main>")
+    assert ".pm-box{" in html and ".pm-skel{" in html and ".pm-todo{" in html, "弹窗样式写在本页,不引第三方 CSS"
+    assert "<link" not in html, "不引第三方 CSS 文件"
+
+
+def test_place_modal_content_order_matches_contract(html: str) -> None:
+    order = ["placeModalHead", "placeModalMedia", "placeModalDetail",
+             "placeModalHighlights", "placeModalActs", "placeModalSource"]
+    positions = [html.index(f'id="{element_id}"') for element_id in order]
+    assert positions == sorted(positions), f"内容顺序应是 标题→图片→介绍→要点→动作→来源:{order}"
+    head = html[html.index('id="placeModalHead"'):html.index('id="placeModalSource"')]
+    for token in ("placeModalMedia", "placeModalDetail", "placeModalHighlights", "placeModalActs"):
+        assert f'id="{token}"' in head
+    title_row = html[html.index(MODAL_TAG):html.index('id="placeModalHead"')]
+    assert 'id="placeModalClose"' in title_row and "✕" in title_row, "✕ 关闭按钮要在标题行里"
+    assert 'aria-labelledby="placeModalTitle"' in html and 'id="placeModalTitle"' in title_row
+
+
+def test_place_modal_functions_present(html: str) -> None:
+    section = modal_section(html)
+    for name in MODAL_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少详情弹窗 JS 函数:{name}"
+    assert "modal:{open:false,place:null" in html, "弹窗状态收进 state.modal(open/place/index/token)"
+    assert "lastFocus:null" in html, "state.modal 要有焦点归还位"
+
+
+def test_place_modal_fetches_media_and_highlights_only_when_opened(html: str) -> None:
+    section = modal_section(html)
+    assert f'PLACE_MEDIA_API="{MODAL_MEDIA_PATH}"' in html, "图片走 GET /api/places/media"
+    assert f'PLACE_HIGHLIGHTS_API="{MODAL_HIGHLIGHTS_PATH}"' in html, "类别要点走 GET /api/places/highlights"
+    # batch 参数拼接:单条也用 place_ids=(与后端 batch 上限 media 20 / highlights 10 同一套口径)
+    assert 'getJSON(PLACE_MEDIA_API+"?place_ids="+id)' in section
+    assert 'getJSON(PLACE_HIGHLIGHTS_API+"?place_ids="+id)' in section
+    assert section.count("getJSON(") == 2, "弹窗段只打这两个接口(不新增其它前端请求)"
+    opener = modal_fn(html, "openPlaceModal", "function closePlaceModal(")
+    # **打开弹窗时才**调:骨架态先出,再拉图片与要点(不预热、不在渲染列表/画 pin 时拉)
+    assert 'setModalSection("placeModalMedia",modalMediaLoadingHtml())' in opener, "图片区先出骨架态"
+    assert 'setModalSection("placeModalHighlights",modalHighlightsLoadingHtml())' in opener, "要点先出骨架态"
+    assert "loadPlaceMedia(place.id,token)" in opener and "loadPlaceHighlights(place.id,token)" in opener
+    assert opener.index("modalMediaLoadingHtml()") < opener.index("loadPlaceMedia(place.id,token)")
+    assert opener.index("modalHighlightsLoadingHtml()") < opener.index("loadPlaceHighlights(place.id,token)")
+    assert "loadPlaceMedia" not in html[:html.index(MODAL_SECTION_START)], \
+        "弹窗段之前(渲染 pin / 列表)不得预拉图片"
+    # token 守卫:关窗或换条目后,在飞的响应一律作废(media/highlights 的成功与失败分支各 2 处)
+    assert section.count("token!==state.modal.token") == 4, "media/highlights 都要 token 守卫"
+    assert f'MODAL_LOADING_TEXT="{MODAL_LOADING_TEXT}"' in html, "骨架态要有「加载中」文案"
+    assert "pm-skel-hero" in section and "pm-skel-line" in section, "骨架态用灰块占位"
+
+
+def test_place_modal_media_source_labels_and_empty_states(html: str) -> None:
+    section = modal_section(html)
+    labels = js_map(html, "MEDIA_SOURCE_LABEL")
+    for key, text in MODAL_SOURCE_LABELS.items():
+        assert f'{key}:"{text}"' in labels, f"图源文案 {key} 应是「{text}」"
+        assert text in html, f"页面里应出现图源文案「{text}」"
+    assert "mediaSourceLabel(source)" in section, "图片区必须标注图源(不是可选项)"
+    assert "mediaSourceLabel(image.source)" in section, "每张缩略图也标各自的图源"
+    # 空/失败 → 「暂无图片」+ reason 分档(no_key / no_data / error)
+    assert f'MODAL_NO_IMAGE_TEXT="{MODAL_NO_IMAGE_TEXT}"' in html
+    reasons = js_map(html, "MEDIA_REASON_TEXT")
+    for key in MODAL_MEDIA_REASONS:
+        assert re.search(rf'{key}:"[^"]{{6,}}"', reasons), f"reason={key} 要有可操作的中文文案"
+    assert "mediaReasonText(key)" in section, "空态要按 reason 翻成人话"
+    assert "modalMediaEmptyHtml(item&&item.reason)" in section, "接口回空图 → 用后端 reason"
+    assert 'modalMediaEmptyHtml("error")' in section, "接口失败按 error 档给「暂无图片」"
+    # 维基页外链:有 page_url 才给,新页打开且不泄露 referrer
+    assert "item.page_url" in section and 'target="_blank" rel="noopener noreferrer">维基页面' in section
+
+
+def test_place_modal_media_is_not_hardcoded(html: str) -> None:
+    section = modal_section(html)
+    assert not re.search(r'src="https?://', section), "图片 URL 只能来自接口,不许写死"
+    assert not re.search(r'href="https?://[^"]*(wikimedia|wikipedia|amap)', section), \
+        "不许写死图片/维基链接(只允许接口回来的 page_url)"
+    assert "esc(image.url)" in section and "esc(images[0].url)" in section, "图片 URL 要过 esc()"
+    assert 'image.addEventListener("error"' in section and 'image.style.display="none"' in section, \
+        "单张图加载失败只隐藏它,不报错、不牵连其余区块"
+    assert "onerror" not in section, "图片失败用 addEventListener(\"error\"),不用内联 onerror"
+    assert 'onerror="' not in html and "onclick=" not in html, "仍不许内联 HTML 事件属性(走事件委托/监听)"
+
+
+def test_place_modal_highlights_pending_and_note(html: str) -> None:
+    section = modal_section(html)
+    assert f'MODAL_TODO_TEXT="{MODAL_TODO_TEXT}"' in html, "value=null 要显示「待核实」"
+    assert "raw!==null&&raw!==undefined&&String(raw).trim()" in section, "null/空串都算查不到"
+    assert 'class="pm-todo"' in section and ".pm-todo{" in html, "「待核实」用弱化样式"
+    assert "item.note" in section, "后端 note(含「待核实」/「解析失败」)要原样透出"
+    assert "item.category" in section and "item.cached" in section, "分类与缓存命中要标出来"
+    assert "item.fields" in section and "field.label" in section and "field.value" in section, \
+        "按后端 fields[{label,value}] 逐字段渲染"
+    assert "HIGHLIGHT_FOOTER" in section and "不编造" in section, "要点区要写清「不编造票价/雪道数/店名」"
+    assert "modalHighlightsHtml(item)" in section, "拿到响应走同一个渲染函数"
+
+
+def test_place_modal_reuses_detail_identity_and_actions(html: str) -> None:
+    detail = modal_fn(html, "modalDetailHtml", "// ⑤ 动作行")
+    assert "detailTextOf(place)" in detail, "详细介绍复用 detailTextOf()(与列表同源)"
+    assert "js-detail-gen" in detail and "/api/places/details?place_ids=" in detail, \
+        "缺长介绍时沿用既有「生成介绍」链路,不新增接口"
+    acts = modal_fn(html, "modalActsHtml", "// 「生成介绍」写完库后")
+    assert "placeFavButtonHtml(place,index)" in acts, "⭐收藏复用同一套按钮与判定"
+    assert 'class="pop-go js-routes" data-i=' in acts and "🚗 路线 / 🛏️ 住宿" in acts, \
+        "🚗路线/🛏️住宿复用既有 .js-routes 委托"
+    assert "openRoutePanel(place,{scroll:true})" in html, "既有路线面板入口零改动"
+    opener = modal_fn(html, "openPlaceModal", "function closePlaceModal(")
+    assert 'setModalSection("placeModalSource",identityHtml(place))' in opener, "来源脚注复用 identityHtml()"
+    assert "syncPlaceFavButtons();" in opener, "收藏按钮的「已收藏」态与列表/popup 同源刷新"
+    cells = html[html.index("function updateDetailCells("):html.index("function detailReasonText(")]
+    assert "syncPlaceModalDetail();" in cells, "生成介绍后就地补进弹窗(不整窗重渲染)"
+
+
+def test_place_modal_entries_popup_button_and_clickable_row(html: str) -> None:
+    popup = html[html.index("function popupHtml("):html.index("function identityHtml(")]
+    assert 'class="pop-go js-detail-modal" data-i=' in popup, "popup 里要有 .js-detail-modal 按钮"
+    assert "📄 查看详情" in popup and "js-place-detail" in popup, "详情弹窗入口与既有「定位到列表行」并存"
+    row = html[html.index("function placeRowHtml("):html.index("// 功能3:渲染地图下方列表")]
+    assert 'tabindex="0"' in row and 'data-i=' in row, "列表行要带序号并可键盘聚焦(整行可点)"
+    assert 'class="pl-row' in row and "data-id=" in row, "既有 .pl-row / data-id 语义不变"
+    clicks = click_section(html)
+    assert 'target.closest(".js-detail-modal")' in clicks and "openPlaceModal(place,index)" in clicks
+    assert 'target.closest("#placeListBody .pl-row")' in clicks and "openPlaceModalFromRow(rowTarget)" in clicks, \
+        "列表整行点开同一个弹窗"
+    # 行内既有按钮一律 stopPropagation(整行可点后不误触行点击,既有行为零回归)
+    for marker in ('.js-place-fav"', ".js-detail-gen", ".js-routes", ".js-detail-modal"):
+        assert "event.stopPropagation()" in branch(clicks, marker), f"行内按钮 {marker} 应 stopPropagation"
+    assert clicks.index('target.closest(".js-place-fav")') < clicks.index("#placeListBody .pl-row"), \
+        "按钮分支要在整行分支之前拦截"
+    assert "openRoutePanel(place,{scroll:true})" in clicks, "路线入口行为不变"
+
+
+def test_place_modal_close_wiring_and_esc_layers(html: str) -> None:
+    assert '$("placeModal").addEventListener("click",onPlaceModalClick)' in html, "弹窗点击走自己的委托"
+    assert '$("placeModalClose").addEventListener("click",closePlaceModal)' in html, "✕ 关闭要绑定"
+    modal_click = modal_fn(html, "onPlaceModalClick", "// 缩略图切主图")
+    assert 'target===$("placeModal")' in modal_click and "closePlaceModal()" in modal_click, "点遮罩空白处关闭"
+    assert "selectModalImage(" in modal_click, "缩略图切主图"
+    keys = keydown_section(html)
+    assert "state.modal.open" in keys and "closePlaceModal()" in keys, "Esc 要能关详情弹窗"
+    assert keys.index("state.modal.open") < keys.index("state.fav.open") < keys.index("closeRoutePanel()"), \
+        "Esc 层级:详情弹窗 → 收藏弹层 → 路线面板(既有口径不破坏)"
+    assert "closeFavPanel()" in keys, "收藏弹层的 Esc 行为保留"
+    opener = modal_fn(html, "openPlaceModal", "function closePlaceModal(")
+    closer = modal_fn(html, "closePlaceModal", "// 列表整行 → 同一个弹窗")
+    assert "state.modal.lastFocus=document.activeElement" in opener, "打开时记住来源焦点"
+    assert "modal.hidden=false" in opener and "modal.hidden=true" in closer, "用 hidden 属性开关(与标记一致)"
+    assert "document.contains(back)" in closer and "back.focus()" in closer, "关闭时把焦点归还原入口"
+    assert "state.modal.token+=1" in closer, "关窗作废在飞的 media/highlights 响应"
+    assert 'target.closest("#placeListBody .pl-row")' in keys, "列表行 Enter/空格与点击同口径"
+
+
+def test_place_modal_adds_no_frontend_key_or_dependency(html: str) -> None:
+    section = modal_section(html)
+    assert "amap_js_key" not in section and ENV_JS_KEY not in section, "弹窗不碰地图 key(不新增前端 key)"
+    assert not re.search(r"[a-f0-9]{32}", section), "弹窗段不得出现 32 位 key 样态字符串"
+    assert "localStorage" not in section and "sessionStorage" not in section
+    assert "new AMap." not in section and "fetch(" not in section, "只经既有 getJSON() 打接口,不自己 fetch"
+    assert inline_script(html), "页面仍只有一段内联脚本(没引第三方 JS)"

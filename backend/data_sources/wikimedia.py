@@ -215,11 +215,13 @@ def page_thumbnail(page: Any) -> Optional[str]:
         if isinstance(holder, Mapping):
             inner = holder.get("thumbnail")
             thumb = inner if isinstance(inner, Mapping) else holder
-            url = normalize_image_url(thumb.get("source") or thumb.get("url"))
+            url = normalize_image_url(
+                strip_thumb_query(thumb.get("source") or thumb.get("url"))
+            )
             if url:
                 return url
         elif isinstance(holder, str):
-            url = normalize_image_url(holder)
+            url = normalize_image_url(strip_thumb_query(holder))
             if url:
                 return url
     return None

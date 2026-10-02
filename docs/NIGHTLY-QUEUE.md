@@ -693,36 +693,49 @@
 
 ## [TASK-8a1] 目的地图片链路:高德 POI 图(主) + 维基百科/Commons(兜底) + PlaceMedia 缓存 + /api/places/media
 
-- 状态: pending
+- 状态: done
 - 目标: 落地点详情弹窗的「相关图片」后端:新建 `data_sources/amap.py`(高德 Web 服务 place/text 取 `pois[0].photos`,带坐标门控防海外误配)与 `data_sources/wikimedia.py`(zh.wikipedia geosearch 优先、search 兜底 + Commons 相册补图);新服务 `services/place_media.py`(高德优先→维基兜底→无图占位,命中缓存 7 天/空结果负缓存 6h);新表 `PlaceMedia`;新 API `GET /api/places/media?place_ids=`(batch ≤20,读库优先、仅 miss 触网,单条失败不影响其余)。
 - 只读清单: `backend/data_sources/_common.py`、`backend/data_sources/photon.py`、`backend/db/models.py`、`backend/db/repository.py`、`docs/TASK-8-CONTRACT.md`(§1~§3.8a1 逐字执行;参考只读 `backend/app/api/places.py` 的 details 批量形态)。
   - ⚠️ 前置依赖(2026-10-01 神朱裁定切换高德后补记):`data_sources/amap.py` 由 **TASK-9a(高德数据源层)** 首个创建;本条**不得新建第二个 amap.py**,改为「往既有 `amap.py` 追加 `search_poi_photos`」。执行顺序:排在 TASK-9a 之后;其余(place/text 取 photos、坐标门控、维基兜底、PlaceMedia、/api/places/media)口径不变。
 - 涉及: backend/data_sources/(新增 amap.py、wikimedia.py、改 _common.py 加 amap 源)、backend/services/place_media.py(新)、backend/db/(models.py 加 PlaceMedia 表、repository.py 加读写)、backend/app/api/places.py(加 /api/places/media)、backend/test_*.py(≥22 新用例,全 mock 不触网)
 - 验收: pytest baseline 792 零回归 + ≥22 新增;契约文档 §3「TASK-8a1」全部字段/响应键/ENV 名逐字照做;真机冒烟 `/api/places/media?place_ids=<西湖>` 出图并标注 source;缺 key 时降级不报错(返回 source=none/reason=no_key)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-02 夜班,Codex 写码(40.9min 触止损被 kill,产物完整)+执行器收口,commit `aff42a8` + 微修 `2dcb0c7`)。
+  - 既有 `amap.py` 追加 `search_poi_photos`(place/text v3、坐标门控 haversine≤WHERE2GO_AMAP_MAX_MATCH_M 默认 5000、http→https、status!=1→[] 不抛、HTTP 错→DataSourceError);新 `data_sources/wikimedia.py`(geosearch 优先/search 兜底/pageimages 主图 800px/Commons 补图 ≤limit、thumburl 剥 ?utm_*、失败不抛 via=none);`PlaceMedia` 表(place_id unique、source 四态、reason 三档);`services/place_media.py`(缓存 7 天/负缓存 6h/图上限 6、amap→wikimedia 兜底→mixed);`GET /api/places/media`(batch≤20、按入参顺序、单条失败不扩散)。
+  - 测试:test_wikimedia.py + test_place_media.py 共 **85 新增**(超 ≥22);执行器复跑 pytest backend/ = **1074 passed**(989 基线零回归)。执行器微修:维基主图 thumburl 同样剥 ?utm_*(契约只点名 Commons,同款噪声一并清)。
+  - 真机冒烟(uvicorn 已重启):place_ids=1,5,4 → source=mixed(高德+维基双源)、0.012s 缓存命中 cached=true;库内无西湖行(清库后杭州 0_50 段是市民中心周边),用 place_id=1「牡丹园湖边」替代验收,出图 2-4 张/条。
+  - **Codex 256K 统计**:40.9min 触止损被 kill(function_calls **63**、首写 **10.8min** R8 线内、tokens **4.79M total** 含 cache 重放),kill 时实现+测试全部落盘且 1074 全绿,只差 commit——与 6c/6d/6g/9b/9c/9d 同款贴线形态。
 
 ---
 
 ## [TASK-8a2] 类别专属要点:LLM 按分类出结构化字段 + PlaceHighlight 永久缓存 + /api/places/highlights
 
-- 状态: pending
+- 状态: done
 - 目标: 新建 `services/highlights.py`:四分类固定字段表(自然→最佳季节/门票开放/游玩建议;人文美食→人文背景/必吃/代表小店;滑雪→雪道数与分级/开放期/适合人群;运动→项目/场地装备/适宜人群),严格 JSON 输出、**查不到置 null 并在 note 标「待核实」禁止编造**;预算 `HIGHLIGHT_MAX_TOKENS=600 / HIGHLIGHT_TIMEOUT_S=60`(必须按调用放大,勿沿用 intro.py 的 120/20s);新表 `PlaceHighlight`(生成后永久缓存);新 API `GET /api/places/highlights?place_ids=`(batch ≤10,读库优先)。
 - 只读清单: `backend/services/details.py`(LLM 预算与缓存口径样板)、`backend/db/models.py`、`backend/db/repository.py`、`backend/app/api/places.py`(details 端点形态)、`docs/TASK-8-CONTRACT.md`(§3「TASK-8a2」逐字执行)。
 - 涉及: backend/services/highlights.py(新)、backend/db/(models.py 加 PlaceHighlight、repository.py)、backend/app/api/places.py(加 /api/places/highlights)、backend/test_highlights.py(≥12 用例,LLM 全 mock 不触网)
 - 验收: pytest 零回归 + ≥12 新增;四分类字段表逐字一致;「拿不到→null+待核实」有专门用例;LLM 异常/解析失败降级为 fields=[] 不抛 500;单次调用确实放大到 600/60(用例断言传入参数)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-02 夜班,Codex 执行,**~17min 自行完成全部实现+测试+commit,未触止损线**——本晚唯一一条,commit `5a94dbd`)。
+  - 新 `services/highlights.py`:HIGHLIGHT_MAX_TOKENS=600/HIGHLIGHT_TIMEOUT_S=60 **按调用传给 llm.chat()**(不沿用 intro 120/20s);CATEGORY_FIELDS 五张固定字段表;category_key() 包含匹配+归类优先级(滑雪>运动>人文美食>自然,全称/短名都落对表);fetch_highlights 走 resolve_provider/LLMClient 唯一入口、严格 JSON prompt、查不到 value=null+note 标「待核实」、异常/坏 JSON→fields=[]+note=解析失败不抛、失败不写行可重试。
+  - `PlaceHighlight` 表(place_id unique/category/fields JSON/note/generated_at,永久缓存无 TTL);repository 照 PlaceMedia 风格加读写(value=None 是合法值不剔);`GET /api/places/highlights`(batch≤10 超限/缺参/非法 id 400 中文、items 按入参顺序、读库优先仅 miss 调 LLM、单条失败只影响该条仍 200)。
+  - 测试:test_highlights.py **64 例**(超 ≥12;含注入替身断言 max_tokens=600/timeout=60 确实传入)。执行器复跑 pytest backend/ = **1138 passed**(1074 基线零回归,54s)。index.html 未动。
+  - 真机冒烟(uvicorn 已重启):place_id=1(自然风光)→ LLM 实调 37s 出 3 字段(门票=null 标「待核实」不编造)→ 二次请求 0.013s cached=true 零 LLM。
+  - **Codex 256K 统计**:单次调用 ~17min(14:54-15:11 UTC,止损线内),function_calls **37**,首写 **3.4min**(R8 线内),tokens **1.70M total**(含 cache 重放),Codex 自报 output 124,922;体量小(单服务+单表+单端点)是未贴线主因,印证「拆小条目」口径。
 
 ---
 
 ## [TASK-8b] 前端目的地详情弹窗:pin「查看详情」+ 列表行整行可点 + 图片区 + 类别要点 + 路线/住宿按钮(依赖 8a1/8a2)
 
-- 状态: pending
+- 状态: done
 - 前置依赖: 排在 TASK-9c(前端地图切高德 JS API)之后 —— 弹窗直接建在高德地图上,避免 Leaflet→高德 对同一段 pin/弹窗代码重写两次。
 - 目标: `index.html` 新增居中详情弹窗 `#placeModal`(role=dialog/aria-modal,Esc+点遮罩+✕ 关闭):标题/类别/距离 → 图片区(打开时才调 `/api/places/media`,骨架态,空/失败给「暂无图片」+**图源标注**「高德/维基百科」+ page_url 外链) → 详细介绍(复用 `detailTextOf` + `/api/places/details` 生成入口) → 类别专属要点(`/api/places/highlights`,骨架+「待核实」弱化样式) → `🚗 路线 / 🛏️ 住宿`(复用 `openRoutePanel`)+ ⭐收藏 → `identityHtml` 脚注。入口:①`popupHtml()` 加「📄 查看详情」按钮(pin 仍先出小 popup);②列表 `.pl-row` 整行可点开同一弹窗,行内既有按钮 `stopPropagation` 不回归。不新增前端 key。
 - 只读清单: `backend/app/static/index.html`、`backend/test_frontend_routes.py`、`docs/TASK-8-CONTRACT.md`(§3「TASK-8b」逐字执行)。
 - 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 静态断言 + node --check)
 - 验收: pytest 零回归 + ≥12 新增断言(DOM id/函数名/接口字符串/「图源」文案/batch 参数拼接/stopPropagation);browser_exec QA:开页 0 error → 点 pin →「查看详情」→ 弹窗出图/介绍/要点 → 路线住宿按钮出面板 → Esc 关闭 → 列表行开同一弹窗;既有收藏/路线/住宿行为零回归。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-02 夜班,Codex 写码(41.4min 触止损被 kill,实现+测试+commit 已全部完成)+执行器真机 QA 复验,commit `902966c`)。
+  - index.html:新增居中 `#placeModal`(role=dialog/aria-modal/hidden,Esc+遮罩+✕ 关闭、焦点记忆归还);打开时才拉 `/api/places/media`(骨架态→主图+缩略图条、图源标注三态「图源:高德/维基百科/高德 + 维基百科」、reason 分档文案、page_url 外链、onerror 隐藏坏图)+ `/api/places/highlights`(骨架态、null→「待核实」弱化、note 透出);详细介绍复用 detailTextOf/生成按钮;动作行 🚗路线/🛏️住宿(js-routes→openRoutePanel)+⭐收藏(js-place-fav 同源);identityHtml 脚注。入口①popupHtml 加「📄 查看详情」.js-detail-modal(原跳转按钮改名「📍 定位到列表行」避免文案冲突,js-place-detail/focusPlaceRow 保留);②.pl-row 整行可点、行内按钮 stopPropagation。Esc 层级:详情弹窗→路线面板→收藏弹层。
+  - test_frontend_routes.py 追加 TASK-8b 段(11 个测试函数/87 断言,超 ≥12 要求);node --check 通过。执行器复跑 pytest backend/ = **1149 passed**(1138 基线零回归,53s)。后端 Python 零改动。
+  - browser_exec 真机 QA(CDP chrome 僵死重启后,uvicorn 最新代码):开页 0 error → 滚动后受信任点击地图 pin → InfoWindow 出「📄 查看详情」→ 弹窗(滴水湖):图片 7 张加载完成+「图源:高德」标注 → 详细介绍在 → 类别要点(运动:项目/场地装备/适宜人群)LLM 实调出字段+免责 note → 点「🚗 路线/🛏️ 住宿」→ routePanel.open=true → Esc 先关弹窗再关面板(层级正确)→ 列表行整行点击开同一弹窗 → 行内收藏按钮点击 stopPropagation 弹窗不误开 → 全程 window.__errs **0** 条;QA 误加的收藏(id=7)已 DELETE 清理,库回到 3 条既有收藏。
+  - **Codex 256K 统计**:41.4min 触止损被 kill(function_calls **114**、首写 **16.8min** 在 R8 前端放宽线 20min 内、tokens ~2.9M+ total 含 cache 重放),kill 时已完成实现+测试+全量绿+commit,只差最终 summary——前端四条(5b/6e/9d/8b)全部呈贴线形态。
 
 ---
 

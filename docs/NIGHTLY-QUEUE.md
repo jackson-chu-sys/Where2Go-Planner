@@ -773,13 +773,18 @@
 
 ## [TASK-10c] AI 行程前端对话框:收藏面板第三个 tab「🤖 AI 行程」+ 多轮对话 + 点名收藏 + 行程卡片 + 存为方案
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-10b
 - 目标: `index.html` 收藏面板加第三个 tab「🤖 AI 行程」(沿用现有 tab 机制,与「我的收藏」「行程方案」并列互斥):消息流(用户/助手气泡,助手气泡渲染按天行程卡片 `Day N · base` + stops 名称/一句理由 + tip;`degraded` 显示可见原因,绝不静默)、输入区(Enter 发送/Shift+Enter 换行/发送中「AI 规划中…(首次约 1 分钟)」)、**点名收藏标签**(点一下把该条加入本次 `collection_ids` 并插入 @引用文本,**未点名的收藏绝不自动进请求**)、底部「⭐ 存为行程方案」(POST /api/planner/save,显示方案名+总预算估算+unmatched 提示)与「🗑 清空对话」、切 tab 时 GET 回放历史;`session_key` 存 localStorage。
 - 只读清单: `backend/app/static/index.html`(收藏面板 tab 区块)、`backend/test_frontend_routes.py`、`docs/TASK-10-CONTRACT.md`(§3「TASK-10c」逐字执行)。
 - 涉及: backend/app/static/index.html、backend/test_frontend_routes.py(≥12 静态断言 + node --check)
 - 验收: pytest 零回归 + ≥12 新增断言;browser_exec 真机 QA(受信任点击):开页 0 error → 切 tab → 「3 天 亲子 不要太累」→ 出按天行程卡片 → 追问「第二天换成古镇」→ 卡片更新 → 点收藏标签再问 → 行程含该收藏 → 「⭐ 存为行程方案」→ 出现方案与预算 → 「🗑 清空对话」→ `window.__errs` 0 条;既有收藏/行程方案 tab 零回归。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-03 夜班,Codex 执行,**~31min 自行完成实现+测试+commit,未触止损线**,commit `6e448ab`)。
+  - index.html(+524/-14,仅前端,后端 Python 零改动):收藏面板第三个 tab「🤖 AI 行程」(与我的收藏/行程方案并列互斥);消息流用户/助手气泡+按天行程卡片(`第N天 · base` + stops 名称/理由 + 💡tip + 「@点名收藏」徽标);degraded 显示可见原因绝不静默;textarea Enter 发送/Shift+Enter 换行、发送中按钮禁用+「AI 规划中…(首次约 1 分钟)」;点名收藏标签(#plannerTags,点一下加入 collection_ids+插入 @引用,「已点名 N 条」计数);「⭐ 存为行程方案」(POST /api/planner/save,显示方案名+总预算+unmatched 提示)/「🗑 清空对话」(DELETE);切 tab GET 回放;session_key 存 localStorage["w2g_planner_session"]。
+  - test_frontend_routes.py +421 行(TASK-10c 段静态断言,超 ≥12 要求;含 node --check)。执行器复跑 pytest backend/ = **1268 passed**(1250 基线零回归,70s)。
+  - browser_exec 真机 QA(uvicorn :8000):开页 0 error → 切「🤖 AI 行程」→ 点名标签渲染 3 条既有收藏 → 发「3天 亲子 不要太累」:发送中态正确(按钮禁用+文案)→ **首轮 LLM 超时 180s,degraded=timeout 气泡可见、给出重试指引、不编造行程(降级口径正确)** → 重试成功:3 天行程卡片(每天 2 stops+理由+tip)→ 点 2 个收藏标签(「已点名 2 条」+@引用插入输入框)→ 追问「第二天换成古镇,用点名的收藏」(184s):Day2 正确改古镇、点名收藏带「@点名收藏」徽标进行程 → 「⭐ 存为行程方案」:方案建成(¥0 估算·1晚·免责文案)+「纳入 3 个地点 · 3 个未在库内」提示 → 行程方案 tab 见新方案 → 「🗑 清空对话」回空态 → 回归:我的收藏 tab 3 条正常、地图 5 pin 正常;全程 window.__errs **0** 条。QA 数据已清理(方案删除、库回 3 条既有收藏)。
+  - **Codex 256K 统计**:单次调用 ~31min(14:38-15:09 UTC,止损线内),function_calls **80**,首写 **9.8min**(R8 前端放宽线内),tokens **6.19M total**(含 cache 重放)/output 73K+reasoning 45K,零 compact。
+  - 备注(报主会话):QA 实测单轮 LLM 73s~184s,**180s 超时线偏紧**(首轮 timeout 降级、重试 184s 贴线通过)——契约预留口径:若后续频繁超时,可考虑把 PLANNER_TIMEOUT_S 上调到 240,待神朱拍板,未擅自改。
 
 ---
 

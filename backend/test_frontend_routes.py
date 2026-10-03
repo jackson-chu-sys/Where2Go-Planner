@@ -41,13 +41,16 @@ if BACKEND_DIR not in sys.path:
 
 from app.api import collections as collections_api  # noqa: E402
 from app.api import places as places_api  # noqa: E402
+from app.api import planner as planner_api  # noqa: E402
 from app.api import routes as routes_api  # noqa: E402
 from app.api import stays as stays_api  # noqa: E402
 from app.api import trips as trips_api  # noqa: E402
 from app.main import STATIC, app as fastapi_app  # noqa: E402
 from db import models as db_models  # noqa: E402
+from db import repository as repo  # noqa: E402
 from db.base import init_db, make_engine, session_factory  # noqa: E402
 from services import place_loader  # noqa: E402
+from services import planner as planner_service  # noqa: E402
 from services import routes as route_service  # noqa: E402
 from services import stays as stay_service  # noqa: E402
 from services import trips as trip_service  # noqa: E402
@@ -780,10 +783,14 @@ def test_plan_picker_uses_checkboxes_instead_of_selects(html: str) -> None:
     for token in ("fmtDuration(summary.duration_min)", "fmtCost(summary.cost_cny)",
                   "fmtKm(summary.distance_km)", "summary.price_estimate"):
         assert token in row, f"勾选行缺少对比字段 {token}"
-    # 旧的三下拉 + localStorage 双轨必须彻底下线(要求⑤)
+    # 旧的三下拉 + localStorage 双轨必须彻底下线(要求⑤)。
+    # ⚠️ localStorage 这一条的范围自 TASK-10c 起收窄成「行程方案 tab 这一段」:AI 行程 tab 按
+    # 契约 §3 要用它存后端补发的 session_key(w2g_planner_session);方案机制本身仍不碰本地存储。
     for gone in ("planDest", "planRoute", "planStay", "PLAN_STORE_KEY", "w2g_trip_plans",
-                 "loadSavedPlans", "renderSavedPlans", "parseStayPrice", "localStorage"):
+                 "loadSavedPlans", "renderSavedPlans", "parseStayPrice"):
         assert gone not in html, f"旧 localStorage 方案机制应已移除:{gone}"
+    assert "localStorage" not in plan_section(html), \
+        "方案组合/报价仍不许落本地存储(单一事实源在后端 SQLite)"
 
 
 def test_plan_picker_place_is_single_choice(html: str) -> None:
@@ -1398,8 +1405,18 @@ def test_amap_map_config_is_fetched_before_script(html: str) -> None:
     assert "loadMapConfig()" in boot and "loadAMapScript(config)" in boot, "启动要先取配置再注入脚本"
     assert boot.index("loadMapConfig()") < boot.index("loadAMapScript(config)")
     assert f'getJSON("{MAP_CONFIG_PATH}")' in html, "key 只能运行时向 /api/map-config 取"
-    assert "localStorage" not in html, "key 不进 localStorage"
-    assert "sessionStorage" not in html, "key 也不进 sessionStorage"
+    # 地图 key 不进本地存储。⚠️ 范围自 TASK-10c 起收窄成「地图段 + boot 段」并补一条全局约束:
+    # 页面里出现的每一处 localStorage 都只能是 AI 行程 tab 存 session_key(见下面的 all(...)),
+    # 地图 key / 安全密钥依旧一个字节都不落本地。
+    loader = amap_section(html)[amap_section(html).index("async function loadMapConfig("):]
+    for scoped in (loader, boot_section(html)):
+        assert "localStorage" not in scoped, "地图 key 不进 localStorage"
+        assert "sessionStorage" not in scoped, "地图 key 也不进 sessionStorage"
+    stored = re.findall(r"(?:localStorage|sessionStorage)\.\w+\(([^)]*)\)", html)
+    assert stored and all("PLANNER_SESSION_STORE" in args for args in stored), \
+        f"本地存储只许用来存 AI 行程的 session_key,实际:{stored}"
+    assert js_string(html, "PLANNER_SESSION_STORE") == PLANNER_SESSION_STORE
+    assert "amap_js_key" not in planner_section(html), "AI 行程段不碰地图 key(不新增前端 key)"
 
 
 def test_amap_security_code_written_before_script_injection(html: str) -> None:
@@ -1788,3 +1805,399 @@ def test_place_modal_adds_no_frontend_key_or_dependency(html: str) -> None:
     assert "localStorage" not in section and "sessionStorage" not in section
     assert "new AMap." not in section and "fetch(" not in section, "只经既有 getJSON() 打接口,不自己 fetch"
     assert inline_script(html), "页面仍只有一段内联脚本(没引第三方 JS)"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-10c:收藏面板第三个 tab「🤖 AI 行程」—— 多轮对话 + **点名收藏**(@标签)+
+#          按天行程卡片 + 「⭐ 存为行程方案」/「🗑 清空对话」+ 切 tab 回放历史。
+#          照 TASK-5b / 8b 的追加模式:静态断言(DOM id / 函数名 / 接口字符串 / 文案 / 常量
+#          与后端同口径)+ 用临时库**真跑后端端点函数**做字段契约(前端读的键必须是真实
+#          响应的子集)。全程不触网:只跑 /api/planner/save(不调 LLM),对话轮次的降级四态
+#          与 collection_ids 两条路径在 test_planner_api.py 里覆盖。
+# --------------------------------------------------------------------------- #
+
+PLANNER_SECTION_START = "// AI 行程(TASK-10c,阶段 A)"
+PLANNER_SECTION_END = "// 目的地详情弹窗(TASK-8b)"
+PLANNER_PANE_END = "<!-- 目的地详情弹窗(TASK-8b)"
+PLANNER_SESSION_STORE = "w2g_planner_session"      # localStorage 键(只存后端补发的 session_key)
+PLANNER_MSG_API = "/api/planner/messages"
+PLANNER_SAVE_API = "/api/planner/save"
+PLANNER_BUSY_LABEL = "AI 规划中…(首次约 1 分钟)"   # 发送中的按钮文案(契约逐字)
+PLANNER_CLEAR_LABEL = "🗑 清空对话"
+PLANNER_UNMATCHED_TEXT = "个地点未在库内,未纳入"
+
+# AI 行程 tab 必须有的 DOM id:tab 钮 + pane + 报错区 + 消息流 + 点名标签区 + 输入区 + 三个按钮
+PLANNER_DOM_IDS = [
+    "favTabAi", "favPaneAi", "plannerErr", "plannerMsgs", "plannerTagWrap", "plannerTagCount",
+    "plannerTags", "plannerInput", "plannerSend", "plannerSave", "plannerClear", "plannerSaveOut",
+    "plannerHint",
+]
+PLANNER_FUNCTIONS = [
+    "plannerSessionKey", "rememberPlannerSession", "setPlannerErr", "plannerItemOf",
+    "plannerDegradedHtml", "plannerStopHtml", "plannerDayHtml", "plannerItineraryHtml",
+    "plannerBubbleHtml", "syncPlannerActs", "setPlannerBusy", "renderPlannerMsgs",
+    "plannerTagKindLabel", "plannerTagHtml", "renderPlannerTags", "plannerMentionedIds",
+    "plannerMentionToken", "onPlannerTagClick", "togglePlannerMention", "plannerInputText",
+    "plannerRequestBody", "plannerSend", "onPlannerKeydown", "plannerLastItinerary",
+    "loadPlannerMessages", "openPlannerTab", "plannerStops", "plannerPlanName",
+    "plannerSaveHtml", "renderPlannerSaveOut", "plannerSavePlan", "plannerClear",
+]
+# 后端 services/planner.py 的结构化行程形状(前端只读这些键)
+ITINERARY_FIELDS = ["days", "days_count", "summary", "unused_collections"]
+DAY_FIELDS = ["day", "base", "stops", "tip"]
+STOP_FIELDS = ["name", "reason", "collection_id"]
+# 请求体键(裸 JSON;字段名以 app/api/planner.py 为准)
+PLANNER_MESSAGE_BODY_FIELDS = ["session_key", "message", "collection_ids", "nights"]
+PLANNER_SAVE_BODY_FIELDS = ["session_key", "name", "stops", "legs", "stay", "nights"]
+# 一份合法行程 JSON:喂给后端 parse_itinerary(),拿真实形状来做前端契约断言
+SAMPLE_ITINERARY_JSON = (
+    '{"days":[{"day":1,"base":"杭州","stops":[{"name":"西湖","reason":"湖边步道适合带娃慢走",'
+    '"collection_id":3},{"name":"灵隐寺","reason":"上午人少树荫多","collection_id":null}],'
+    '"tip":"第一天不赶,傍晚去湖边"},'
+    '{"day":2,"base":"杭州","stops":[{"name":"宋城","reason":"演出适合亲子","collection_id":null}],'
+    '"tip":"演出票待核实"}],"days_count":2,"summary":"两天都在西湖一带,少换乘",'
+    '"unused_collections":["崇礼滑雪场"]}'
+)
+
+
+def planner_section(html: str) -> str:
+    """切出「AI 行程(TASK-10c)」那一段 JS(契约断言只在这一段里找字段引用)。"""
+    start = html.index(PLANNER_SECTION_START)
+    return html[start:html.index(PLANNER_SECTION_END, start)]
+
+
+def planner_pane(html: str) -> str:
+    """切出 AI 行程 tab 的那块 DOM(收藏面板里的第三个 pane)。"""
+    start = html.index('<div id="favPaneAi"')
+    return html[start:html.index(PLANNER_PANE_END, start)]
+
+
+def planner_fn(html: str, name: str, end: str) -> str:
+    """在 AI 行程段里切出某个函数体(``async function`` 也能按名字切到)。"""
+    section = planner_section(html)
+    return section[section.index(f"function {name}("):section.index(end)]
+
+
+def switch_section(html: str) -> str:
+    return html[html.index("function switchFavTab"):html.index('$("goCity").addEventListener')]
+
+
+@pytest.fixture()
+def planner_saved(plan_session) -> dict[str, Any]:
+    """真跑 ``POST /api/planner/save``:库里两个目的地命中,第三个站名进 unmatched。"""
+    repo.upsert_places(plan_session, origin_city="杭州", band="0_25", items=[
+        {"osm_type": db_models.AMAP_OSM_TYPE, "osm_id": 910001, "name": "西湖",
+         "lat": 30.2501234, "lng": 120.1501234, "category": "自然", "tags": {}},
+        {"osm_type": db_models.AMAP_OSM_TYPE, "osm_id": 910002, "name": "灵隐寺",
+         "lat": 30.2401234, "lng": 120.1001234, "category": "人文美食", "tags": {}},
+    ])
+    plan_session.commit()
+    return planner_api.save_plan(session=plan_session, payload={
+        "session_key": "frontend-ai-session", "name": "AI 行程 · 杭州 · 2 天", "nights": 1,
+        "stops": [{"name": "西湖", "collection_id": None},
+                  {"name": "灵隐寺", "collection_id": None},
+                  {"name": "宋城", "collection_id": None}],
+        "legs": [], "stay": [],
+    })
+
+
+def test_planner_tab_dom_ids_present(html: str) -> None:
+    for element_id in PLANNER_DOM_IDS:
+        assert f'id="{element_id}"' in html, f"缺少 AI 行程 tab 的 DOM id:{element_id}"
+    pane = planner_pane(html)
+    assert 'role="tabpanel" aria-labelledby="favTabAi"' in pane, "pane 要与 tab 钮绑好 a11y"
+    assert "onclick=" not in pane, "运行时生成的标签/气泡一律走事件委托,不许内联 onclick"
+    for css in (".ai-msgs{", ".ai-bubble{", ".ai-day{", ".ai-stop{", ".ai-tag{", ".ai-degraded{"):
+        assert css in html, f"缺少样式 {css}(不引第三方 CSS)"
+
+
+def test_planner_tab_is_registered_as_third_tab(html: str) -> None:
+    assert re.search(r'<button type="button" id="favTabAi" class="fp-tab" role="tab" '
+                     r'aria-selected="false"', html), "第三个 tab 要沿用既有 .fp-tab 样式与 role=tab"
+    assert 'aria-controls="favPaneAi"' in html and "🤖 AI 行程" in html
+    tablist = html[html.index('<div class="fp-tabs"'):html.index('<div id="favPaneFav"')]
+    assert tablist.index("favTabFav") < tablist.index("favTabPlan") < tablist.index("favTabAi"), \
+        "「🤖 AI 行程」是与「我的收藏」「行程方案」并列的第三个 tab"
+    assert re.search(r'<div id="favPaneAi"[^>]*style="display:none"', html), "AI pane 默认隐藏"
+    switch = switch_section(html)
+    assert 'const FAV_TABS=["fav","plan","ai"]' in html, "tab 键要收成一份常量(三个 pane 同源)"
+    assert "FAV_TABS.forEach(key=>" in switch
+    assert 'panes={fav:$("favPaneFav"),plan:$("favPanePlan"),ai:$("favPaneAi")}' in switch
+    assert 'panes[key].style.display=active?"block":"none"' in switch, "三个 pane 必须互斥显示"
+    assert 'tabs[key].classList.toggle("sel",active)' in switch, "选中 tab 要有视觉态"
+    assert 'setAttribute("aria-selected"' in switch
+    assert '$("favTabAi").addEventListener("click",()=>switchFavTab("ai"))' in html
+    assert 'if(state.tripPlan.tab==="ai") openPlannerTab();' in switch, "切到 AI tab 才回放历史"
+
+
+def test_planner_functions_present(html: str) -> None:
+    section = planner_section(html)
+    for name in PLANNER_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"缺少 AI 行程 JS 函数:{name}"
+    # 复用既有资产而不是另立一套:分组口径 / 金额区间 / 晚数 / 时间格式
+    for reused in ("favGroupOf(", "moneyRange(", "planNights()", "fmtGeneratedAt(",
+                   "loadTripPlans()", "refreshFavItems()"):
+        assert reused in section, f"应复用既有 {reused}(不另写一套)"
+
+
+def test_planner_state_shape_and_session_store(html: str) -> None:
+    state_row = html[html.index("const state={"):html.index("// 高德覆盖物句柄")]
+    assert re.search(r'planner:\{sessionKey:"",items:\[\],busy:false,mentioned:\[\],'
+                     r'lastItinerary:null\}', state_row), "state.planner 五个键照契约 §3 一字不差"
+    assert js_string(html, "PLANNER_SESSION_STORE") == PLANNER_SESSION_STORE
+    session_fn = planner_fn(html, "plannerSessionKey", "function rememberPlannerSession")
+    assert "localStorage.getItem(PLANNER_SESSION_STORE)" in session_fn, "刷新后要能读回会话 key"
+    assert "catch(error)" in session_fn, "读不到本地存储(隐私模式)只当新会话,不抛错"
+    remember = planner_fn(html, "rememberPlannerSession", "function setPlannerErr")
+    assert "localStorage.setItem(PLANNER_SESSION_STORE,value)" in remember
+    send = planner_fn(html, "plannerSend", "function onPlannerKeydown")
+    assert "rememberPlannerSession(result.session_key)" in send, "后端补发的 key 要存下来(多轮续聊)"
+    assert 'PLANNER_SESSION_STORE="w2g_planner_session"' in planner_pane(html) or \
+        PLANNER_SESSION_STORE in planner_pane(html), "面板要写清 key 存在哪(不藏着)"
+
+
+def test_planner_calls_planner_api_endpoints(html: str) -> None:
+    section = planner_section(html)
+    assert js_string(html, "PLANNER_MSG_API") == PLANNER_MSG_API
+    assert js_string(html, "PLANNER_SAVE_API") == PLANNER_SAVE_API
+    assert 'sendJSON(PLANNER_MSG_API,{method:"POST"' in section, "发一轮对话应 POST /api/planner/messages"
+    assert 'getJSON(PLANNER_MSG_API+"?session_key="' in section, "回放历史应 GET /api/planner/messages"
+    assert 'sendJSON(PLANNER_MSG_API+"?session_key="+encodeURIComponent(key),{method:"DELETE"})' in section, \
+        "清空对话应 DELETE /api/planner/messages?session_key="
+    assert 'sendJSON(PLANNER_SAVE_API,{method:"POST"' in section, "存为方案应 POST /api/planner/save"
+    assert 'headers:{"Content-Type":"application/json"}' in section, "POST 要声明 JSON 请求体"
+    assert "JSON.stringify(" in section, "请求体要序列化(后端收裸 JSON 对象)"
+    assert "fetch(" not in section, "只经既有 getJSON()/sendJSON() 打接口,不自己 fetch"
+    paths = fastapi_app.openapi()["paths"]
+    assert PLANNER_MSG_API in paths and PLANNER_SAVE_API in paths, "后端路由要已注册(TASK-10b)"
+    assert {"get", "post", "delete"} <= set(paths[PLANNER_MSG_API]), "对话三件套要齐"
+
+
+def test_planner_mention_only_clicked_collections(html: str) -> None:
+    body_fn = planner_fn(html, "plannerRequestBody", "async function plannerSend")
+    for field in PLANNER_MESSAGE_BODY_FIELDS:
+        assert re.search(rf"\b{field}:", body_fn), f"对话请求体缺少字段 {field}"
+    assert "collection_ids:plannerMentionedIds()" in body_fn, "collection_ids 只能来自「已点名」"
+    assert "if(" not in body_fn, "collection_ids 恒发:没点名就是空数组,**绝不**按条件省略字段"
+    mentioned = planner_fn(html, "plannerMentionedIds", "function plannerMentionToken")
+    assert "state.planner.mentioned" in mentioned, "点名清单只读 state.planner.mentioned"
+    assert "Number(id)" in mentioned and "id>0" in mentioned, "只发正整数 id(与后端校验同口径)"
+    toggle = planner_fn(html, "togglePlannerMention", "function plannerInputText")
+    assert "state.planner.mentioned.push(id)" in toggle, "点一下 = 加入本次请求的 collection_ids"
+    assert "input.value.slice(0,caret)+token" in toggle, "点一下要在输入框光标处插入 @引用文本"
+    assert "plannerMentionToken(name)" in toggle, "插入的引用文本走同一个拼装函数"
+    token_fn = planner_fn(html, "plannerMentionToken", "function onPlannerTagClick")
+    assert '"@"+String(name||"").trim()' in token_fn, "引用文本就是 @名称"
+    assert "state.planner.mentioned.splice(at,1)" in toggle, "再点一下取消点名(并把 @引用撤掉)"
+    assert '$("plannerTags").addEventListener("click",onPlannerTagClick)' in html, "点名走事件委托"
+    assert "js-planner-tag" in toggle or "js-planner-tag" in planner_section(html)
+    assert "state.fav.items" not in body_fn, "请求体绝不直接读收藏列表(未点名的不许自动进请求)"
+
+
+def test_planner_tags_render_from_fav_items(html: str) -> None:
+    render = planner_fn(html, "renderPlannerTags", "// 只有点过名的收藏 id 会进请求")
+    assert "state.fav.items" in render, "点名标签与「⭐ 我的收藏」同源"
+    assert "plannerTagHtml" in render and "PLANNER_TAG_EMPTY" in render, "没收藏时给中文占位"
+    assert "alive.indexOf(id)>=0" in render, "被删掉的收藏要从点名里剔掉(免得请求带死 id)"
+    tag = planner_fn(html, "plannerTagHtml", "function renderPlannerTags")
+    assert 'class="ai-tag js-planner-tag' in tag and '" data-id="' in tag and 'data-name="' in tag
+    assert '"@"+esc(name)' in tag, "标签文案是 @名称(名称要过 esc())"
+    assert '" on":"' in tag or '(on?" on":"")' in tag, "点过名的标签要有选中态"
+    acts = planner_fn(html, "syncPlannerActs", "function setPlannerBusy")
+    assert '"已点名 "+plannerMentionedIds().length+" 条"' in acts, "标签区要显示「已点名 N 条」"
+    refresh = html[html.index("async function refreshFavItems"):html.index("async function openFavPanel")]
+    assert "renderPlannerTags();" in refresh, "收藏增删后点名标签要同源刷新"
+
+
+def test_planner_input_keyboard_and_limits(html: str) -> None:
+    pane = planner_pane(html)
+    assert "<textarea" in pane and 'id="plannerInput"' in pane, "输入区是 textarea(要多行)"
+    assert 'for="plannerInput"' in pane, "textarea 要有 label(可访问性)"
+    assert "Enter 发送 · Shift+Enter 换行" in pane
+    assert re.search(r'<textarea id="plannerInput" rows="3" maxlength="2000"', html)
+    key = planner_fn(html, "onPlannerKeydown", "function plannerLastItinerary")
+    assert 'event.key!=="Enter"||event.shiftKey' in key, "只有裸 Enter 发送,Shift+Enter 换行"
+    assert "event.preventDefault()" in key and "plannerSend()" in key
+    assert '$("plannerInput").addEventListener("keydown",onPlannerKeydown)' in html
+    send = planner_fn(html, "plannerSend", "function onPlannerKeydown")
+    assert "先说一句需求" in send, "空消息就地给中文提示(不打无谓的 400)"
+    assert "PLANNER_MSG_MAX" in send and "上限" in send, "超长就地给中文提示"
+    assert js_constant(html, "PLANNER_MSG_MAX") == planner_service.MAX_MESSAGE_LEN, "字数上限与后端一致"
+    assert js_constant(html, "PLANNER_HISTORY_LIMIT") == planner_service.LIST_LIMIT_DEFAULT, \
+        "回放条数与后端默认一致"
+    assert js_constant(html, "PLANNER_HISTORY_LIMIT") <= planner_service.LIST_LIMIT_MAX
+
+
+def test_planner_busy_state_disables_buttons(html: str) -> None:
+    assert js_string(html, "PLANNER_BUSY_LABEL") == PLANNER_BUSY_LABEL, "发送中文案要逐字"
+    acts = planner_fn(html, "syncPlannerActs", "function setPlannerBusy")
+    assert "send.disabled=busy" in acts and "busy?PLANNER_BUSY_LABEL:PLANNER_SEND_LABEL" in acts
+    assert "save.disabled=busy||!state.planner.lastItinerary" in acts, "没行程卡片时不许存为方案"
+    assert "clear.disabled=busy" in acts
+    assert '<button type="button" id="plannerSave" class="fp-save-btn ai-alt" disabled' in html, \
+        "「⭐ 存为行程方案」默认禁用"
+    send = planner_fn(html, "plannerSend", "function onPlannerKeydown")
+    assert "if(state.planner.busy) return;" in send, "发送中再点直接忽略(不并发两轮 LLM)"
+    assert "setPlannerBusy(true)" in send and "setPlannerBusy(false)" in send
+    assert "renderPlannerMsgs();" in send, "状态变了要重渲染消息流"
+
+
+def test_planner_bubbles_render_itinerary_cards(html: str) -> None:
+    bubble = planner_fn(html, "plannerBubbleHtml", "// 按钮态 + 「已点名 N 条」")
+    assert 'class="ai-bubble ' in bubble and "ai-me" in bubble and "ai-bot" in bubble, "用户/助手两种气泡"
+    assert "PLANNER_ROLE_LABEL[item.role]" in bubble, "气泡要标出是谁说的"
+    assert "esc(item.content)" in bubble, "正文要过 esc()(AI 文本不可信)"
+    assert 'plannerItineraryHtml(item.itinerary)' in bubble and '(mine?"":' in bubble, \
+        "只有助手气泡渲染行程卡片"
+    assert 'replace(/\\n/g,"<br>")' in bubble, "多行 reply 要保留换行"
+    day = planner_fn(html, "plannerDayHtml", "function plannerItineraryHtml")
+    assert 'ai-day-ttl">Day ' in day and '" · "+esc(data.base)' in day, "每天一块「Day N · base」"
+    assert "data.stops" in day and "plannerStopHtml" in day and "data.tip" in day
+    stop = planner_fn(html, "plannerStopHtml", "function plannerDayHtml")
+    assert "data.name" in stop and "data.reason" in stop, "stops 要有名称与一句理由"
+    assert "data.collection_id" in stop and "ai-ref" in stop, "点名收藏排进来的站要标出来"
+    assert "理由待核实" in stop, "AI 没给理由写「待核实」,不套话、不编造"
+    msgs = planner_fn(html, "renderPlannerMsgs", "// 点名标签")
+    assert "PLANNER_EMPTY_TEXT" in msgs and "PLANNER_LOADING_TEXT" in msgs, "空态/加载态要有中文占位"
+    assert "box.scrollTop=box.scrollHeight" in msgs, "最新一轮要滚到可见"
+
+
+def test_planner_itinerary_contract_matches_backend(html: str) -> None:
+    """真跑后端 parse_itinerary():前端读的行程键必须与后端归一后的形状一致。"""
+    itinerary, snippet = planner_service.parse_itinerary(SAMPLE_ITINERARY_JSON)
+    assert itinerary is not None and snippet is None, "样例行程应能被后端解析出来"
+    assert set(ITINERARY_FIELDS) <= set(itinerary), f"后端行程形状变了:{sorted(itinerary)}"
+    assert set(DAY_FIELDS) <= set(itinerary["days"][0]), f"后端 day 形状变了:{itinerary['days'][0]}"
+    assert set(STOP_FIELDS) <= set(itinerary["days"][0]["stops"][0]), "后端 stop 形状变了"
+    section = planner_section(html)
+    card = section[section.index("function plannerItineraryHtml"):section.index("function plannerBubbleHtml")]
+    for field in ITINERARY_FIELDS:
+        assert f"itinerary.{field}" in card or f".{field}" in card, f"前端没有消费 itinerary.{field}"
+    day = planner_fn(html, "plannerDayHtml", "function plannerItineraryHtml")
+    for field in DAY_FIELDS:
+        assert f"data.{field}" in day, f"前端没有消费 day.{field}"
+    stop = planner_fn(html, "plannerStopHtml", "function plannerDayHtml")
+    for field in STOP_FIELDS:
+        assert f"data.{field}" in stop, f"前端没有消费 stop.{field}"
+    assert "unused_collections" in card and "点了名但没排进去" in card, \
+        "点了名却没排进去的收藏要有可见提示"
+
+
+def test_planner_degraded_reasons_are_visible(html: str) -> None:
+    section = planner_section(html)
+    reasons = js_map(html, "PLANNER_REASON_TEXT")
+    assert set(planner_service.DEGRADE_REASONS) == {"no_key", "timeout", "error", "parse_error"}
+    for key in planner_service.DEGRADE_REASONS:
+        assert re.search(rf'{key}:"[^"]{{4,}}"', reasons), f"降级原因 {key} 要有中文文案"
+    degraded = planner_fn(html, "plannerDegradedHtml", "// 一个 stop")
+    assert "原因:" in degraded and "esc(code)" in degraded, "原因码要摆到明面上"
+    assert "没有编造行程" in degraded, "降级要说清「没编造行程」并可重试"
+    bubble = planner_fn(html, "plannerBubbleHtml", "// 按钮态 + 「已点名 N 条」")
+    assert "(!mine&&item.degraded)?plannerDegradedHtml(item.reason)" in bubble, \
+        "助手气泡 degraded=true 就渲染降级块(绝不静默)"
+    send = planner_fn(html, "plannerSend", "function onPlannerKeydown")
+    assert "degraded:result.degraded" in send and "reason:result.reason" in send, "POST 响应要接住降级字段"
+    assert "if(result.itinerary) state.planner.lastItinerary=result.itinerary" in send, \
+        "降级轮不覆盖上一版行程(存为方案还指着它)"
+    assert "AI 行程规划失败" in send and "error.message" in send, "接口失败也要有可见中文报错"
+    item_of = planner_fn(html, "plannerItemOf", "// 降级绝不静默")
+    for field in ("payload.itinerary", "payload.degraded", "payload.reason", "payload.generated_at"):
+        assert field in item_of, f"回放的历史项要读 {field}(助手消息的结构化行程在 payload 里)"
+
+
+def test_planner_replays_history_on_tab_switch(html: str) -> None:
+    opener = planner_fn(html, "openPlannerTab", "// itinerary.days[].stops 展平")
+    assert "renderPlannerTags();" in opener and "loadPlannerMessages();" in opener
+    load = planner_fn(html, "loadPlannerMessages", "// 切到「🤖 AI 行程」")
+    assert 'encodeURIComponent(key)' in load and '"&limit="+PLANNER_HISTORY_LIMIT' in load
+    assert "result.items" in load and "plannerItemOf" in load, "回放要逐条归一成气泡数据"
+    assert "plannerLastItinerary(items)" in load, "回放后「⭐ 存为行程方案」要按最近一版行程解锁"
+    assert "对话历史读取失败" in load and "error.message" in load
+    assert "if(!key){" in load, "本机没有会话 key 时直接给空态(不打无谓的 400)"
+    last = planner_fn(html, "plannerLastItinerary", "async function loadPlannerMessages")
+    assert "itinerary" in last and "return null" in last, "找不到行程就返回 null(不猜)"
+
+
+def test_planner_save_payload_fields_match_backend(html: str) -> None:
+    save = planner_fn(html, "plannerSavePlan", "// 「🗑 清空对话」")
+    for field in PLANNER_SAVE_BODY_FIELDS:
+        assert re.search(rf"\b{field}:", save), f"save 请求体缺少字段 {field}"
+    assert "legs:[],stay:[]" in save, "阶段 A:legs / stay 恒空(交通住宿是阶段 B)"
+    assert "stops:stops" in save and "name:plannerPlanName()" in save and "nights:planNights()" in save
+    assert "还没有可保存的行程" in save, "没有行程卡片时就地给中文提示(不打无谓的 400)"
+    assert "存为行程方案失败" in save and "error.message" in save, "后端 400 中文报错要透出"
+    stops_fn = planner_fn(html, "plannerStops", "// 方案名 = 唯一键")
+    assert "state.planner.lastItinerary" in stops_fn and "day.stops" in stops_fn, \
+        "stops 从 itinerary.days[].stops 展平"
+    assert "collection_id:((isFinite(id)&&id>0)?id:null)" in stops_fn, "没有 collection_id 就传 null"
+    name_fn = planner_fn(html, "plannerPlanName", "// 存为方案的结果")
+    assert "days_count" in name_fn and "base" in name_fn, "方案名带城市与天数(同名 = 幂等刷新)"
+
+
+def test_planner_save_result_contract_matches_backend(html: str, planner_saved: dict[str, Any]) -> None:
+    """真跑 POST /api/planner/save:前端读的键必须都在真实响应里(字段名对不上这里当场红)。"""
+    save_html = planner_fn(html, "plannerSaveHtml", "function renderPlannerSaveOut")
+    assert not (referenced_fields(save_html, "data") - set(planner_saved)), \
+        f"前端读了 save 响应里没有的键:{sorted(referenced_fields(save_html, 'data') - set(planner_saved))}"
+    plan = planner_saved["trip_plan"]
+    assert not (referenced_fields(save_html, "plan") - set(plan)), "前端读了 trip_plan 里没有的键"
+    quote = plan["quote"]
+    assert set(QUOTE_FIELDS) <= set(quote), f"后端 quote 缺字段:{sorted(quote)}"
+    assert not (referenced_fields(save_html, "quote") - set(quote)), "前端读了 quote 里没有的键"
+    assert "plan.name" in save_html, "要显示方案名"
+    assert "moneyRange(quote.total_cny_low,quote.total_cny_high)" in save_html, "要显示总预算估算区间"
+    assert "KIND_BADGE[quote.kind]" in save_html and "quote.note" in save_html, \
+        "金额必须带「估算」标注与后端免责文案"
+    assert "PLANNER_UNMATCHED_TEXT" in save_html and "unmatched.length" in save_html, \
+        "unmatched 要有「N 个地点未在库内,未纳入」提示"
+    assert js_string(html, "PLANNER_UNMATCHED_TEXT") == PLANNER_UNMATCHED_TEXT
+    assert "data.created===false" in save_html, "同名方案 = 幂等刷新,要标出来"
+    # 后端真实结果:两站命中、宋城进 unmatched;quote 仍是既有 estimate 口径
+    assert planner_saved["unmatched"] == ["宋城"]
+    assert [item["name"] for item in planner_saved["matched"]] == ["西湖", "灵隐寺"]
+    assert quote["kind"] == trip_service.QUOTE_KIND and quote["note"] == trip_service.QUOTE_NOTE
+    save_fn = planner_fn(html, "plannerSavePlan", "// 「🗑 清空对话」")
+    assert "loadTripPlans()" in save_fn and "refreshFavItems()" in save_fn, \
+        "存完方案:「🧳 行程方案」列表与收藏/点名标签都同源刷新"
+
+
+def test_planner_clear_conversation_uses_delete(html: str) -> None:
+    section = planner_section(html)
+    clear = section[section.index("async function plannerClear"):]
+    assert 'sendJSON(PLANNER_MSG_API+"?session_key="+encodeURIComponent(key),{method:"DELETE"})' in clear
+    assert "state.planner.items=[]" in clear and "state.planner.lastItinerary=null" in clear, \
+        "清空后本地也要清干净(存为方案按钮回到禁用)"
+    assert "清空对话失败" in clear and "error.message" in clear, "失败要有可见中文报错"
+    assert "renderPlannerSaveOut(\"\")" in clear or 'renderPlannerSaveOut("")' in clear, "旧的保存结果要撤掉"
+    assert '$("plannerClear").addEventListener("click",plannerClear)' in html
+    assert js_string(html, "PLANNER_CLEAR_LABEL") == PLANNER_CLEAR_LABEL
+    assert PLANNER_CLEAR_LABEL in planner_pane(html), "清空按钮在面板里可见"
+
+
+def test_planner_stage_a_does_not_invent_money(html: str) -> None:
+    section = planner_section(html)
+    card = section[section.index("function plannerItineraryHtml"):section.index("function plannerBubbleHtml")]
+    for token in ("fmtCost", "moneyRange", "transport_cny", "price_estimate", "total_cny"):
+        assert token not in card, f"阶段 A 的行程卡片不许出现金额:{token}"
+    assert js_string(html, "PLANNER_STAGE_NOTE").startswith("阶段 A")
+    assert "PLANNER_STAGE_NOTE" in card, "卡片要标清「阶段 A:只排每天的目的地」"
+    pane = planner_pane(html)
+    assert "阶段 A" in pane and "不含交通报价 / 住宿 / 总预算" in pane, "面板要写清阶段 A 的边界"
+    assert "不编" in pane, "面板要写清「不编数字」"
+    assert "估算" in section, "金额只来自后端 quote(估算口径)"
+
+
+def test_planner_tab_keeps_existing_tabs_and_adds_no_key(html: str) -> None:
+    section = planner_section(html)
+    assert not re.search(r"[a-f0-9]{32}", section), "AI 行程段不得出现 32 位 key 样态字符串"
+    assert "amap_js_key" not in section and ENV_JS_KEY not in section, "不新增前端 key"
+    assert "new AMap." not in section and "fetch(" not in section
+    assert inline_script(html), "仍只有一段内联脚本(没引第三方 JS)"
+    # 既有两个 tab 零回归:DOM、切换与各自的加载入口都还在
+    for element_id in ("favTabFav", "favTabPlan", "favPaneFav", "favPanePlan", "planPicker", "planList"):
+        assert f'id="{element_id}"' in html, f"既有 tab 的 DOM 少了 {element_id}"
+    switch = switch_section(html)
+    assert "renderPlanPicker();loadTripPlans();" in switch, "「🧳 行程方案」tab 的加载入口不变"
+    assert '$("favTabFav").addEventListener("click",()=>switchFavTab("fav"))' in html
+    assert '$("favTabPlan").addEventListener("click",()=>switchFavTab("plan"))' in html
+    assert "state.tripPlan.tab" in switch, "tab 状态仍存在 state.tripPlan.tab(沿用现有机制)"

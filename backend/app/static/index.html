@@ -163,6 +163,44 @@
   .fp-recalc{margin-top:7px;margin-right:7px;padding:4px 11px;font-size:12px;background:#e0f2fe;color:#075985;border-radius:7px}
   .fp-recalc:hover{background:#bae6fd}
   .fp-recalc:disabled{opacity:.5;cursor:wait}
+  /* AI 行程(TASK-10c):第三个 tab —— 对话气泡 + 按天行程卡片 + 点名收藏标签。
+     类名一律 ai-*(.pl-* 已被地图下方列表占着);配色沿用面板既有的青/黄口径。 */
+  .ai-msgs{margin-top:10px;max-height:38vh;overflow:auto;border:1px solid #e5e7eb;
+           border-radius:10px;padding:8px 9px;background:#fcfefd}
+  .ai-bubble{border-radius:10px;padding:7px 9px;margin-top:7px;font-size:13px;line-height:1.55}
+  .ai-bubble:first-child{margin-top:0}
+  .ai-me{background:#e0f2fe;color:#0c4a6e;margin-left:24px}
+  .ai-bot{background:#f0fdfa;border:1px solid #99f6e4;color:#1f2937;margin-right:12px}
+  .ai-who{font-size:11px;color:#6b7280;font-weight:700}
+  .ai-time{font-weight:400;color:#9ca3af;margin-left:6px}
+  .ai-text{margin-top:3px}
+  /* 降级(no_key/timeout/error/parse_error)必须显眼:黄底 + 原因码,绝不静默 */
+  .ai-degraded{margin-top:5px;background:#fef3c7;color:#92400e;border-radius:8px;
+               padding:6px 8px;font-size:12px}
+  .ai-card{margin-top:8px;border-top:1px dashed #99f6e4;padding-top:7px}
+  .ai-sum{font-size:12px;color:#0f766e;font-weight:700}
+  .ai-day{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
+  .ai-day-ttl{font-weight:700;font-size:13px;color:#0f766e}
+  .ai-stops{margin:5px 0 0;padding-left:19px}
+  .ai-stop{font-size:12px;color:#1f2937;margin-top:4px}
+  .ai-why{display:block;color:#6b7280;font-size:11px;margin-top:1px}
+  .ai-why.ai-todo{color:#9ca3af;font-style:italic}
+  .ai-ref{display:inline-block;margin-left:5px;background:#fef3c7;color:#92400e;font-size:11px;
+          border-radius:8px;padding:0 6px}
+  .ai-tip{margin-top:6px;font-size:11px;color:#374151;background:#f8fafc;border-radius:7px;padding:5px 7px}
+  .ai-note{margin-top:7px;font-size:11px;color:#9ca3af}
+  .ai-warn{margin-top:6px;font-size:11px;color:#92400e;background:#fef3c7;border-radius:7px;padding:5px 7px}
+  .ai-tags{margin-top:11px;border-top:1px solid #e5e7eb;padding-top:8px}
+  .ai-tag{margin:5px 5px 0 0;padding:3px 9px;font-size:12px;background:#f3f4f6;color:#374151;border-radius:12px}
+  .ai-tag:hover{background:#e0f2fe;color:#075985}
+  .ai-tag.on{background:#0f766e;color:#fff;font-weight:700}
+  .ai-in-row{margin-top:9px}
+  #plannerInput{width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;font-family:inherit;
+                border:1px solid #d1d5db;border-radius:9px;background:#fff;resize:vertical}
+  .ai-acts{margin-top:8px;display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+  .ai-acts .fp-save-btn,.ai-acts .fp-del{margin-top:0}
+  .ai-alt{background:#0369a1}
+  .ai-alt:hover{background:#075985}
   /* 前往预订(TASK-4b):deep-link 聚合,只跳转不代订 */
   .bk-row{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
   .bk-nm{font-size:12px;font-weight:700;color:#374151}
@@ -372,13 +410,17 @@
         <div class="rp-ttl" id="favPanelTitle">⭐ 我的收藏</div>
         <button type="button" id="favPanelClose" class="rp-x" title="关闭收藏列表">✕</button>
       </div>
-      <!-- tab(TASK-5b):「我的收藏」对比 / 「行程方案」组合(后端持久化),互斥显示 -->
-      <div class="fp-tabs" role="tablist" aria-label="收藏与行程方案">
+      <!-- tab(TASK-5b / TASK-10c):「我的收藏」对比 / 「行程方案」组合(后端持久化)/
+           「AI 行程」对话式规划,三个 pane 互斥显示(state.tripPlan.tab) -->
+      <div class="fp-tabs" role="tablist" aria-label="收藏、行程方案与 AI 行程">
         <button type="button" id="favTabFav" class="fp-tab sel" role="tab" aria-selected="true"
                 aria-controls="favPaneFav" title="按类型分组看收藏快照(路线时长/费用、住宿预估价)">⭐ 我的收藏</button>
         <button type="button" id="favTabPlan" class="fp-tab" role="tab" aria-selected="false"
                 aria-controls="favPanePlan"
                 title="勾选收藏组合成方案(POST/GET/DELETE /api/trip-plans,后端持久化)">🧳 行程方案</button>
+        <button type="button" id="favTabAi" class="fp-tab" role="tab" aria-selected="false"
+                aria-controls="favPaneAi"
+                title="和 AI 多轮对话排「每天的目的地」;想用自己的收藏要先在下面点名(@标签)">🤖 AI 行程</button>
       </div>
       <div id="favPaneFav" role="tabpanel" aria-labelledby="favTabFav">
         <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
@@ -418,6 +460,41 @@
           <div id="planList"></div>
           <div class="fp-total-note" id="planApiNote"></div>
         </div>
+      </div>
+      <!-- AI 行程(TASK-10c,阶段 A):多轮对话 → 按天行程卡片 → 「⭐ 存为行程方案」落成既有 TripPlan。
+           接口:POST/GET/DELETE /api/planner/messages + POST /api/planner/save(键名见 app/api/planner.py)。
+           口径:①**点名才带**(collection_ids 恒等于已点名的那几条,没点名就是空数组,绝不省略字段
+           —— 省略后端会把全部收藏当素材);②降级四态一律显示原因 + 后端中文文案;③本阶段只排目的地,
+           交通/住宿/总预算不编,金额只在存为方案后由后端按当时口径估算返回。 -->
+      <div id="favPaneAi" role="tabpanel" aria-labelledby="favTabAi" style="display:none">
+        <div class="fp-plan-ttl">🤖 AI 行程(对话式规划 · 阶段 A)</div>
+        <div class="fp-sub">说需求(如「3 天,亲子,不要太累」)→ AI 排出<b>每天的目的地</b>(顺序 + 一句理由),
+          可以继续追问改(如「第二天换成古镇」)。想用自己的收藏,<b>先点下面的 @标签点名</b>:
+          未点名的一律不会进请求。本阶段不含交通报价 / 住宿 / 总预算(阶段 B 再做);
+          AI 拿不到的事实(门票 / 开放时间等)写「待核实」,<b>不编数字</b>。</div>
+        <div id="plannerErr" class="fp-err" style="display:none"></div>
+        <div class="ai-msgs" id="plannerMsgs"></div>
+        <div class="ai-tags" id="plannerTagWrap">
+          <div class="fp-grp-ttl">点名收藏<span class="fp-grp-cnt" id="plannerTagCount">已点名 0 条</span></div>
+          <div class="fp-sub">点一下 = 加入本次请求的 collection_ids + 在输入框插入 @引用;再点一下取消。</div>
+          <div id="plannerTags"></div>
+        </div>
+        <div class="ai-in-row">
+          <label class="fp-sub" for="plannerInput">这一轮想说什么(Enter 发送 · Shift+Enter 换行)</label>
+          <textarea id="plannerInput" rows="3" maxlength="2000"
+                    placeholder="例:3 天,亲子,不要太累;第二天想换成古镇"></textarea>
+        </div>
+        <div class="ai-acts">
+          <button type="button" id="plannerSend" class="fp-save-btn"
+                  title="POST /api/planner/messages(只带已点名的 collection_ids)">📨 发送(Enter)</button>
+          <button type="button" id="plannerSave" class="fp-save-btn ai-alt" disabled
+                  title="POST /api/planner/save:把 AI 排的地点落成既有行程方案(晚数取「🧳 行程方案」tab 的住几晚)">⭐ 存为行程方案</button>
+          <button type="button" id="plannerClear" class="fp-del"
+                  title="DELETE /api/planner/messages:只删对话消息,会话 key 保留">🗑 清空对话</button>
+        </div>
+        <div id="plannerSaveOut" style="display:none"></div>
+        <div class="fp-sub" id="plannerHint">对话历史存在后端(按 session_key),key 只存在本机
+          localStorage 的 w2g_planner_session 里,刷新页面不丢;换设备/清了本机存储就要重新开一轮。</div>
       </div>
     </div>
   </div>
@@ -547,6 +624,10 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
                    busy:false,auto:true,token:0,detailToken:0},
              list:{reco:0,other:0},
              tripPlan:{tab:"fav",items:[],picked:{place:[],legs:[],stay:[]},note:"",busy:false},
+             // AI 行程(TASK-10c):sessionKey 由后端补发并存 localStorage(刷新不丢对话);
+             // items 是归一后的气泡数据;mentioned = **已点名**的 Collection.id(只有它们进
+             // collection_ids);lastItinerary = 最近一版结构化行程(「⭐ 存为行程方案」用它)
+             planner:{sessionKey:"",items:[],busy:false,mentioned:[],lastItinerary:null},
              // 详情弹窗(TASK-8b):token 守卫在飞的 media/highlights 响应;lastFocus 用于关闭后归还焦点
              modal:{open:false,place:null,index:-1,images:[],hero:0,token:0,lastFocus:null},
              mapNote:""};   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
@@ -2624,6 +2705,7 @@ async function refreshFavItems(){
   if(state.fav.open){
     renderFavItems();renderBookSection();setFavErr("");
     renderPlanPicker();                                  // 勾选面与收藏同源(TASK-5b)
+    renderPlannerTags();                                 // 点名标签与收藏同源(TASK-10c)
     if(state.tripPlan.tab==="plan") loadTripPlans();     // 删收藏会让方案 quote 出现 missing,顺手刷一次
   }
   syncFavButtons();
@@ -2955,21 +3037,24 @@ function onPlanListClick(event){
   const recalc=target.closest(".js-plan-recalc");
   if(recalc) recalcTripPlan(recalc.getAttribute("data-id"));
 }
-// tab 切换:两个 pane 互斥显示;切到「行程方案」时刷一次列表(后端已按新的在前排序)
+// 收藏面板的三个 tab 键(TASK-10c 加了 ai):DOM 对应 favPaneFav|favPanePlan|favPaneAi
+const FAV_TABS=["fav","plan","ai"];
+// tab 切换:三个 pane 互斥显示(我的收藏 / 行程方案 / AI 行程,TASK-10c 加了第三个);
+// 切到「行程方案」刷一次列表(后端已按新的在前排序),切到「AI 行程」刷点名标签 + 回放对话历史
 function switchFavTab(which){
-  state.tripPlan.tab=(which==="plan")?"plan":"fav";
-  const onPlan=(state.tripPlan.tab==="plan");
-  const panes={fav:$("favPaneFav"),plan:$("favPanePlan")};
-  const tabs={fav:$("favTabFav"),plan:$("favTabPlan")};
-  ["fav","plan"].forEach(key=>{
-    const active=((key==="plan")===onPlan);
+  state.tripPlan.tab=(FAV_TABS.indexOf(which)>=0)?which:"fav";
+  const panes={fav:$("favPaneFav"),plan:$("favPanePlan"),ai:$("favPaneAi")};
+  const tabs={fav:$("favTabFav"),plan:$("favTabPlan"),ai:$("favTabAi")};
+  FAV_TABS.forEach(key=>{
+    const active=(key===state.tripPlan.tab);
     if(panes[key]) panes[key].style.display=active?"block":"none";
     if(tabs[key]){
       tabs[key].classList.toggle("sel",active);
       tabs[key].setAttribute("aria-selected",active?"true":"false");
     }
   });
-  if(onPlan){renderPlanPicker();loadTripPlans();}
+  if(state.tripPlan.tab==="plan"){renderPlanPicker();loadTripPlans();}
+  if(state.tripPlan.tab==="ai") openPlannerTab();
 }
 
 // --------------------------------------------------------------------------- //
@@ -3044,6 +3129,416 @@ function renderBookSection(){
   html+='<div class="fp-total-note">'+esc(BOOK_DISCLAIMER)+"</div>";
   box.innerHTML=html;
   section.style.display="block";
+}
+
+// --------------------------------------------------------------------------- //
+// AI 行程(TASK-10c,阶段 A):收藏面板第三个 tab「🤖 AI 行程」—— 多轮对话 +
+//   **点名收藏**(@标签)+ 按天行程卡片 + 「⭐ 存为行程方案」落成既有 TripPlan。
+// 接口(全在 app/api/planner.py,键名逐字照抄,前端只读这些键):
+//   POST   /api/planner/messages {session_key,message,collection_ids,nights}
+//          → {session_key,title,reply,itinerary|null,degraded,reason,turn_index,generated_at}
+//   GET    /api/planner/messages?session_key=&limit=
+//          → {session_key,title,items:[{role,content,payload,created_at}]}
+//   DELETE /api/planner/messages?session_key=  → {session_key,deleted}
+//   POST   /api/planner/save {session_key,name,stops,legs,stay,nights}
+//          → {trip_plan(含 quote),matched,unmatched,created,idempotent,nights,count,…}
+// 四条口径(契约 §0 / §3 TASK-10c):
+//   ① 阶段 A 只排「每天的目的地」:交通 / 住宿 / 总预算一律不编;金额只在「存为方案」后
+//      由后端按收藏快照的当时口径估算返回(quote.kind 恒为 estimate);
+//   ② **点名才带**:collection_ids 恒等于「已点名」的那几条 id;没点名就是**空数组**
+//      (绝不省略这个字段 —— 省略后端会按契约把当前全部收藏当"可选素材"送进 prompt);
+//   ③ 降级四态(no_key / timeout / error / parse_error)一律显示可见文案 + 原因码,绝不静默;
+//   ④ session_key 由后端补发,前端只把它存进 localStorage(刷新不丢对话);**不新增前端 key**、
+//      不引第三方 JS,只经既有 getJSON() / sendJSON() 打接口。
+// --------------------------------------------------------------------------- //
+const PLANNER_MSG_API="/api/planner/messages";
+const PLANNER_SAVE_API="/api/planner/save";
+const PLANNER_SESSION_STORE="w2g_planner_session";   // 只存后端补发的 session_key,不存任何 key/密钥
+const PLANNER_HISTORY_LIMIT=50;   // 回放条数(与后端 LIST_LIMIT_DEFAULT 同口径,后端上限 200)
+const PLANNER_MSG_MAX=2000;       // 单条消息字数上限(与后端 planner.MAX_MESSAGE_LEN 同口径)
+const PLANNER_SEND_LABEL="📨 发送(Enter)";
+const PLANNER_BUSY_LABEL="AI 规划中…(首次约 1 分钟)";
+const PLANNER_SAVE_LABEL="⭐ 存为行程方案";
+const PLANNER_CLEAR_LABEL="🗑 清空对话";
+const PLANNER_EMPTY_TEXT="还没有对话:说一句需求(如「3 天,亲子,不要太累」),AI 会排出每天的目的地。";
+const PLANNER_LOADING_TEXT="正在读取对话历史(GET /api/planner/messages)…";
+const PLANNER_WAIT_TEXT="AI 正在排这一轮行程,首次约 1 分钟,别关页面…";
+const PLANNER_TAG_EMPTY="还没有收藏可点名:先在「⭐ 我的收藏」tab 里收藏目的地 / 路线 / 住宿。";
+const PLANNER_STAGE_NOTE="阶段 A:只排每天的目的地;交通 / 住宿 / 总预算等你确认后再细化(不编数字)。";
+const PLANNER_UNMATCHED_TEXT="个地点未在库内,未纳入";
+const PLANNER_ROLE_LABEL={user:"我",assistant:"🤖 AI"};
+// 降级原因码 → 中文(后端 reply 里已带完整说明,这里再把**码**摆到明面上,一眼看出是哪一类)
+const PLANNER_REASON_TEXT={no_key:"服务端没配可用的 LLM key",timeout:"模型超时(可重试)",
+  error:"模型调用失败(可重试)",parse_error:"返回的不是合法行程 JSON(换种说法重试)"};
+
+// 会话 key:后端补发(uuid4().hex),前端只负责存 / 取;读不到(隐私模式、被清)就当新会话
+function plannerSessionKey(){
+  if(state.planner.sessionKey) return state.planner.sessionKey;
+  let stored="";
+  try{stored=String(localStorage.getItem(PLANNER_SESSION_STORE)||"").trim();}
+  catch(error){stored="";}
+  state.planner.sessionKey=stored;
+  return stored;
+}
+function rememberPlannerSession(key){
+  const value=String(key||"").trim();
+  if(!value) return;
+  state.planner.sessionKey=value;
+  try{localStorage.setItem(PLANNER_SESSION_STORE,value);}
+  catch(error){/* 存不下只影响刷新续聊,这一轮对话照常 */}
+}
+function setPlannerErr(message){
+  const box=$("plannerErr");
+  if(!box) return;
+  box.textContent=message||"";
+  box.style.display=message?"block":"none";
+}
+// 两种来源归一成同一种气泡数据:POST 的响应(reply/itinerary/degraded/reason 平铺)
+// 与 GET 回放的历史项({role,content,payload:{itinerary,degraded,reason,generated_at},created_at})
+function plannerItemOf(raw){
+  const data=raw||{};
+  const payload=(data.payload&&typeof data.payload==="object")?data.payload:{};
+  const content=(data.content===undefined||data.content===null)?data.reply:data.content;
+  return {
+    role:(data.role==="user")?"user":"assistant",
+    content:String(content===undefined||content===null?"":content),
+    itinerary:payload.itinerary||data.itinerary||null,
+    degraded:!!(payload.degraded||data.degraded),
+    reason:String(payload.reason||data.reason||""),
+    at:String(payload.generated_at||data.generated_at||data.created_at||"")
+  };
+}
+// 降级绝不静默:原因码 + 中文原因 + 「没编造行程」都写在气泡最上面
+function plannerDegradedHtml(reason){
+  const code=String(reason||"").trim();
+  const label=PLANNER_REASON_TEXT[code]||"后端没给原因码(按 error 处理)";
+  return '<div class="ai-degraded">⚠️ 本轮降级(原因:'+(code?esc(code):"unknown")+" · "+esc(label)+
+    ")—— 没有编造行程,按下面这段说明重试即可。</div>";
+}
+// 一个 stop:名称 + 一句理由(点名收藏的那条标出来)+ 缺理由写「待核实」不套话
+function plannerStopHtml(stop){
+  const data=stop||{};
+  const reason=String(data.reason||"").trim();
+  const collectionId=Number(data.collection_id);
+  return '<li class="ai-stop"><b>'+esc(data.name||"(未命名地点)")+"</b>"+
+    ((isFinite(collectionId)&&collectionId>0)
+      ? ('<span class="ai-ref" title="这一站来自你点名的收藏 #'+collectionId+'">@点名收藏</span>')
+      : "")+
+    (reason
+      ? ('<span class="ai-why">'+esc(reason)+"</span>")
+      : '<span class="ai-why ai-todo">理由待核实(AI 这一站没给理由)</span>')+
+    "</li>";
+}
+// 行程卡片:每天一块「Day N · base」+ stops + tip
+function plannerDayHtml(day){
+  const data=day||{};
+  const stops=Array.isArray(data.stops)?data.stops:[];
+  return '<div class="ai-day"><div class="ai-day-ttl">Day '+Number(data.day||0)+
+    (String(data.base||"").trim()?(" · "+esc(data.base)):"")+"</div>"+
+    '<ol class="ai-stops">'+stops.map(plannerStopHtml).join("")+"</ol>"+
+    (String(data.tip||"").trim()?('<div class="ai-tip">💡 '+esc(data.tip)+"</div>"):"")+
+    "</div>";
+}
+function plannerItineraryHtml(itinerary){
+  const days=(itinerary&&Array.isArray(itinerary.days))?itinerary.days:[];
+  if(!days.length) return "";
+  const summary=String((itinerary&&itinerary.summary)||"").trim();
+  const unused=(itinerary&&Array.isArray(itinerary.unused_collections))?itinerary.unused_collections:[];
+  const count=Number((itinerary&&itinerary.days_count)||days.length);
+  return '<div class="ai-card">'+
+    (summary?('<div class="ai-sum">'+esc(summary)+"</div>"):"")+
+    days.map(plannerDayHtml).join("")+
+    '<div class="ai-note">共 '+count+" 天 · "+esc(PLANNER_STAGE_NOTE)+"</div>"+
+    (unused.length
+      ? ('<div class="ai-warn">⚠️ 点了名但没排进去:'+unused.map(name=>esc(name)).join("、")+
+         " —— 可以追问一句「为什么没用 XX」让它改。</div>")
+      : "")+
+    "</div>";
+}
+function plannerBubbleHtml(item){
+  const mine=(item.role==="user");
+  return '<div class="ai-bubble '+(mine?"ai-me":"ai-bot")+'">'+
+    '<div class="ai-who">'+esc(PLANNER_ROLE_LABEL[item.role]||item.role)+
+      (item.at?('<span class="ai-time">'+esc(fmtGeneratedAt(item.at))+"</span>"):"")+"</div>"+
+    ((!mine&&item.degraded)?plannerDegradedHtml(item.reason):"")+
+    '<div class="ai-text">'+esc(item.content).replace(/\n/g,"<br>")+"</div>"+
+    (mine?"":plannerItineraryHtml(item.itinerary))+
+    "</div>";
+}
+// 按钮态 + 「已点名 N 条」:发送中禁用并换文案;没有 lastItinerary 时不许存为方案
+function syncPlannerActs(){
+  const busy=!!state.planner.busy;
+  const send=$("plannerSend"),save=$("plannerSave"),clear=$("plannerClear");
+  if(send){send.disabled=busy;send.textContent=busy?PLANNER_BUSY_LABEL:PLANNER_SEND_LABEL;}
+  if(save){save.disabled=busy||!state.planner.lastItinerary;save.textContent=PLANNER_SAVE_LABEL;}
+  if(clear){clear.disabled=busy;clear.textContent=PLANNER_CLEAR_LABEL;}
+  const count=$("plannerTagCount");
+  if(count) count.textContent="已点名 "+plannerMentionedIds().length+" 条";
+}
+function setPlannerBusy(busy){
+  state.planner.busy=!!busy;
+  syncPlannerActs();
+}
+function renderPlannerMsgs(){
+  const box=$("plannerMsgs");
+  if(!box) return;
+  const items=state.planner.items||[];
+  if(!items.length){
+    box.innerHTML='<div class="fp-empty">'+
+      esc(state.planner.busy?PLANNER_LOADING_TEXT:PLANNER_EMPTY_TEXT)+"</div>";
+  }else{
+    box.innerHTML=items.map(plannerBubbleHtml).join("")+
+      (state.planner.busy?('<div class="fp-empty">'+esc(PLANNER_WAIT_TEXT)+"</div>"):"");
+  }
+  box.scrollTop=box.scrollHeight;   // 最新一轮总在下面
+  syncPlannerActs();
+}
+// 点名标签:一条收藏一个 @名称 按钮(与「⭐ 我的收藏」同源,收藏变了自动跟着刷)
+function plannerTagKindLabel(item){
+  const group=favGroupOf(item);
+  return FAV_GROUP_TITLES[group==="route"?"legs":group]||"";
+}
+function plannerTagHtml(item){
+  const id=Number(item.id);
+  const on=state.planner.mentioned.indexOf(id)>=0;
+  const name=String(item.name||"(无名)");
+  return '<button type="button" class="ai-tag js-planner-tag'+(on?" on":"")+'" data-id="'+id+
+    '" data-name="'+esc(name)+'" title="'+esc(plannerTagKindLabel(item))+" #"+id+
+    ' · 点一下 = 加入本次请求的 collection_ids 并在输入框插入 @引用;再点一下取消">'+
+    (on?"✓ ":"")+"@"+esc(name)+"</button>";
+}
+function renderPlannerTags(){
+  const box=$("plannerTags");
+  if(!box) return;
+  const items=state.fav.items||[];
+  // 点名过的收藏可能刚被删掉:按当前收藏列表剔掉失效 id(免得请求里带死 id)
+  const alive=items.map(item=>Number(item.id));
+  state.planner.mentioned=plannerMentionedIds().filter(id=>alive.indexOf(id)>=0);
+  box.innerHTML=items.length
+    ? items.map(plannerTagHtml).join("")
+    : '<div class="fp-empty">'+esc(PLANNER_TAG_EMPTY)+"</div>";
+  syncPlannerActs();
+}
+// 只有点过名的收藏 id 会进请求;没点名 = 空数组(**不是**省略字段)
+function plannerMentionedIds(){
+  return (state.planner.mentioned||[]).map(id=>Number(id)).filter(id=>isFinite(id)&&id>0);
+}
+function plannerMentionToken(name){return "@"+String(name||"").trim()+" ";}
+function onPlannerTagClick(event){
+  const target=event.target;
+  const tag=(target&&target.closest)?target.closest(".js-planner-tag"):null;
+  if(!tag) return;
+  event.stopPropagation();
+  togglePlannerMention(tag.getAttribute("data-id"),tag.getAttribute("data-name"));
+}
+function togglePlannerMention(rawId,name){
+  const id=Number(rawId);
+  if(!isFinite(id)||id<=0) return;
+  const input=$("plannerInput");
+  const token=plannerMentionToken(name);
+  const at=state.planner.mentioned.indexOf(id);
+  if(at>=0){
+    state.planner.mentioned.splice(at,1);
+    if(input){   // 取消点名 = 把刚插进去的 @引用也撤掉,不留会误导的残留文本
+      const place=input.value.indexOf(token);
+      if(place>=0) input.value=input.value.slice(0,place)+input.value.slice(place+token.length);
+    }
+  }else{
+    state.planner.mentioned.push(id);
+    if(input){   // 在光标处插入 @引用(取不到光标位置就追加到末尾)
+      const caret=(typeof input.selectionStart==="number")?input.selectionStart:input.value.length;
+      input.value=input.value.slice(0,caret)+token+input.value.slice(caret);
+      input.focus();
+      input.setSelectionRange(caret+token.length,caret+token.length);
+    }
+  }
+  setPlannerErr("");
+  renderPlannerTags();
+}
+function plannerInputText(){
+  const input=$("plannerInput");
+  return String(input?input.value:"").trim();
+}
+// 请求体:collection_ids 恒等于「已点名」的 id(空数组 = 明确不点名),nights 取方案 tab 的住几晚
+function plannerRequestBody(message){
+  return {session_key:plannerSessionKey()||null,message:message,
+          collection_ids:plannerMentionedIds(),nights:planNights()};
+}
+async function plannerSend(){
+  if(state.planner.busy) return;
+  const message=plannerInputText();
+  if(!message){
+    setPlannerErr("先说一句需求(如「3 天,亲子,不要太累」):空消息后端会 400。");
+    return;
+  }
+  if(message.length>PLANNER_MSG_MAX){
+    setPlannerErr("这一轮说得太长:"+message.length+" 字,上限 "+PLANNER_MSG_MAX+" 字(请分几轮说)。");
+    return;
+  }
+  const input=$("plannerInput");
+  if(input) input.value="";
+  setPlannerErr("");
+  setPlannerBusy(true);
+  state.planner.items.push(plannerItemOf({role:"user",content:message}));
+  renderPlannerMsgs();
+  try{
+    const result=await sendJSON(PLANNER_MSG_API,{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(plannerRequestBody(message))});
+    rememberPlannerSession(result.session_key);
+    state.planner.items.push(plannerItemOf({role:"assistant",content:result.reply,
+      itinerary:result.itinerary,degraded:result.degraded,reason:result.reason,
+      generated_at:result.generated_at}));
+    if(result.itinerary) state.planner.lastItinerary=result.itinerary;   // 降级轮不覆盖上一版行程
+    renderPlannerSaveOut("");                                            // 旧方案的保存结果已不对应
+  }catch(error){
+    // 这一轮没进历史(后端 400 / 网络失败):撤回本地那条用户气泡、原文放回输入框,改完直接重发
+    state.planner.items.pop();
+    if(input&&!input.value.trim()) input.value=message;
+    setPlannerErr("AI 行程规划失败:"+((error&&error.message)||error)+"(这一轮没存进历史,可直接重发)");
+  }finally{
+    setPlannerBusy(false);
+    renderPlannerMsgs();
+  }
+}
+// Enter 发送 / Shift+Enter 换行(换行走 textarea 默认行为,不拦)
+function onPlannerKeydown(event){
+  if(event.key!=="Enter"||event.shiftKey) return;
+  event.preventDefault();
+  plannerSend();
+}
+// 最近一版结构化行程:回放时用来决定「⭐ 存为行程方案」能不能点
+function plannerLastItinerary(items){
+  const rows=items||[];
+  for(let index=rows.length-1;index>=0;index-=1){
+    if(rows[index]&&rows[index].itinerary) return rows[index].itinerary;
+  }
+  return null;
+}
+async function loadPlannerMessages(){
+  const key=plannerSessionKey();
+  if(!key){   // 本机没有会话 key = 后端也没有这段历史:直接空态(不打无谓的 400)
+    state.planner.items=[];
+    state.planner.lastItinerary=null;
+    renderPlannerSaveOut("");
+    renderPlannerMsgs();
+    return;
+  }
+  renderPlannerMsgs();   // 先给「正在读取对话历史…」占位
+  try{
+    const result=await getJSON(PLANNER_MSG_API+"?session_key="+encodeURIComponent(key)+
+                               "&limit="+PLANNER_HISTORY_LIMIT);
+    const items=(Array.isArray(result.items)?result.items:[]).map(plannerItemOf);
+    state.planner.items=items;
+    state.planner.lastItinerary=plannerLastItinerary(items);
+    setPlannerErr("");
+  }catch(error){
+    setPlannerErr("对话历史读取失败:"+((error&&error.message)||error));
+  }
+  renderPlannerMsgs();
+}
+// 切到「🤖 AI 行程」:点名标签跟着当前收藏刷一遍 + GET 回放历史(含行程卡片)
+function openPlannerTab(){
+  renderPlannerTags();
+  loadPlannerMessages();
+}
+// itinerary.days[].stops 展平成后端要的 [{name,collection_id|null}](阶段 A:legs / stay 恒空)
+function plannerStops(){
+  const plan=state.planner.lastItinerary||{};
+  const days=Array.isArray(plan.days)?plan.days:[];
+  const stops=[];
+  days.forEach(day=>{
+    ((day&&Array.isArray(day.stops))?day.stops:[]).forEach(stop=>{
+      const name=String((stop&&stop.name)||"").trim();
+      if(!name) return;
+      const id=Number(stop&&stop.collection_id);
+      stops.push({name:name,collection_id:((isFinite(id)&&id>0)?id:null)});
+    });
+  });
+  return stops;
+}
+// 方案名 = 唯一键(同名再存 = 幂等刷新):同一份行程重复保存不会堆出新方案
+function plannerPlanName(){
+  const plan=state.planner.lastItinerary||{};
+  const days=Array.isArray(plan.days)?plan.days:[];
+  const count=Number(plan.days_count||days.length)||1;
+  const base=String((days[0]&&days[0].base)||"").trim();
+  return "AI 行程 · "+(base||"待定")+" · "+count+" 天";
+}
+// 存为方案的结果:方案名 + 总预算估算(quote.total_cny_low~high)+ unmatched 提示
+function plannerSaveHtml(result){
+  const data=result||{};
+  const plan=data.trip_plan||{};
+  const quote=plan.quote||null;
+  const matched=Array.isArray(data.matched)?data.matched:[];
+  const unmatched=Array.isArray(data.unmatched)?data.unmatched:[];
+  const badge=quote?(KIND_BADGE[quote.kind]||KIND_BADGE.estimate):KIND_BADGE.estimate;
+  return '<div class="fp-quote">'+
+    '<div class="fp-quote-row">✅ 已存为行程方案:<b>'+esc(plan.name||"(未命名方案)")+"</b>"+
+      (data.created===false?"(同名方案 → 按幂等口径刷新了引用)":"(新建)")+"</div>"+
+    (quote
+      ? ('<div class="fp-quote-ttl">大致总花费:<b>'+moneyRange(quote.total_cny_low,quote.total_cny_high)+
+         '</b> <span class="badge '+badge.cls+'">'+esc(badge.text)+"</span> · 🛏️ 住宿按 "+
+         Number(quote.stay_nights||PLAN_NIGHTS_DEFAULT)+" 晚</div>"+
+         '<div class="fp-total-note">'+esc(quote.note||PLAN_QUOTE_NOTE_FALLBACK)+"</div>")
+      : '<div class="fp-quote-row">后端没给 quote(暂无报价,方案本身已存)</div>')+
+    '<div class="fp-quote-row">📍 纳入 '+matched.length+" 个地点"+
+      (unmatched.length
+        ? (" · ⚠️ "+unmatched.length+" "+PLANNER_UNMATCHED_TEXT+":"+
+           unmatched.map(name=>esc(name)).join("、")+
+           "(先在目的地列表里搜到它们入库再存,或直接点名对应收藏)")
+        : "")+"</div>"+
+    "</div>";
+}
+function renderPlannerSaveOut(content){
+  const box=$("plannerSaveOut");
+  if(!box) return;
+  box.innerHTML=content||"";
+  box.style.display=content?"block":"none";
+}
+async function plannerSavePlan(){
+  const stops=plannerStops();
+  if(!state.planner.lastItinerary||!stops.length){
+    setPlannerErr("还没有可保存的行程:先让 AI 排出一版「每天的目的地」(行程卡片出现后这个按钮才可用)。");
+    return;
+  }
+  setPlannerBusy(true);setPlannerErr("");
+  try{
+    const result=await sendJSON(PLANNER_SAVE_API,{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session_key:plannerSessionKey()||"",name:plannerPlanName(),
+                           stops:stops,legs:[],stay:[],nights:planNights()})});
+    renderPlannerSaveOut(plannerSaveHtml(result));
+    await loadTripPlans();     // 「🧳 行程方案」tab 的列表同源刷新(存的就是既有 TripPlan)
+    await refreshFavItems();   // 命中的地点会幂等建成收藏 → 收藏列表与点名标签跟着刷
+  }catch(error){
+    setPlannerErr("存为行程方案失败:"+((error&&error.message)||error));   // 后端 400 中文报错原样透出
+  }finally{
+    setPlannerBusy(false);
+  }
+}
+// 「🗑 清空对话」:只删消息(后端保留会话行,session_key 继续可用)
+async function plannerClear(){
+  if(state.planner.busy) return;
+  const key=plannerSessionKey();
+  if(!key){   // 本机没有会话 key:后端没有历史,清本地就够
+    state.planner.items=[];
+    state.planner.lastItinerary=null;
+    renderPlannerSaveOut("");
+    renderPlannerMsgs();
+    return;
+  }
+  setPlannerBusy(true);setPlannerErr("");
+  try{
+    await sendJSON(PLANNER_MSG_API+"?session_key="+encodeURIComponent(key),{method:"DELETE"});
+    state.planner.items=[];
+    state.planner.lastItinerary=null;
+    renderPlannerSaveOut("");
+  }catch(error){
+    setPlannerErr("清空对话失败:"+((error&&error.message)||error));
+  }finally{
+    setPlannerBusy(false);
+    renderPlannerMsgs();
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -3356,6 +3851,15 @@ $("planPicker").addEventListener("change",onPlanPickChange);
 $("planNights").addEventListener("change",()=>{syncPlanPicked();renderTripPlans();});
 $("planName").addEventListener("input",()=>setPlanErr(""));
 $("planList").addEventListener("click",onPlanListClick);
+// AI 行程(TASK-10c):第三个 tab —— 发送(Enter 发送 / Shift+Enter 换行)、点名标签、
+// 存为行程方案、清空对话;全部走 addEventListener(页面里仍不许出现内联 onclick)
+$("favTabAi").addEventListener("click",()=>switchFavTab("ai"));
+$("plannerSend").addEventListener("click",plannerSend);
+$("plannerInput").addEventListener("keydown",onPlannerKeydown);
+$("plannerInput").addEventListener("input",()=>setPlannerErr(""));
+$("plannerTags").addEventListener("click",onPlannerTagClick);
+$("plannerSave").addEventListener("click",plannerSavePlan);
+$("plannerClear").addEventListener("click",plannerClear);
 $("routeRetry").addEventListener("click",()=>{
   const place=state.routePanel.place;
   if(place) openRoutePanel(place);   // 失败重试:缓存里没东西,会重新打一次 /api/routes

@@ -15,12 +15,15 @@
 * M4(行程方案,TASK-5a):``POST /api/trip-plans``(按名字幂等 upsert)、
   ``GET /api/trip-plans``(新的在前,每项带报价)、``GET/DELETE /api/trip-plans/{id}``;
   总花费只按收藏快照的"当时口径"**估算**(不重新调 ``/api/routes``),见 ``app/api/trips.py``
+* TASK-10b(AI 行程规划,阶段 A):``POST/GET/DELETE /api/planner/messages``(多轮对话 +
+  历史回放 + 清空)与 ``POST /api/planner/save``(把 AI 排的地点**幂等**落成既有 ``TripPlan``);
+  编排在 ``services/planner.py``,路由见 ``app/api/planner.py``
 """
 from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from .api import collections, discover, places, routes, stays, trips
+from .api import collections, discover, planner, places, routes, stays, trips
 
 app = FastAPI(title="Where2Go 试用")
 app.include_router(discover.router, prefix="/api")
@@ -29,6 +32,7 @@ app.include_router(routes.router, prefix="/api")
 app.include_router(collections.router, prefix="/api")
 app.include_router(stays.router, prefix="/api")
 app.include_router(trips.router, prefix="/api")
+app.include_router(planner.router, prefix="/api")
 
 STATIC = Path(__file__).parent / "static"
 app.mount("/", StaticFiles(directory=str(STATIC), html=True), name="static")

@@ -757,13 +757,17 @@
 
 ## [TASK-10b] AI 行程规划 API:POST/GET/DELETE /api/planner/messages + POST /api/planner/save(匹配入库并落 TripPlan)
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-10a
 - 目标: 新建 `backend/app/api/planner.py`(裸 JSON + 400 中文,风格照 trips.py):`POST /api/planner/messages`(`session_key` 空则后端 `uuid4().hex`;`collection_ids` 给了只用这些做素材、没给取当前全部收藏,但 **prompt 仍硬约束未点名不得纳入**;message 空/超长 400)、`GET /api/planner/messages`(未知 session 返回空 items 不 404)、`DELETE /api/planner/messages`、`POST /api/planner/save`(无 `collection_id` 的 stop 按名称在库内 Place 匹配→**幂等**建 `Collection(kind="place")`→调既有 `services.trips.upsert_trip_plan()`→返回 `{trip_plan, matched, unmatched}`,一个都匹配不到则 400 中文);`app/main.py` 挂 `/api`。
 - 只读清单: `backend/app/api/trips.py`、`backend/app/api/collections.py`(收藏 upsert/ref_key 口径)、`backend/services/trips.py`、`backend/services/planner.py`(10a 产物)、`docs/TASK-10-CONTRACT.md`(§3「TASK-10b」逐字执行)。
 - 涉及: backend/app/api/planner.py(新)、backend/app/main.py、backend/test_planner_api.py(≥18 用例,全 mock 不触网)
 - 验收: pytest 零回归 + ≥18 新增;400 文案有用例;`collection_ids` 有无两条路径都有用例;save 的同名重复保存**幂等**有用例(不产生新 Place/Collection/TripPlan 行);`/api/trip-plans` 与 `/api/collections` **响应键逐键零变化**断言;save 返回的 quote 复用既有 `estimate` 口径与免责文案。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-03 夜班,Codex 执行,**~32min 自行完成实现+测试+真机冒烟+commit,未触止损线**,commit `3bc85e5`)。
+  - 新 `app/api/planner.py`:POST /api/planner/messages(session_key 空→uuid4().hex;collection_ids 给了只取这几条素材、没给取全部收藏;message 空/超 2000 400 中文;返回 plan_turn 形状原样透出)、GET(limit 默认 50 上限 200,未知 session 空 items 不 404)、DELETE(调 clear_session)、POST /api/planner/save(无 collection_id 的 stop 库内 Place 名称匹配:精确同名优先→包含匹配→多命中取 id 最小;幂等建 Collection(kind=place、osm_key ref_key、坐标定点 7 位、mode 空串);调既有 trips.upsert_trip_plan;全不匹配 400「行程里的地点都不在库内…」);main.py 挂 /api。
+  - `test_planner_api.py` **54 例**(超 ≥18;含降级四态、两条素材路径、save 幂等、/api/trip-plans 与 /api/collections 响应键逐键零变化)。执行器复跑 pytest backend/ = **1250 passed**(1196 基线零回归,73s)。index.html 未动。
+  - 真机冒烟(uvicorn :8000 已重启):「3天 亲子 不要太累」**73s** 返回结构化 days(3天×3 stops,键名逐字契约)→ 同 session 追问「第二天换成古镇」**75s**,Day2 正确改朱家角古镇(多轮上下文生效,无 >180s/解析失败,不需调预算)→ save 匹配 place_id=30/unmatched 正确、同名重复保存幂等(plan id 不变、collection 不重复)→ 400 文案三处全对;冒烟数据(方案/收藏/会话消息)已清理,库回 3 条既有收藏。
+  - **Codex 256K 统计**:单次调用 ~32min(14:04-14:36 UTC,止损线内),function_calls **72**,首写 **11.2min**(R8 线内),tokens **5.53M total**(含 cache 重放 5.32M)/output 58K+reasoning 28K,零 compact。注:第一次启动因 source .env 未加 set -a 秒退(9/28 同坑重踩,~2min 损失),重启即成功。
 
 ---
 

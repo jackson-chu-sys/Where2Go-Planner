@@ -971,14 +971,18 @@ def load_segment(
     refresh: bool = False,
     target_total: Optional[int] = None,
     intros: bool = True,
+    sync_intros: bool = False,
     intro_limit: Optional[int] = INTRO_BATCH_LIMIT,
     intro_workers: int = intro_service.DEFAULT_WORKERS,
 ) -> SegmentOutcome:
     """读取某 (城市, band) 的目的地;未入库才抓取并落库。
 
-    ``intros=True`` 时,**抓取入库之后**再给缺简介的 POI 补 LLM 一句话简介
+    ``intros=True`` 时,**抓取入库之后**给缺简介的 POI 补 LLM 一句话简介
     (只作用于本次抓取路径:命中库直接读库时不调 LLM,保持零网络秒回)。
-    简介失败一律降级为空,不影响已入库的数据。
+    TASK-12 起默认**异步后台回填**(:func:`services.intro.start_backfill`,照 stays 6c
+    的 estimating 口径):入库 commit 后立即返回,``intro_stats=None``,简介由后台线程池
+    补齐(DB 即缓存,失败降级为空,前端「补简介」按钮兜底)。``sync_intros=True``
+    (CLI/测试)才走旧的同步口径并返回真实 stats。
 
     ``seeds`` 留空就用 :func:`services.seed_data.load_seeds`(受 ``WHERE2GO_SEEDS``
     开关控制);传 ``[]`` 可显式关掉本次的种子合并。抓取与读库两条路径都合并种子,
@@ -1060,15 +1064,26 @@ def load_segment(
     repo.bump_fetch_rounds(session, record)
     session.commit()
     # 先落库再补简介:LLM 挂了/没 key 也只是简介为空,入库结果不受影响。
+    # TASK-12:默认**后台异步**回填(首屏墙钟从 ~170s 降到 ~15s,见 docs/PERF-NOTES.md);
+    # intro_stats=None → API/前端走「待补简介 N 条」既有分支,响应键零变化。
     intro_stats = None
     if intros:
-        intro_stats = intro_service.fill_missing_intros(
-            session,
-            origin_city=city_clean,
-            band=band_def["key"],
-            limit=intro_limit,
-            workers=intro_workers,
-        )
+        if sync_intros:
+            intro_stats = intro_service.fill_missing_intros(
+                session,
+                origin_city=city_clean,
+                band=band_def["key"],
+                limit=intro_limit,
+                workers=intro_workers,
+            )
+        else:
+            intro_stats = intro_service.start_backfill(
+                session,
+                origin_city=city_clean,
+                band=band_def["key"],
+                limit=intro_limit,
+                workers=intro_workers,
+            )
     return _read_from_db(
         session,
         origin=origin,
@@ -1174,6 +1189,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("band", nargs="?", default="50_100", choices=band_keys(), help="距离分段 key")
     parser.add_argument("--refresh", action="store_true", help="强制重抓(仍按唯一键 upsert)")
     parser.add_argument("--no-intros", action="store_true", help="抓取后不调 LLM 补简介")
+    parser.add_argument("--sync-intros", action="store_true",
+                        help="同步补简介(默认后台异步回填,CLI 想看到结果就用本开关)")
     parser.add_argument("--intro-limit", type=int, default=None,
                         help=f"本次最多补多少条简介(默认 {INTRO_BATCH_LIMIT};0 = 不限)")
     parser.add_argument("--db", default=None, help="数据库 URL(默认 WHERE2GO_DB_URL 或 backend/data/where2go.db)")
@@ -1191,6 +1208,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 band=args.band,
                 refresh=args.refresh,
                 intros=not args.no_intros,
+                sync_intros=args.sync_intros,
                 intro_limit=intro_limit,
             )
         except (DataSourceError, ValueError) as exc:

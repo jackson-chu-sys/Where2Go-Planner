@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterator
 
 import pytest
 
@@ -26,3 +27,18 @@ if BACKEND_DIR not in sys.path:
 def seeds_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """整套单测默认关闭人工种子数据(线上默认开,见 services.seed_data)。"""
     monkeypatch.setenv("WHERE2GO_SEEDS", "off")
+
+
+@pytest.fixture(autouse=True)
+def inline_intro_backfill() -> "Iterator[None]":
+    """TASK-12:后台简介回填在测试里**同步执行**(InlineExecutor),避免线程竞态与真 LLM。
+
+    生产路径(真线程池)由 test_intro_backfill.py 单独覆盖。
+    """
+    from services import intro as intro_service
+
+    intro_service.set_backfill_executor(intro_service.InlineExecutor())
+    try:
+        yield
+    finally:
+        intro_service.set_backfill_executor(None)

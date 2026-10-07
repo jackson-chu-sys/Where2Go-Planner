@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -454,6 +455,160 @@ def _run_batch(produce: IntroGenerator, payloads: Sequence[Mapping[str, Any]], *
         return [str(produce(payload) or "") for payload in payloads]
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, workers)) as pool:
         return [str(text or "") for text in pool.map(produce, payloads)]
+
+
+# --------------------------------------------------------------------------- #
+# 后台简介回填(TASK-12,照 services.stays 的 6c estimating 口径)
+# --------------------------------------------------------------------------- #
+# 冷抓的绝对大头是 LLM intro 同步回填(实测 40 条 ≈150~165s,占墙钟 73%~98%,
+# 见 docs/PERF-NOTES.md)。改成:抓取入库后**立即返回**,简介交给后台线程池补;
+# DB 即缓存的口径不变(已有 intro 的行绝不调 LLM),前端「补简介」按钮仍是兜底。
+
+
+class InlineExecutor:
+    """:class:`concurrent.futures.Executor` 的最小替身:提交即同步执行(测试/CLI 用)。"""
+
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        class _Done:
+            def __init__(self, result: Any) -> None:
+                self._result = result
+
+            def result(self) -> Any:
+                return self._result
+
+        return _Done(fn(*args, **kwargs))
+
+
+_backfill_executor: Optional[Any] = None
+_backfill_lock = threading.Lock()
+_backfill_inflight: set[tuple[str, str]] = set()
+
+
+def backfill_executor() -> Any:
+    """进程内共享的后台回填线程池(懒加载;测试用 :func:`set_backfill_executor` 注入)。"""
+    global _backfill_executor
+    with _backfill_lock:
+        if _backfill_executor is None:
+            _backfill_executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="intro-backfill"
+            )
+        return _backfill_executor
+
+
+def set_backfill_executor(executor: Optional[Any]) -> None:
+    """替换/清空后台执行器(测试注入 :data:`InlineExecutor`;传 ``None`` 复原懒加载)。"""
+    global _backfill_executor
+    with _backfill_lock:
+        _backfill_executor = executor
+
+
+def _backfill_worker(
+    engine: Any,
+    *,
+    origin_city: str,
+    band: str,
+    category: Optional[str],
+    limit: Optional[int],
+    workers: int,
+) -> Optional[dict[str, Any]]:
+    """后台任务体:**自开 session**(调用方的 Session 非线程安全,不能跨线程复用)。
+
+    engine 取自提交方的 ``session.get_bind()`` —— 测试里的临时库天然隔离。
+    任何异常(LLM 挂了/库被锁)都吞掉:简介缺失只影响展示,不值得打断进程;
+    缺的行下次「补简介」或下一轮抓取会自然重试。返回本次的 stats(异常时 ``None``)。
+    """
+    stats: Optional[dict[str, Any]] = None
+    try:
+        from db import session_factory  # 延迟导入,避免 intro ↔ db 的循环依赖面扩大
+
+        session = session_factory(engine)()
+        try:
+            stats = fill_missing_intros(
+                session,
+                origin_city=origin_city,
+                band=band,
+                category=category,
+                limit=limit,
+                workers=workers,
+            )
+        finally:
+            session.close()
+    except Exception:  # noqa: BLE001 - 后台补简介绝不向上抛(降级口径见 docstring)
+        stats = None
+    finally:
+        with _backfill_lock:
+            _backfill_inflight.discard((origin_city, band))
+    return stats
+
+
+def start_backfill(
+    session: Session,
+    *,
+    origin_city: str,
+    band: str,
+    category: Optional[str] = None,
+    limit: Optional[int] = None,
+    workers: int = DEFAULT_WORKERS,
+) -> Optional[dict[str, Any]]:
+    """提交一次后台简介回填。
+
+    * **真线程池**(生产):后台执行,立即返回 ``None``(调用方按「简介生成中」口径展示);
+      同 ``(origin_city, band)`` 已在飞、或库里没有缺简介的行 → 不提交,同样返回 ``None``;
+    * :data:`InlineExecutor`(测试/CLI 注入):**同步执行**并返回真实 stats dict
+      (既有单测对 ``intro_stats`` 的断言零改动)。
+    """
+    runner = backfill_executor()
+    if isinstance(runner, InlineExecutor):
+        return _backfill_worker(
+            session.get_bind(),
+            origin_city=origin_city,
+            band=band,
+            category=category,
+            limit=limit,
+            workers=workers,
+        )
+    pending = repo.count_places(
+        session, origin_city=origin_city, band=band, category=category, missing_intro=True
+    )
+    if pending <= 0:
+        return None
+    # 释放 count 留下的读事务快照:SQLite 的 SHARED 锁会挡住后台 worker 的写提交
+    # (生产路径 worker 要等 LLM 批跑完才写库,届时请求早已结束,这里只是保险)。
+    session.rollback()
+    key = (origin_city, band)
+    with _backfill_lock:
+        if key in _backfill_inflight:
+            return None
+        _backfill_inflight.add(key)
+    try:
+        runner.submit(
+            _backfill_worker,
+            session.get_bind(),
+            origin_city=origin_city,
+            band=band,
+            category=category,
+            limit=limit,
+            workers=workers,
+        )
+    except Exception:  # noqa: BLE001 - 提交失败(执行器已关闭等)退回未提交态
+        with _backfill_lock:
+            _backfill_inflight.discard(key)
+        return None
+    return None
+
+
+def wait_backfill(timeout: Optional[float] = None) -> None:
+    """等所有在飞的后台回填落地(CLI ``--wait`` / 测试收尾用;InlineExecutor 下即时返回)。"""
+    import time as _time
+
+    deadline = None if timeout is None else _time.monotonic() + float(timeout)
+    while True:
+        with _backfill_lock:
+            if not _backfill_inflight:
+                return
+        if deadline is not None and _time.monotonic() >= deadline:
+            return
+        _time.sleep(0.05)
 
 
 def main(argv: Optional[list[str]] = None) -> int:

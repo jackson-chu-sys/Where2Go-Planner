@@ -18,12 +18,15 @@
 * TASK-10b(AI 行程规划,阶段 A):``POST/GET/DELETE /api/planner/messages``(多轮对话 +
   历史回放 + 清空)与 ``POST /api/planner/save``(把 AI 排的地点**幂等**落成既有 ``TripPlan``);
   编排在 ``services/planner.py``,路由见 ``app/api/planner.py``
+* TASK-11a(全局 AI 助手,只做后端):``POST/GET/DELETE /api/assistant/messages``
+  (通用旅行问答 + 历史回放 + 清空;会话 key 带 ``chat-`` 前缀,**复用** planner 的两张会话表);
+  编排在 ``services/assistant.py``,路由见 ``app/api/assistant.py``
 """
 from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-from .api import collections, discover, planner, places, routes, stays, trips
+from .api import assistant, collections, discover, planner, places, routes, stays, trips
 
 app = FastAPI(title="Where2Go 试用")
 app.include_router(discover.router, prefix="/api")
@@ -33,6 +36,7 @@ app.include_router(collections.router, prefix="/api")
 app.include_router(stays.router, prefix="/api")
 app.include_router(trips.router, prefix="/api")
 app.include_router(planner.router, prefix="/api")
+app.include_router(assistant.router, prefix="/api")
 
 STATIC = Path(__file__).parent / "static"
 app.mount("/", StaticFiles(directory=str(STATIC), html=True), name="static")

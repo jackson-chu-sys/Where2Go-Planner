@@ -823,12 +823,18 @@
 
 ## [TASK-12] 性能调查+优化:搜索位置/重新抓取慢(执行器手写,不派 Codex)
 
-- 状态: pending
+- 状态: done
 - 背景: 神朱 2026-10-07 反馈:切高德后搜索位置和重新抓取仍慢(比 Overpass 时代好一些)。已知线索(夜班执行器写码前实测确认,勿直接采信):①`load_segment` 的 LLM 简介回填是**同步**的(INTRO_BATCH_LIMIT=40、workers=4,首屏冷抓要等最多 40 条 LLM,9d QA 实测上海 50-100 冷抓 ~125s 大头疑似在此);②amap 节流 0.6s 是**进程级**、`default_fetcher` 五组是**串行** for 循环,ring band 还要 × 格子数 × 翻页数,请求次数×(0.6s+RTT) 线性累积;③page_limit 可能发出拿不满的空页请求。
 - 目标: 先**分段计时**(uvicorn 真机冷抓 0_50 与 ring band 各一次 + 「加载更多」扩抓一次:amap 网络请求次数/耗时、LLM intro 耗时、落库耗时,落一份 docs/PERF-NOTES.md);再按数据实施优化,候选(按计时结果取舍):a) intro 回填改**异步后台**(照 stays 6c 的 estimating 口径:先返回列表 intro=null,后台线程池补,前端已有「补简介」入口兜底);b) 首查 INTRO_BATCH_LIMIT 降到 15(=首屏显示数);c) default_fetcher 组间并行(节流锁天然串行化请求,收益=RTT 重叠,需测 QPS 10021 不触发);d) 消除空页请求。**渐进配额/page_size/offset/more 口径与 /api/places 响应形状一律不变,前端零改动**。
 - 涉及: backend/services/place_loader.py、backend/services/intro.py、backend/data_sources/amap.py(如需)、docs/PERF-NOTES.md(新)、backend/test_*.py
 - 验收: PERF-NOTES.md 有基线/优化后对照数字;优化后冷抓首屏墙钟较基线**降 ≥30%**(达不到须给数据说明原因);pytest 零回归(基线含 11a 增量)+ 新增用例覆盖异步 intro 不阻塞返回;真机冒烟:冷抓秒级回列表、intro 后台补齐可见;uvicorn 重启。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-07 夜班,**执行器手写**,commit `8bf3813`)。
+  - 分段计时(tools/perf_probe.py 插桩,成都全新冷抓):线索①证实——**LLM intro 同步回填占墙钟 73%~98%**(40 条 ≈150~165s;amap 检索仅 2.5~52s);线索②次要(amap 耗时≈纯节流时间,RTT 已被节流窗吸收);线索③未证实(_paged 已有配额满/页不满即停)。数字全落 docs/PERF-NOTES.md。
+  - 实施候选 a:`services/intro.py` 新增后台回填(InlineExecutor/set_backfill_executor/start_backfill/wait_backfill,照 stays 6c 口径;worker 自开 session(get_bind 拿 engine,测试 tmp 库隔离)、(city,band) inflight 去重、异常全吞降级);`place_loader.load_segment` 增 `sync_intros=False` 默认异步(入库 commit 后立即返回 intro_stats=None → 前端走「待补简介 N 条」既有分支,**/api/places 响应键零变化、前端零改动**);CLI 加 --sync-intros 保留同步口径;conftest autouse 注入 InlineExecutor → 既有 intro_stats 断言零改动。候选 b/c/d 按计时数据不做(b 无必要、c 收益<30%且有 QPS 10021 风险、d 未证实)。
+  - 效果(武汉 vs 成都基线):0_50 冷抓 **173.4s→12.3s(-93%)**、50_100 ring **198.2s→50.2s(-75%)**、扩抓 round2 **168.1s→3.0s(-98%)**,远超 ≥30% 验收线。
+  - 测试:test_intro_backfill.py 9 用例(真线程池:返回不阻塞/sync 旧契约/no-intros 零 LLM/inflight 去重/worker 吞异常/worker 自开 session/读库路径零回填)。pytest backend/ = **1352 passed**(1343 基线零回归,84s)。
+  - 真机冒烟(uvicorn :8000 已重启):西安 0_50 全新冷抓 `GET /api/places?page_size=15` **3.3s** 秒回(intro_stats=None/intro_pending=29);~2.5min 后库内 intro 缺 29→**1**(后台自动补齐);二次查询 source=db 秒回。
+  - 坑记录:SQLite 读事务 SHARED 锁挡后台 worker 写库 → start_backfill 提交前 session.rollback() 释放快照(已进 PERF-NOTES)。
 
 ---
 

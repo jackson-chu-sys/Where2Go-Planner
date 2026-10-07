@@ -790,13 +790,17 @@
 
 ## [TASK-11a] 全局 AI 助手后端:/api/assistant/messages(通用旅行问答,复用 Planner 会话表)
 
-- 状态: pending
+- 状态: done
 - 背景: 神朱 2026-10-07 拍板:所有界面侧边加 AI 对话窗口,用户可描述、提问(定位=通用旅行助手,兼可触发现有行程规划)。本条只做后端;前端侧边抽屉属 TASK-11b。
 - 目标: 新建 `backend/services/assistant.py`:`chat_turn(session_key, message, *, context=None)` —— 复用 `PlannerSession`/`PlannerMessage` 两表(**表结构零改动**,session_key 由调用方带 `chat-` 前缀区分行程会话);系统提示=通用旅行助手(答旅行问题/描述目的地/给实用建议;拿不到的事实明说、禁编造;中文回复,纯文本 ≤400 字);`context`(前端传当前城市/band/收藏摘要,截 500 字)拼入 prompt;LLM 预算 `ASSISTANT_MAX_TOKENS=800 / ASSISTANT_TIMEOUT_S=120` **按调用传给 llm.chat()**(勿沿用 intro 的 120/20s);降级四态 no_key/timeout/error/parse_error 一律不抛、reply 中文兜底含原因码。新建 `backend/app/api/assistant.py`:POST/GET/DELETE `/api/assistant/messages`,风格照 planner.py(裸 JSON、400 中文、未知 session 返回空 items 不 404、message 空/超 2000 字 400);main.py 挂 `/api`。
 - 只读清单: `backend/services/planner.py`、`backend/app/api/planner.py`、`backend/services/intro.py`(LLMClient 唯一入口)、`backend/db/models.py`、`backend/test_planner_api.py`(mock 套路)。
 - 涉及: backend/services/assistant.py(新)、backend/app/api/assistant.py(新)、backend/app/main.py、backend/test_assistant.py(新)
 - 验收: pytest 零回归(基线 1268)+ ≥15 新增全 mock;预算按调用传入有用例断言;降级四态各有用例(不抛且 reply 非空);context 截断有用例;`/api/planner/*` 与 `/api/trip-plans` 响应键零变化断言;不动 index.html。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-07 夜班,Codex 执行,**~17.8min 自行完成实现+测试+commit,未触止损线**,commit `cc35888`)。
+  - 新 `services/assistant.py`:四常量逐字落地(ASSISTANT_MAX_TOKENS=800/ASSISTANT_TIMEOUT_S=120 按调用传 llm.chat、ASSISTANT_HISTORY_LIMIT=12、CONTEXT_MAX_CHARS=500);chat_turn 返回精确五键 {session_key,reply,degraded,reason,message_id};复用 PlannerSession/PlannerMessage 两表零改动(list_messages/clear_session 直接复用 planner 同名函数,会话行保留);系统提示=通用旅行助手(中文纯文本≤400字、禁编造、排完整行程仍归「🤖 AI 行程」);降级四态 no_key/timeout/error/parse_error 不抛、reply 含原因码、消息照样落库;context 截 500 字拼 prompt、None/空白不拼。
+  - 新 `app/api/assistant.py`:POST/GET/DELETE /api/assistant/messages(裸 JSON+400 中文+_optional_text+note,风格照 planner.py);session_key 空则补发 "chat-"+uuid4().hex,给了原样存取;main.py 挂 /api。
+  - `test_assistant.py` 39 函数/**59 用例**(超 ≥15;含预算断言 800/120≠intro 默认、四态各例、context 截断、chat- 前缀、多轮历史、API 400 中文全谱、助手/行程会话同表互不污染)。执行器复跑 pytest backend/ = **1327 passed**(1268 基线零回归,78s)。index.html/db/models.py/planner.py 未动。
+  - **Codex 256K 统计**:单次调用 ~17.8min(14:05-14:23 UTC,止损线内),function_calls **32**,首写 **7.1min**(R8 线内),tokens **1.46M total**(含 cache 重放 1.32M)/output 41K+reasoning 19K,零 compact。连续三条(8a2/10a/11a)小体量条目均远低于止损线,拆条口径持续有效。
 
 ---
 

@@ -39,6 +39,7 @@ BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if BACKEND_DIR not in sys.path:
     sys.path.insert(0, BACKEND_DIR)
 
+from app.api import assistant as assistant_api  # noqa: E402
 from app.api import collections as collections_api  # noqa: E402
 from app.api import places as places_api  # noqa: E402
 from app.api import planner as planner_api  # noqa: E402
@@ -49,6 +50,7 @@ from app.main import STATIC, app as fastapi_app  # noqa: E402
 from db import models as db_models  # noqa: E402
 from db import repository as repo  # noqa: E402
 from db.base import init_db, make_engine, session_factory  # noqa: E402
+from services import assistant as assistant_service  # noqa: E402
 from services import place_loader  # noqa: E402
 from services import planner as planner_service  # noqa: E402
 from services import routes as route_service  # noqa: E402
@@ -90,6 +92,9 @@ AMAP_JS_SRC = "https://webapi.amap.com/maps"
 MAP_CONFIG_PATH = "/api/map-config"
 MAP_NO_KEY_HINT = "地图未配置高德 JS key"
 ENV_JS_KEY = "WHERE2GO_AMAP_JS_KEY"
+# 本地存储只许用来存**会话 session_key**(10c 的「🤖 AI 行程」+ 11b 的全局 AI 助手问答,
+# 两个 key 分开存);地图 key / 安全密钥一个字节都不许落本地。
+SESSION_STORE_CONSTS = ("PLANNER_SESSION_STORE", "ASSIST_SESSION_STORE")
 ENV_SECURITY_CODE = "WHERE2GO_AMAP_SECURITY_JS_CODE"
 # 32 位小写十六进制 = 高德 key 的样态(**拼出来**,免得仓库里真出现一串像 key 的字面量)
 AMAP_KEY_SAMPLE = "0123456789abcdef" * 2
@@ -1406,15 +1411,16 @@ def test_amap_map_config_is_fetched_before_script(html: str) -> None:
     assert boot.index("loadMapConfig()") < boot.index("loadAMapScript(config)")
     assert f'getJSON("{MAP_CONFIG_PATH}")' in html, "key 只能运行时向 /api/map-config 取"
     # 地图 key 不进本地存储。⚠️ 范围自 TASK-10c 起收窄成「地图段 + boot 段」并补一条全局约束:
-    # 页面里出现的每一处 localStorage 都只能是 AI 行程 tab 存 session_key(见下面的 all(...)),
-    # 地图 key / 安全密钥依旧一个字节都不落本地。
+    # 页面里出现的每一处 localStorage 都只能是**存会话 session_key**(10c 的「🤖 AI 行程」tab +
+    # 11b 的全局 AI 助手问答,两个 key 分开存,见下面的 all(...)),地图 key / 安全密钥依旧
+    # 一个字节都不落本地。
     loader = amap_section(html)[amap_section(html).index("async function loadMapConfig("):]
     for scoped in (loader, boot_section(html)):
         assert "localStorage" not in scoped, "地图 key 不进 localStorage"
         assert "sessionStorage" not in scoped, "地图 key 也不进 sessionStorage"
     stored = re.findall(r"(?:localStorage|sessionStorage)\.\w+\(([^)]*)\)", html)
-    assert stored and all("PLANNER_SESSION_STORE" in args for args in stored), \
-        f"本地存储只许用来存 AI 行程的 session_key,实际:{stored}"
+    assert stored and all(any(store in args for store in SESSION_STORE_CONSTS) for args in stored), \
+        f"本地存储只许用来存会话 session_key,实际:{stored}"
     assert js_string(html, "PLANNER_SESSION_STORE") == PLANNER_SESSION_STORE
     assert "amap_js_key" not in planner_section(html), "AI 行程段不碰地图 key(不新增前端 key)"
 
@@ -2201,3 +2207,415 @@ def test_planner_tab_keeps_existing_tabs_and_adds_no_key(html: str) -> None:
     assert '$("favTabFav").addEventListener("click",()=>switchFavTab("fav"))' in html
     assert '$("favTabPlan").addEventListener("click",()=>switchFavTab("plan"))' in html
     assert "state.tripPlan.tab" in switch, "tab 状态仍存在 state.tripPlan.tab(沿用现有机制)"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-11b:全局 AI 助手前端 —— 右侧可折叠抽屉(💬 问答 / 🧳 行程 双模式)+ 悬浮入口按钮。
+#          照 TASK-8b / 10c 的追加模式:静态断言(DOM id / 函数名 / 接口字符串 / CSS 层级 /
+#          文案 / 常量与后端同口径)+ 用临时库**真跑 11a 的后端端点函数**做字段契约
+#          (强制走真实的 no_key 降级路径,不触网)。零回归:10c 的「🤖 AI 行程」tab 原样保留。
+# --------------------------------------------------------------------------- #
+
+ASSIST_SECTION_START = "// 全局 AI 助手抽屉(TASK-11b)"
+ASSIST_SECTION_END = "(async function boot(){"
+ASSIST_DRAWER_TAG = '<aside id="assistDrawer" role="dialog" aria-labelledby="assistDrawerTitle" hidden>'
+ASSIST_MSG_API = "/api/assistant/messages"
+ASSIST_SESSION_STORE = "w2g_assistant_session"     # 问答会话 key(行程沿用 w2g_planner_session)
+ASSIST_BUSY_LABEL = "AI 思考中…"                    # 问答的进行中文案(契约逐字)
+ASSIST_FAB_LABEL = "💬 AI 助手"
+ASSIST_MODES = ("chat", "trip")
+# 抽屉必须有的 DOM id:入口按钮 + 抽屉 + 头部收起 + 两个模式 tab / pane + 问答四件套 + 行程镜像件
+ASSIST_DOM_IDS = [
+    "assistFab", "assistDrawer", "assistDrawerTitle", "assistCollapse", "assistTabChat",
+    "assistTabTrip", "assistPaneChat", "assistPaneTrip", "assistErr", "assistMsgs", "assistCtx",
+    "assistInput", "assistSend", "assistClear", "assistHint", "assistTripErr", "assistTripMsgs",
+    "assistTripTagWrap", "assistTripTagCount", "assistTripTags", "assistTripInput",
+    "assistTripSend", "assistTripSave", "assistTripClear", "assistTripSaveOut",
+]
+ASSIST_FUNCTIONS = [
+    "assistSessionKey", "rememberAssistSession", "setAssistErr", "assistDegradedHtml",
+    "assistBubbleHtml", "assistFavSummary", "assistContext", "renderAssistCtx", "syncAssistActs",
+    "setAssistBusy", "renderAssistMsgs", "assistInputText", "assistRequestBody", "assistSend",
+    "onAssistKeydown", "loadAssistMessages", "assistClear", "plannerInputBox",
+    "renderAssistTripMsgs", "renderAssistTripTags", "syncAssistTripActs", "setAssistTripErr",
+    "renderAssistTripSaveOut", "switchAssistMode", "openAssistDrawer", "closeAssistDrawer",
+    "toggleAssistDrawer",
+]
+# 问答请求体键(裸 JSON;字段名以 app/api/assistant.py 为准)
+ASSIST_BODY_FIELDS = ["session_key", "message", "context"]
+# POST 响应里前端要消费的键(11a:chat_turn 的形状原样透出)
+ASSIST_REPLY_FIELDS = ["session_key", "reply", "degraded", "reason"]
+
+
+def assist_section(html: str) -> str:
+    """切出「全局 AI 助手抽屉(TASK-11b)」那一段 JS(在既有绑定之后、boot 之前)。"""
+    start = html.index(ASSIST_SECTION_START)
+    return html[start:html.index(ASSIST_SECTION_END, start)]
+
+
+def assist_drawer(html: str) -> str:
+    """切出抽屉那块 DOM(悬浮入口按钮 + <aside>)。"""
+    start = html.index('<button type="button" id="assistFab"')
+    return html[start:html.index("</aside>", start)]
+
+
+def assist_pane(html: str, which: str) -> str:
+    """切出抽屉里某个模式的 pane(chat / trip)。"""
+    marker = f'<div id="assistPane{which.capitalize()}"'
+    start = html.index(marker)
+    return html[start:html.index("</div>\n    </div>", start)]
+
+
+def assist_fn(html: str, name: str, end: str) -> str:
+    """在助手段里切出某个函数体(``async function`` 也能按名字切到)。"""
+    section = assist_section(html)
+    return section[section.index(f"function {name}("):section.index(end)]
+
+
+@pytest.fixture()
+def assistant_turn(plan_session, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """真跑 ``POST /api/assistant/messages``:强制走**真实的** no_key 降级路径,不触网。
+
+    ``LLMClient(environ={})`` = 一个 key 都读不到 → 服务层不抛、返回 degraded=True + reason,
+    所以拿到的是后端真实响应形状(前端读的键必须是它的子集)。
+    """
+    monkeypatch.setattr(assistant_service, "default_llm_client",
+                        lambda: assistant_service.LLMClient(environ={}))
+    return assistant_api.post_message(
+        {"message": "这个分段带娃合适吗?", "context": "起点城市:杭州;距离分段:50-100 km"},
+        session=plan_session)
+
+
+def test_assist_drawer_dom_ids_present(html: str) -> None:
+    assert ASSIST_DRAWER_TAG in html, "抽屉的 DOM 要按契约写死(id/role/aria-labelledby/hidden,默认收起)"
+    for element_id in ASSIST_DOM_IDS:
+        assert f'id="{element_id}"' in html, f"缺少 AI 助手抽屉的 DOM id:{element_id}"
+    drawer = assist_drawer(html)
+    assert "onclick=" not in drawer and "onerror=" not in drawer, "一律走事件委托,不许内联事件属性"
+    assert ASSIST_FAB_LABEL in drawer, "悬浮入口按钮要有可见文案(不是一个光秃秃的图标)"
+    assert 'aria-expanded="false" aria-controls="assistDrawer"' in drawer, "入口按钮要绑好 a11y 关系"
+    for css in ("#assistDrawer{", "#assistFab{", ".ad-ctx{", ".ad-in{", "#assistDrawer[hidden]{display:none}"):
+        assert css in html, f"缺少样式 {css}(不引第三方 CSS)"
+
+
+def test_assist_drawer_is_right_side_and_collapsible(html: str) -> None:
+    fab = html[html.index("#assistFab{"):html.index("#assistFab:hover{")]
+    assert "position:fixed" in fab and "right:14px" in fab and "bottom:20px" in fab, "入口按钮悬浮在右下"
+    box = html[html.index("#assistDrawer{"):html.index("#assistDrawer[hidden]{")]
+    assert "position:fixed" in box and "top:12px;right:12px;bottom:12px" in box, "抽屉贴右侧、可折叠"
+    assert "width:min(340px,calc(100% - 24px))" in box, "只吃右侧一条,不铺满屏(地图主操作区不被遮挡)"
+    assert "overflow:auto" in box, "内容长了自己滚,不把页面撑开"
+    assert "body.assist-open #assistFab{display:none}" in html, "展开时入口按钮让位(收起走抽屉头部 ✕)"
+    assert "body.assist-open #routePanel{right:" in html, "展开时路线面板整体左移让开(与路线面板共存)"
+    section = assist_section(html)
+    assert 'document.body.classList.add("assist-open")' in section, "展开要挂 body 类(CSS 才有抓手)"
+    assert 'document.body.classList.remove("assist-open")' in section, "收起要摘掉 body 类"
+    assert 'if(drawer) drawer.hidden=true;' in section and "drawer.hidden=false" in section, \
+        "用 hidden 属性开关(与 DOM 上的 hidden 一致)"
+    assert '$("assistFab").addEventListener("click",toggleAssistDrawer)' in html, "入口按钮 = 开/关切换"
+    assert '$("assistCollapse").addEventListener("click",closeAssistDrawer)' in html, "✕ 收起要绑定"
+    closer = assist_fn(html, "closeAssistDrawer", "function toggleAssistDrawer")
+    assert "if(!state.assist.open) return;" in closer, "已经收着时 Esc 兜底那一层不该再做任何事"
+    assert "document.contains(back)" in closer and "back.focus()" in closer, "收起后把焦点归还来源元素"
+
+
+def test_assist_drawer_layers_under_modals(html: str) -> None:
+    assert css_z_index(html, ".modal-mask") > css_z_index(html, "#favPanel") > \
+        css_z_index(html, "#assistDrawer") > css_z_index(html, "#routePanel"), \
+        "层级:详情弹窗 > 收藏弹层 > AI 助手抽屉 > 路线面板(抽屉不遮挡弹层,弹层开着也能共存)"
+    assert "modal-mask" not in assist_drawer(html), "抽屉不是遮罩层(不带 .modal-mask,不锁背景滚动)"
+    assert 'id="placeModal"' in html and html.index('id="placeModal"') < html.index('id="assistFab"'), \
+        "抽屉挂在详情弹窗之后(同一层容器,样式全在本页 <style> 里)"
+    # 共存:开详情弹窗 / 收藏弹层都不会顺手关掉抽屉,反之亦然(各自只管自己的 state)
+    assert "closeAssistDrawer" not in modal_section(html), "详情弹窗那段不该碰抽屉"
+    assert "closePlaceModal" not in assist_section(html) and "closeFavPanel" not in assist_section(html), \
+        "抽屉开合不影响详情弹窗与收藏弹层(四者可以同时开着)"
+    assert "state.assist" not in html[html.index("function openPlaceModal("):html.index("function closePlaceModal(")], \
+        "openPlaceModal 不收抽屉(共存,不互相打断)"
+
+
+def test_assist_esc_layer_is_outermost(html: str) -> None:
+    keys = keydown_section(html)
+    for marker in ("state.modal.open", "state.fav.open", "state.routePanel.open", "state.assist.open"):
+        assert marker in keys, f"Esc 层级里缺了 {marker}"
+    assert keys.index("state.modal.open") < keys.index("state.fav.open") < \
+        keys.index("state.routePanel.open") < keys.index("state.assist.open"), \
+        "Esc 由内层优先:详情弹窗 → 收藏弹层 → 路线面板 → AI 助手抽屉(抽屉最外层最后关)"
+    assert "closeAssistDrawer()" in keys and "closePlaceModal()" in keys and "closeFavPanel()" in keys
+    assert "closeRoutePanel()" in keys, "既有三层的行为一个不少(零回归)"
+    assert keys.index("closeAssistDrawer()") > keys.index("closeFavPanel()"), "抽屉排在收藏弹层之后收"
+
+
+def test_assist_dual_mode_tabs_and_panes(html: str) -> None:
+    drawer = assist_drawer(html)
+    for which, label in (("Chat", "💬 问答"), ("Trip", "🧳 行程")):
+        assert re.search(rf'<button type="button" id="assistTab{which}" class="fp-tab[^"]*" role="tab" ',
+                         drawer), f"{label} 的模式钮要沿用既有 .fp-tab 样式与 role=tab"
+        assert f'aria-controls="assistPane{which}"' in drawer
+        assert label in drawer
+    tablist = drawer[drawer.index('<div class="fp-tabs ad-tabs"'):drawer.index('<div id="assistPaneChat"')]
+    assert tablist.index("assistTabChat") < tablist.index("assistTabTrip"), "问答在前、行程在后"
+    assert re.search(r'<div id="assistPaneTrip"[^>]*style="display:none"', html), "行程 pane 默认隐藏"
+    assert re.search(r'<div id="assistTabChat" class="fp-tab sel"|id="assistTabChat" class="fp-tab sel"', html), \
+        "默认停在「💬 问答」"
+    assert 'const ASSIST_MODES=["chat","trip"]' in html, "两个模式键收成一份常量(两个 pane 同源)"
+    switch = assist_fn(html, "switchAssistMode", "function openAssistDrawer")
+    assert 'panes={chat:$("assistPaneChat"),trip:$("assistPaneTrip")}' in switch
+    assert 'panes[key].style.display=active?"block":"none"' in switch, "两个 pane 必须互斥显示"
+    assert 'tabs[key].classList.toggle("sel",active)' in switch and 'setAttribute("aria-selected"' in switch
+    assert '$("assistTabChat").addEventListener("click",()=>switchAssistMode("chat"))' in html
+    assert '$("assistTabTrip").addEventListener("click",()=>switchAssistMode("trip"))' in html
+    assert "state.assist.mode" in switch, "模式状态存在 state.assist.mode"
+
+
+def test_assist_modes_call_their_own_api(html: str) -> None:
+    section = assist_section(html)
+    assert js_string(html, "ASSIST_MSG_API") == ASSIST_MSG_API, "💬 问答走 11a 的助手接口"
+    assert 'sendJSON(ASSIST_MSG_API,{method:"POST"' in section, "发一轮问答应 POST /api/assistant/messages"
+    assert 'getJSON(ASSIST_MSG_API+"?session_key="' in section, "回放问答历史应 GET /api/assistant/messages"
+    assert 'await sendJSON(ASSIST_MSG_API,{method:"DELETE"' in section, "清空问答应 DELETE 同一个接口"
+    assert 'body:JSON.stringify({session_key:key})' in section, \
+        "助手的清空是 DELETE **带请求体**(与 planner 的 query 参数口径不同,别照抄)"
+    assert PLANNER_MSG_API in section or "openPlannerTab()" in section, \
+        "🧳 行程走既有 /api/planner/messages(复用 10c 的入口,不另写一条请求路径)"
+    assert '$("assistTripSend").addEventListener("click",plannerSend)' in html, "行程模式的发送复用 plannerSend"
+    assert "PLANNER_MSG_API" in planner_section(html), "行程模式的接口常量仍是 10c 那一个"
+    assert "fetch(" not in section, "只经既有 getJSON()/sendJSON() 打接口,不自己 fetch"
+    assert 'headers:{"Content-Type":"application/json"}' in section and "JSON.stringify(" in section
+    paths = fastapi_app.openapi()["paths"]
+    assert ASSIST_MSG_API in paths and PLANNER_MSG_API in paths, "两个模式的后端路由都要已注册"
+    assert {"get", "post", "delete"} <= set(paths[ASSIST_MSG_API]), "助手对话三件套要齐(TASK-11a)"
+
+
+def test_assist_context_is_city_band_and_fav_summary(html: str) -> None:
+    context = assist_fn(html, "assistContext", "// 上下文回显")
+    assert "state.origin" in context and "origin.city" in context, "context 要带当前起点城市"
+    assert "state.bandMeta" in context and "currentBand()" in context, "context 要带选中的分段(含降级兜底)"
+    assert "band.label" in context and "band.low" in context and "band.high" in context, \
+        "分段要写清 label 与距离口径(km),AI 才知道问的是哪一圈"
+    assert "assistFavSummary()" in context, "context 要带收藏条数摘要"
+    assert "state.category" in context and "categoryMeta(" in context, "顺带带上分类筛选(页面已有状态)"
+    assert "text.slice(0,ASSIST_CTX_MAX)" in context, "前端拼完必须截到上限(不甩长文给后端)"
+    assert js_constant(html, "ASSIST_CTX_MAX") == assistant_service.CONTEXT_MAX_CHARS, \
+        "上下文上限与后端 CONTEXT_MAX_CHARS 同口径(500 字)"
+    summary = assist_fn(html, "assistFavSummary", "// POST 自动带的 context")
+    assert "state.fav.items" in summary and "favGroupOf(" in summary, "收藏摘要与「⭐ 我的收藏」同源"
+    assert "收藏 " in summary and "items.length" in summary, "摘要报条数(目的地/路线/住宿各多少)"
+    body = assist_fn(html, "assistRequestBody", "async function assistSend")
+    for field in ASSIST_BODY_FIELDS:
+        assert re.search(rf"\b{field}:", body), f"问答请求体缺少字段 {field}"
+    assert "context:assistContext()" in body, "context 每次发送实时重算(不用旧快照)"
+    assert "session_key:assistSessionKey()" in body
+    echo = assist_fn(html, "renderAssistCtx", "// 按钮态")
+    assert 'box.textContent=ASSIST_CTX_PREFIX' in echo and "assistContext()" in echo, \
+        "发的是什么上下文就回显给用户看(不藏着)"
+    assert 'id="assistCtx"' in html and "ASSIST_CTX_EMPTY" in html, "还没有起点时给中文占位"
+
+
+def test_assist_message_limit_matches_backend(html: str) -> None:
+    assert js_constant(html, "ASSIST_MSG_MAX") == assistant_service.MAX_MESSAGE_LEN, \
+        "提问字数上限与后端 assistant.MAX_MESSAGE_LEN 同口径"
+    assert js_constant(html, "ASSIST_HISTORY_LIMIT") == planner_service.LIST_LIMIT_DEFAULT, \
+        "回放条数与后端默认一致"
+    assert js_constant(html, "ASSIST_HISTORY_LIMIT") <= planner_service.LIST_LIMIT_MAX
+    pane = assist_pane(html, "chat")
+    assert re.search(r'<textarea id="assistInput" class="ad-in" rows="3" maxlength="2000"', html), \
+        "输入区是 textarea(要多行)+ maxlength 与后端同口径"
+    assert 'for="assistInput"' in pane and "Enter 发送 · Shift+Enter 换行" in pane, "label 与键盘口径要写清"
+    send = assist_fn(html, "assistSend", "// Enter 发送 / Shift+Enter 换行")
+    assert "先问一句" in send, "空消息就地给中文提示(不打无谓的 400)"
+    assert "ASSIST_MSG_MAX" in send and "上限" in send, "超长就地给中文提示"
+    assert "AI 问答失败" in send and "error.message" in send, "接口失败(后端 400 中文报错)要透出"
+
+
+def test_assist_degraded_reason_is_visible(html: str) -> None:
+    section = assist_section(html)
+    degraded = assist_fn(html, "assistDegradedHtml", "// 问答气泡")
+    assert "PLANNER_REASON_TEXT[code]" in degraded, "复用 10c 的原因码中文表(后端降级四态同一套码)"
+    assert "原因:" in degraded and "esc(code)" in degraded, "原因码要摆到明面上"
+    assert "没有编造答案" in degraded, "降级要说清「没编造答案」并可重试"
+    assert 'class="ai-degraded"' in degraded, "沿用 10c 的黄底降级样式(显眼)"
+    for key in planner_service.DEGRADE_REASONS:
+        assert re.search(rf'{key}:"[^"]{{4,}}"', js_map(html, "PLANNER_REASON_TEXT")), \
+            f"降级原因 {key} 要有中文文案"
+    bubble = assist_fn(html, "assistBubbleHtml", "// 收藏条数摘要")
+    assert "(!mine&&item.degraded)?assistDegradedHtml(item.reason)" in bubble, \
+        "助手气泡 degraded=true 就渲染降级块(绝不静默)"
+    assert 'class="ai-bubble ' in bubble and "ai-me" in bubble and "ai-bot" in bubble, "用户/助手两种气泡"
+    assert "esc(item.content)" in bubble and 'replace(/\\n/g,"<br>")' in bubble, "正文过 esc() 且保留换行"
+    send = assist_fn(html, "assistSend", "// Enter 发送 / Shift+Enter 换行")
+    assert "degraded:result.degraded" in send and "reason:result.reason" in send, "POST 响应要接住降级字段"
+
+
+def test_assist_session_keys_are_two_separate_stores(html: str) -> None:
+    section = assist_section(html)
+    assert js_string(html, "ASSIST_SESSION_STORE") == ASSIST_SESSION_STORE
+    assert js_string(html, "PLANNER_SESSION_STORE") == PLANNER_SESSION_STORE
+    assert ASSIST_SESSION_STORE != PLANNER_SESSION_STORE, "问答与行程两个会话 key 必须分开存"
+    getter = assist_fn(html, "assistSessionKey", "function rememberAssistSession")
+    assert "localStorage.getItem(ASSIST_SESSION_STORE)" in getter, "刷新后要能读回问答会话 key"
+    assert "catch(error)" in getter, "读不到本地存储(隐私模式)只当新会话,不抛错"
+    remember = assist_fn(html, "rememberAssistSession", "function setAssistErr")
+    assert "localStorage.setItem(ASSIST_SESSION_STORE,value)" in remember
+    send = assist_fn(html, "assistSend", "// Enter 发送 / Shift+Enter 换行")
+    assert "rememberAssistSession(result.session_key)" in send, "后端补发的 key 要存下来(多轮续聊)"
+    trip = assist_fn(html, "renderAssistTripMsgs", "// 点名标签")
+    assert "state.planner.items" in trip, "行程模式共用 state.planner(= 沿用 w2g_planner_session 那一份)"
+    assert "ASSIST_SESSION_STORE" not in trip and "localStorage" not in trip, \
+        "行程模式不另存 key(沿用既有 w2g_planner_session)"
+    drawer = assist_drawer(html)
+    assert ASSIST_SESSION_STORE in drawer and PLANNER_SESSION_STORE in drawer, \
+        "两个 key 存在哪都要在抽屉里写清(不藏着)"
+
+
+def test_assist_busy_state_and_keyboard(html: str) -> None:
+    assert js_string(html, "ASSIST_BUSY_LABEL") == ASSIST_BUSY_LABEL, "问答的进行中文案要逐字"
+    acts = assist_fn(html, "syncAssistActs", "function setAssistBusy")
+    assert "send.disabled=busy" in acts and "busy?ASSIST_BUSY_LABEL:ASSIST_SEND_LABEL" in acts, \
+        "发送中禁用发送按钮并换进行中文案"
+    assert "clear.disabled=busy" in acts, "发送中也不许清空(免得并发)"
+    key = assist_fn(html, "onAssistKeydown", "async function loadAssistMessages")
+    assert 'event.key!=="Enter"||event.shiftKey' in key, "只有裸 Enter 发送,Shift+Enter 换行"
+    assert "event.preventDefault()" in key and "assistSend()" in key
+    assert '$("assistInput").addEventListener("keydown",onAssistKeydown)' in html
+    assert '$("assistInput").addEventListener("input",()=>setAssistErr(""))' in html, "改一个字就清掉报错"
+    send = assist_fn(html, "assistSend", "// Enter 发送 / Shift+Enter 换行")
+    assert "if(state.assist.busy) return;" in send, "发送中再点直接忽略(不并发两轮 LLM)"
+    assert "setAssistBusy(true)" in send and "setAssistBusy(false)" in send
+    assert "renderAssistMsgs();" in send, "状态变了要重渲染消息流"
+    assert "ASSIST_WAIT_TEXT" in assist_fn(html, "renderAssistMsgs", "function assistInputText"), \
+        "等待期间消息流里也要有进行中文案(不只按钮变字)"
+    # 行程模式沿用 10c 的进行中文案与键盘口径
+    trip_acts = assist_fn(html, "syncAssistTripActs", "function setAssistTripErr")
+    assert "busy?PLANNER_BUSY_LABEL:PLANNER_SEND_LABEL" in trip_acts, \
+        "行程的进行中文案沿用「AI 规划中…(首次约 1 分钟)」"
+    assert js_string(html, "PLANNER_BUSY_LABEL") == PLANNER_BUSY_LABEL
+    assert '$("assistTripInput").addEventListener("keydown",onPlannerKeydown)' in html, \
+        "行程模式复用 10c 的 Enter/Shift+Enter 处理"
+    assert '$("assistTripSend").addEventListener("click",plannerSend)' in html
+
+
+def test_assist_trip_mode_reuses_planner_ui(html: str) -> None:
+    section = assist_section(html)
+    msgs = assist_fn(html, "renderAssistTripMsgs", "// 点名标签")
+    assert "plannerBubbleHtml" in msgs, "按天行程卡片/气泡复用 10c 的渲染器(不另写一套)"
+    assert "PLANNER_EMPTY_TEXT" in msgs and "PLANNER_LOADING_TEXT" in msgs and "PLANNER_WAIT_TEXT" in msgs
+    assert "box.scrollTop=box.scrollHeight" in msgs, "最新一轮要滚到可见"
+    tags = assist_fn(html, "renderAssistTripTags", "// 按钮态:行程的进行中文案")
+    assert "plannerTagHtml" in tags and "PLANNER_TAG_EMPTY" in tags, "点名标签复用 10c 的构造器"
+    assert "state.fav.items" in tags, "点名标签与收藏同源"
+    refresh = html[html.index("async function refreshFavItems"):html.index("async function openFavPanel")]
+    assert 'if(state.assist.open&&state.assist.mode==="trip"&&!state.fav.open) renderPlannerTags();' in refresh, \
+        "抽屉停在行程模式时,收藏增删也要刷点名标签(收藏面板没开也要刷)"
+    acts = assist_fn(html, "syncAssistTripActs", "function setAssistTripErr")
+    assert "state.planner.busy" in acts and "state.planner.lastItinerary" in acts, "按钮态读同一份 state"
+    assert "PLANNER_SAVE_LABEL" in acts and "PLANNER_CLEAR_LABEL" in acts
+    assert '"已点名 "+plannerMentionedIds().length+" 条"' in acts, "「已点名 N 条」两处同源"
+    assert '$("assistTripTags").addEventListener("click",onPlannerTagClick)' in html, "@点名走 10c 的委托"
+    assert '$("assistTripSave").addEventListener("click",plannerSavePlan)' in html, "存为方案复用 10c"
+    assert '$("assistTripClear").addEventListener("click",plannerClear)' in html, "清空对话复用 10c"
+    switch = assist_fn(html, "switchAssistMode", "function openAssistDrawer")
+    assert "openPlannerTab()" in switch, "切到行程模式复用 10c 的入口(刷点名标签 + 回放历史)"
+    assert "loadAssistMessages();" in switch, "切到问答模式才回放问答历史"
+    box = assist_fn(html, "plannerInputBox", "// 消息流")
+    assert 'state.assist.mode==="trip"' in box and '$("assistTripInput")' in box and '$("plannerInput")' in box, \
+        "输入框归一:抽屉在前台就读抽屉那个(@引用也插到前台)"
+    assert 'active.closest("#assistPaneTrip")' in box and 'active.closest("#favPaneAi")' in box, \
+        "两个入口同时开着时按焦点认前台(不会把 @引用插进看不见的那个框)"
+    assert 'state.fav.open&&state.tripPlan.tab==="ai"' in box, \
+        "拿不到焦点线索时按层级兜底:收藏弹层盖在抽屉之上,优先读它那个"
+    # 10c 那四处镜像钩子:任一处渲染,抽屉同步(两个入口共用同一份 state.planner)
+    planner = planner_section(html)
+    for hook, owner in (("setAssistTripErr(message);", "setPlannerErr"),
+                        ("renderAssistTripMsgs();", "renderPlannerMsgs"),
+                        ("renderAssistTripTags();", "renderPlannerTags"),
+                        ("syncAssistTripActs();", "syncPlannerActs"),
+                        ("renderAssistTripSaveOut(content);", "renderPlannerSaveOut")):
+        assert hook in planner, f"10c 的 {owner} 里少了镜像钩子 {hook}(抽屉会与 tab 不同步)"
+    assert "const input=plannerInputBox();" in planner_fn(html, "togglePlannerMention", "function plannerInputText")
+    assert "const input=plannerInputBox();" in planner_fn(html, "plannerInputText", "// 请求体")
+    # 复用不等于重写:10c 的函数一个都没被搬进助手段(定义仍在 planner 段里)
+    for name in ("plannerSend", "plannerSavePlan", "plannerClear", "plannerBubbleHtml", "plannerTagHtml"):
+        assert f"function {name}(" not in section, f"{name} 应留在 10c 那一段(助手段只调用,不重定义)"
+        assert f"function {name}(" in planner, f"{name} 的原定义不能动(零回归)"
+
+
+def test_assist_chat_history_replay_and_clear(html: str) -> None:
+    load = assist_fn(html, "loadAssistMessages", "// 「🗑 清空对话」")
+    assert 'encodeURIComponent(key)' in load and '"&limit="+ASSIST_HISTORY_LIMIT' in load
+    assert "result.items" in load and "plannerItemOf" in load, \
+        "回放要逐条归一成气泡数据(归一器复用 10c 的 plannerItemOf:payload.degraded/reason 也吃得下)"
+    assert "if(!key){" in load, "本机没有会话 key 时直接给空态(不打无谓的 400)"
+    assert "问答历史读取失败" in load and "error.message" in load
+    clear = assist_fn(html, "assistClear", "// --- 「🧳 行程」模式")
+    assert 'method:"DELETE"' in clear and "JSON.stringify({session_key:key})" in clear
+    assert "state.assist.items=[]" in clear, "清空后本地也要清干净"
+    assert "清空问答失败" in clear and "error.message" in clear, "失败要有可见中文报错"
+    assert '$("assistClear").addEventListener("click",assistClear)' in html
+    assert js_string(html, "ASSIST_CLEAR_LABEL") == "🗑 清空对话"
+
+
+def test_assistant_response_contract_matches_backend(html: str, assistant_turn: dict[str, Any],
+                                                    plan_session) -> None:
+    """真跑 11a 的端点(强制 no_key 降级):前端读的键必须都在真实响应里,且降级不静默。"""
+    assert set(ASSIST_REPLY_FIELDS) <= set(assistant_turn), f"助手响应形状变了:{sorted(assistant_turn)}"
+    assert assistant_turn["degraded"] is True and assistant_turn["reason"] == "no_key", \
+        "没配 key 就该 degraded=True + reason=no_key(后端不抛、不触网)"
+    assert assistant_turn["reply"], "降级也要给中文 reply(前端直接显示)"
+    assert assistant_turn["session_key"].startswith("chat-"), "后端补发的问答 key 带 chat- 前缀"
+    section = assist_section(html)
+    for field in ASSIST_REPLY_FIELDS:
+        assert f"result.{field}" in section, f"前端没有消费响应的 {field}"
+    # 回放:刚发过一轮 → GET 能拿回历史,且前端发过去的 context 落进了 payload(可追溯)
+    listed = assistant_api.get_messages(session_key=assistant_turn["session_key"], limit=None,
+                                        session=plan_session)
+    items = listed.get("items") or []
+    assert items, "刚发过一轮,回放要有历史"
+    row = items[-1]
+    assert {"role", "content", "created_at"} <= set(row), f"回放项形状变了:{sorted(row)}"
+    assert any("context" in (item.get("payload") or {}) for item in items), \
+        "前端发的 context 要落进 payload(问答历史里能追溯当时带了什么页面上下文)"
+    assert "payload.degraded" in planner_section(html) and "payload.reason" in planner_section(html), \
+        "回放时降级原因仍要可见(归一器读 payload.degraded/reason)"
+    # 清空:DELETE 带请求体 {session_key} → 只删消息、会话行保留(key 继续可用)
+    cleared = assistant_api.delete_messages({"session_key": assistant_turn["session_key"]},
+                                            session=plan_session)
+    assert cleared["deleted"] >= 1 and cleared["session_key"] == assistant_turn["session_key"]
+    assert assistant_api.get_messages(session_key=assistant_turn["session_key"], limit=None,
+                                      session=plan_session)["items"] == [], "清空后回放应为空"
+
+
+def test_assist_drawer_adds_no_frontend_key_or_dependency(html: str) -> None:
+    section = assist_section(html)
+    assert not re.search(r"[a-f0-9]{32}", section), "AI 助手段不得出现 32 位 key 样态字符串"
+    assert not re.search(r"[a-f0-9]{32}", assist_drawer(html)), "抽屉 DOM 里也不得有 key 样态字符串"
+    assert "amap_js_key" not in section and ENV_JS_KEY not in section, "不新增前端 key"
+    assert "/api/map-config" not in section, "不新增配置接口(地图配置仍只有既有那一个)"
+    assert "new AMap." not in section and "fetch(" not in section and "document.write" not in section
+    assert "<script src=" not in html and "<link" not in html, "不引第三方 JS/CSS"
+    assert inline_script(html), "页面仍只有一段内联脚本"
+    stored = re.findall(r"(?:localStorage|sessionStorage)\.\w+\(([^)]*)\)", section)
+    assert stored and all(any(name in args for name in SESSION_STORE_CONSTS) for args in stored), \
+        f"助手段的本地存储只用来存会话 session_key,实际:{stored}"
+
+
+def test_assist_drawer_keeps_existing_features(html: str) -> None:
+    # 10c 的「🤖 AI 行程」tab 保留不删(零回归):DOM、切换与加载入口都在
+    for element_id in ("favTabAi", "favPaneAi", "plannerErr", "plannerMsgs", "plannerTags",
+                       "plannerInput", "plannerSend", "plannerSave", "plannerClear", "plannerSaveOut"):
+        assert f'id="{element_id}"' in html, f"既有 AI 行程 tab 的 DOM 少了 {element_id}"
+    assert '$("favTabAi").addEventListener("click",()=>switchFavTab("ai"))' in html
+    assert 'if(state.tripPlan.tab==="ai") openPlannerTab();' in switch_section(html)
+    assert 'const FAV_TABS=["fav","plan","ai"]' in html, "收藏面板仍是三个 tab(没被抽屉取代)"
+    # 详情弹窗 / 收藏弹层 / 路线面板的既有开关一个不少
+    for element_id in ("placeModal", "placeModalClose", "favPanel", "favPanelClose", "routePanel"):
+        assert f'id="{element_id}"' in html, f"既有弹层的 DOM 少了 {element_id}"
+    keys = keydown_section(html)
+    assert "closePlaceModal()" in keys and "closeFavPanel()" in keys and "closeRoutePanel()" in keys
+    # state:既有键不变,只多了 assist 一个
+    state_row = html[html.index("const state={"):html.index("// 高德覆盖物句柄")]
+    assert re.search(r'planner:\{sessionKey:"",items:\[\],busy:false,mentioned:\[\],'
+                     r'lastItinerary:null\}', state_row), "state.planner 一字不动(行程模式共用它)"
+    assert re.search(r'assist:\{open:false,mode:"chat",sessionKey:"",items:\[\],busy:false,'
+                     r'lastFocus:null\}', state_row), "state.assist 六个键照契约写死"
+    assert "onclick=" not in html and "alert(" not in html, "仍不许内联 onclick / alert"

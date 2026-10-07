@@ -201,6 +201,32 @@
   .ai-acts .fp-save-btn,.ai-acts .fp-del{margin-top:0}
   .ai-alt{background:#0369a1}
   .ai-alt:hover{background:#075985}
+  /* 全局 AI 助手抽屉(TASK-11b):右侧可折叠抽屉 + 悬浮入口按钮(💬 问答 / 🧳 行程 双模式)。
+     层级口径:抽屉 z-index 1900 —— 盖住地图右上角的路线面板(1000),但**低于**收藏弹层(2000)
+     与详情弹窗(2100),所以三者可以同时开着、互不遮挡;Esc 逐层收时抽屉排在最外层(最后关)。
+     展开时只吃右侧一条(宽 ≤340px),并把路线面板整体左移让开 —— 地图主操作区不被挡住。
+     气泡/降级块/行程卡片/点名标签一律复用 10c 的 .ai-*(不引第三方 CSS)。 */
+  #assistFab{position:fixed;right:14px;bottom:20px;z-index:1900;padding:9px 15px;font-size:13px;
+             border-radius:20px;box-shadow:0 3px 12px rgba(15,23,42,.3)}
+  #assistFab:hover{background:#115e59}
+  body.assist-open #assistFab{display:none}   /* 抽屉开着时入口按钮让位(收起入口在抽屉头部 ✕) */
+  #assistDrawer{position:fixed;top:12px;right:12px;bottom:12px;z-index:1900;
+                width:min(340px,calc(100% - 24px));overflow:auto;background:#fff;border-radius:12px;
+                box-shadow:0 6px 24px rgba(15,23,42,.3);padding:12px 14px;box-sizing:border-box}
+  #assistDrawer[hidden]{display:none}
+  .ad-tabs{margin-top:9px}
+  .ad-ctx{margin-top:8px;font-size:11px;color:#374151;background:#f8fafc;border:1px dashed #e5e7eb;
+          border-radius:8px;padding:5px 7px;line-height:1.55}
+  /* 与 #plannerInput 同观感(那边是 id 选择器,这里两个 textarea 共用一条类规则) */
+  .ad-in{width:100%;box-sizing:border-box;padding:7px 9px;font-size:13px;font-family:inherit;
+         border:1px solid #d1d5db;border-radius:9px;background:#fff;resize:vertical}
+  .ad-acts .fp-save-btn,.ad-acts .fp-del{margin-top:0}
+  /* 抽屉展开 → 地图右上角的路线面板整体左移让开(窄屏路线面板已是 static,本条自然不生效) */
+  body.assist-open #routePanel{right:calc(min(340px,100vw - 24px) + 24px)}
+  @media (max-width:680px){
+    #assistDrawer{top:auto;height:min(74vh,540px);width:calc(100% - 20px);right:10px;bottom:10px}
+    body.assist-open #routePanel{right:10px}
+  }
   /* 前往预订(TASK-4b):deep-link 聚合,只跳转不代订 */
   .bk-row{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
   .bk-nm{font-size:12px;font-weight:700;color:#374151}
@@ -524,6 +550,80 @@
       <div id="placeModalSource"></div>
     </div>
   </div>
+  <!-- 全局 AI 助手抽屉(TASK-11b):右侧可折叠 + 悬浮入口按钮,一个抽屉两个模式 ——
+       💬 问答走 POST/GET/DELETE /api/assistant/messages(TASK-11a 后端):POST 自动带 context
+         = 当前起点城市 + 选中分段 + 收藏条数摘要(前端拼 ≤500 字,内容在抽屉里可见、不藏着);
+       🧳 行程走既有 /api/planner/messages,与收藏面板「🤖 AI 行程」tab <b>同一份 state.planner、
+         同一个 session_key、同一批渲染与点名函数</b>(气泡/按天行程卡片/@点名标签/存为方案全部复用),
+         任一处发送,另一处同步刷新;那个 tab 保留不删。
+       会话 key 只存本机 localStorage,两个模式分开存:w2g_assistant_session(问答)/
+       w2g_planner_session(行程,沿用既有)。层级:抽屉在收藏弹层与详情弹窗<b>之下</b>、
+       路线面板之上;Esc 逐层收 = 详情弹窗 → 收藏弹层 → 路线面板 → 抽屉(最外层最后关)。 -->
+  <button type="button" id="assistFab" aria-expanded="false" aria-controls="assistDrawer"
+          title="打开全局 AI 助手:💬 旅行问答(自动带上当前页面上下文)/ 🧳 AI 行程(与收藏面板同一份会话)">💬 AI 助手</button>
+  <aside id="assistDrawer" role="dialog" aria-labelledby="assistDrawerTitle" hidden>
+    <div class="rp-head">
+      <div class="rp-ttl" id="assistDrawerTitle">🤖 AI 助手</div>
+      <button type="button" id="assistCollapse" class="rp-x"
+              title="收起抽屉(Esc 在其他弹层都关掉后才收它;对话不丢,历史存在后端按 session_key 回放)">✕</button>
+    </div>
+    <div class="fp-sub">右侧抽屉,展开时不挡地图主操作区(路线面板会自动让位)。两个模式各存一个会话 key,
+      都只在本机 localStorage;回答里 AI 拿不准的事实写「待核实」,<b>不编数字</b>。</div>
+    <div class="fp-tabs ad-tabs" role="tablist" aria-label="AI 助手模式(问答 / 行程)">
+      <button type="button" id="assistTabChat" class="fp-tab sel" role="tab" aria-selected="true"
+              aria-controls="assistPaneChat"
+              title="通用旅行问答:POST /api/assistant/messages,自动带上当前起点城市 + 分段 + 收藏摘要">💬 问答</button>
+      <button type="button" id="assistTabTrip" class="fp-tab" role="tab" aria-selected="false"
+              aria-controls="assistPaneTrip"
+              title="AI 行程:走既有 /api/planner/messages,与收藏面板「🤖 AI 行程」tab 同一份会话与点名清单">🧳 行程</button>
+    </div>
+    <!-- 💬 问答:气泡流 + 本轮上下文回显 + 发送 / 清空 -->
+    <div id="assistPaneChat" role="tabpanel" aria-labelledby="assistTabChat">
+      <div id="assistErr" class="fp-err" style="display:none"></div>
+      <div class="ai-msgs" id="assistMsgs"></div>
+      <div class="ad-ctx" id="assistCtx"></div>
+      <div class="ai-in-row">
+        <label class="fp-sub" for="assistInput">想问什么(Enter 发送 · Shift+Enter 换行)</label>
+        <textarea id="assistInput" class="ad-in" rows="3" maxlength="2000"
+                  placeholder="例:这个分段带娃合适吗?门票和开放时间要自己核实什么?"></textarea>
+      </div>
+      <div class="ai-acts ad-acts">
+        <button type="button" id="assistSend" class="fp-save-btn"
+                title="POST /api/assistant/messages(自动带 context:当前起点城市 + 选中分段 + 收藏摘要)">📨 发送(Enter)</button>
+        <button type="button" id="assistClear" class="fp-del"
+                title="DELETE /api/assistant/messages(请求体 {session_key}):只删消息,会话 key 保留">🗑 清空对话</button>
+      </div>
+      <div class="fp-sub" id="assistHint">问答历史存在后端(按 session_key),key 只存在本机 localStorage 的
+        w2g_assistant_session 里,刷新页面不丢;换设备/清了本机存储就要重新开一轮。</div>
+    </div>
+    <!-- 🧳 行程:与收藏面板「🤖 AI 行程」tab 同源(共用 state.planner / session_key / 点名清单) -->
+    <div id="assistPaneTrip" role="tabpanel" aria-labelledby="assistTabTrip" style="display:none">
+      <div class="fp-sub">与收藏面板「🤖 AI 行程」tab 是<b>同一份会话</b>(w2g_planner_session)与同一份点名清单:
+        在这儿排出的行程,那边打开就能看到。想用自己的收藏,<b>先点下面的 @标签点名</b>
+        (未点名的一律不会进请求);阶段 A 只排每天的目的地,不含交通报价 / 住宿 / 总预算。</div>
+      <div id="assistTripErr" class="fp-err" style="display:none"></div>
+      <div class="ai-msgs" id="assistTripMsgs"></div>
+      <div class="ai-tags" id="assistTripTagWrap">
+        <div class="fp-grp-ttl">点名收藏<span class="fp-grp-cnt" id="assistTripTagCount">已点名 0 条</span></div>
+        <div class="fp-sub">点一下 = 加入本次请求的 collection_ids + 在输入框插入 @引用;再点一下取消。</div>
+        <div id="assistTripTags"></div>
+      </div>
+      <div class="ai-in-row">
+        <label class="fp-sub" for="assistTripInput">这一轮想说什么(Enter 发送 · Shift+Enter 换行)</label>
+        <textarea id="assistTripInput" class="ad-in" rows="3" maxlength="2000"
+                  placeholder="例:3 天,亲子,不要太累;第二天想换成古镇"></textarea>
+      </div>
+      <div class="ai-acts ad-acts">
+        <button type="button" id="assistTripSend" class="fp-save-btn"
+                title="POST /api/planner/messages(只带已点名的 collection_ids)">📨 发送(Enter)</button>
+        <button type="button" id="assistTripSave" class="fp-save-btn ai-alt" disabled
+                title="POST /api/planner/save:把 AI 排的地点落成既有行程方案(与收藏面板同一个按钮口径)">⭐ 存为行程方案</button>
+        <button type="button" id="assistTripClear" class="fp-del"
+                title="DELETE /api/planner/messages:只删对话消息,会话 key 保留">🗑 清空对话</button>
+      </div>
+      <div id="assistTripSaveOut" style="display:none"></div>
+    </div>
+  </aside>
 </main>
 <footer>
   Where2Go 阶段2b · 地图:高德 JS API 2.0(底图与 POI 同源、坐标 GCJ-02;JS key 与安全密钥由
@@ -630,6 +730,10 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
              planner:{sessionKey:"",items:[],busy:false,mentioned:[],lastItinerary:null},
              // 详情弹窗(TASK-8b):token 守卫在飞的 media/highlights 响应;lastFocus 用于关闭后归还焦点
              modal:{open:false,place:null,index:-1,images:[],hero:0,token:0,lastFocus:null},
+             // AI 助手抽屉(TASK-11b):open = 抽屉是否展开、mode = "chat"|"trip"、
+             // sessionKey/items/busy 只服务「💬 问答」;「🧳 行程」**不另立 state** —— 直接共用
+             // 上面的 state.planner(同一份会话 key / 气泡 / 点名清单),两个入口才永远同步。
+             assist:{open:false,mode:"chat",sessionKey:"",items:[],busy:false,lastFocus:null},
              mapNote:""};   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
 // 高德覆盖物句柄:rings/pins/routeLayer 是**数组**(高德没有 Leaflet 的 layerGroup,
 // 清图层 = clearOverlays() 逐个 setMap(null));infoWindow 承载 popupHtml(),hoverTip 代替 bindTooltip。
@@ -1543,10 +1647,13 @@ function onDocumentClick(event){
 // 键盘可达:Enter/空格选中卡片(画线),Esc 关弹层/面板清线
 function onDocumentKeydown(event){
   if(event.key==="Escape"){
-    // 层级(TASK-8b):详情弹窗开着先关它,再关收藏弹层,最后才是路线面板(既有口径不变)
+    // 层级(TASK-8b + 11b):详情弹窗开着先关它,再关收藏弹层,再关路线面板,最后才收 AI 助手
+    // 抽屉 —— 抽屉是**最外层**(它展开时不遮挡上面三个,所以 Esc 由内层优先、它最后关)。
     if(state.modal.open){closePlaceModal();return;}
     if(state.fav.open){closeFavPanel();return;}   // 先关收藏弹层,再关路线面板
-    closeRoutePanel();return;
+    if(state.routePanel.open){closeRoutePanel();return;}
+    if(state.assist.open){closeAssistDrawer();return;}
+    closeRoutePanel();return;   // 都没开:沿用既有兜底(顺手清掉地图上可能残留的线)
   }
   if(event.key!=="Enter"&&event.key!==" "&&event.key!=="Spacebar") return;
   const target=event.target;
@@ -2708,6 +2815,8 @@ async function refreshFavItems(){
     renderPlannerTags();                                 // 点名标签与收藏同源(TASK-10c)
     if(state.tripPlan.tab==="plan") loadTripPlans();     // 删收藏会让方案 quote 出现 missing,顺手刷一次
   }
+  // 抽屉展开在「🧳 行程」模式时,即使收藏面板没开也要刷点名标签(镜像钩子会同步抽屉那一侧,TASK-11b)
+  if(state.assist.open&&state.assist.mode==="trip"&&!state.fav.open) renderPlannerTags();
   syncFavButtons();
   syncStayFavButtons();   // 住宿卡片的「已收藏」态与收藏列表同源刷新(TASK-3b)
   syncPlaceFavButtons();  // 目的地收藏按钮(popup + 地图下方列表)同源刷新(TASK-FE 功能4)
@@ -3192,6 +3301,7 @@ function setPlannerErr(message){
   if(!box) return;
   box.textContent=message||"";
   box.style.display=message?"block":"none";
+  setAssistTripErr(message);   // 抽屉「🧳 行程」同源显示(TASK-11b:同一份 state.planner)
 }
 // 两种来源归一成同一种气泡数据:POST 的响应(reply/itinerary/degraded/reason 平铺)
 // 与 GET 回放的历史项({role,content,payload:{itinerary,degraded,reason,generated_at},created_at})
@@ -3274,6 +3384,7 @@ function syncPlannerActs(){
   if(clear){clear.disabled=busy;clear.textContent=PLANNER_CLEAR_LABEL;}
   const count=$("plannerTagCount");
   if(count) count.textContent="已点名 "+plannerMentionedIds().length+" 条";
+  syncAssistTripActs();        // 抽屉那一套按钮/计数跟着同一份 busy 与点名清单走(TASK-11b)
 }
 function setPlannerBusy(busy){
   state.planner.busy=!!busy;
@@ -3292,6 +3403,7 @@ function renderPlannerMsgs(){
   }
   box.scrollTop=box.scrollHeight;   // 最新一轮总在下面
   syncPlannerActs();
+  renderAssistTripMsgs();           // 抽屉「🧳 行程」镜像同一份 items(TASK-11b)
 }
 // 点名标签:一条收藏一个 @名称 按钮(与「⭐ 我的收藏」同源,收藏变了自动跟着刷)
 function plannerTagKindLabel(item){
@@ -3318,6 +3430,7 @@ function renderPlannerTags(){
     ? items.map(plannerTagHtml).join("")
     : '<div class="fp-empty">'+esc(PLANNER_TAG_EMPTY)+"</div>";
   syncPlannerActs();
+  renderAssistTripTags();           // 抽屉的 @点名标签同源(TASK-11b)
 }
 // 只有点过名的收藏 id 会进请求;没点名 = 空数组(**不是**省略字段)
 function plannerMentionedIds(){
@@ -3334,7 +3447,7 @@ function onPlannerTagClick(event){
 function togglePlannerMention(rawId,name){
   const id=Number(rawId);
   if(!isFinite(id)||id<=0) return;
-  const input=$("plannerInput");
+  const input=plannerInputBox();
   const token=plannerMentionToken(name);
   const at=state.planner.mentioned.indexOf(id);
   if(at>=0){
@@ -3356,7 +3469,7 @@ function togglePlannerMention(rawId,name){
   renderPlannerTags();
 }
 function plannerInputText(){
-  const input=$("plannerInput");
+  const input=plannerInputBox();
   return String(input?input.value:"").trim();
 }
 // 请求体:collection_ids 恒等于「已点名」的 id(空数组 = 明确不点名),nights 取方案 tab 的住几晚
@@ -3494,6 +3607,7 @@ function renderPlannerSaveOut(content){
   if(!box) return;
   box.innerHTML=content||"";
   box.style.display=content?"block":"none";
+  renderAssistTripSaveOut(content);   // 「⭐ 存为行程方案」的结果两处同显(TASK-11b)
 }
 async function plannerSavePlan(){
   const stops=plannerStops();
@@ -3876,6 +3990,370 @@ $("placeModal").addEventListener("click",onPlaceModalClick);
 $("placeModalClose").addEventListener("click",closePlaceModal);
 document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);
+
+// --------------------------------------------------------------------------- //
+// 全局 AI 助手抽屉(TASK-11b):右侧可折叠抽屉 + 悬浮入口按钮,一个抽屉两个模式。
+//   💬 问答(TASK-11a 后端):POST /api/assistant/messages {session_key,message,context}
+//        → {session_key,reply,degraded,reason,message_id};GET ?session_key=&limit= 回放;
+//        DELETE **带请求体** {session_key} 清空(与 planner 的 query 参数口径不同,别照抄)。
+//        context 由前端拼:当前起点城市 + 选中分段 + 收藏条数摘要,**≤500 字**
+//        (与后端 CONTEXT_MAX_CHARS 同口径,后端还会再截一次),内容在抽屉里回显、不藏着。
+//   🧳 行程:走既有 /api/planner/messages —— 与收藏面板「🤖 AI 行程」tab **共用同一份
+//        state.planner / 同一个 session_key(w2g_planner_session)/ 同一批函数**
+//        (plannerSend / plannerBubbleHtml / plannerTagHtml / plannerSavePlan / plannerClear …);
+//        抽屉只是把自己的容器接在同一份 state 上(10c 那四处镜像钩子),两个入口永远同步。
+// 五条口径:
+//   ① session_key 只存本机 localStorage,两个模式**分开存**:问答 w2g_assistant_session、
+//      行程沿用既有 w2g_planner_session;读不到(隐私模式 / 被清)就当新会话,不抛错。
+//   ② degraded=true **绝不静默**:原因码 + 中文原因摆在气泡最上面(与 10c 同一套原因码表)。
+//   ③ Enter 发送 / Shift+Enter 换行;发送中禁用按钮并换进行中文案
+//      (问答「AI 思考中…」,行程沿用 10c 的「AI 规划中…(首次约 1 分钟)」)。
+//   ④ 层级:抽屉(z-index 1900)盖住路线面板(1000)、但在收藏弹层(2000)与详情弹窗(2100)
+//      **之下** —— 四者可以同时开着;Esc 由内层优先,抽屉排在最外层最后关(见 onDocumentKeydown)。
+//   ⑤ 不新增前端 key、不引第三方 JS/CSS、不新增配置接口,只经既有 getJSON()/sendJSON() 打接口。
+// --------------------------------------------------------------------------- //
+const ASSIST_MSG_API="/api/assistant/messages";
+const ASSIST_SESSION_STORE="w2g_assistant_session";  // 问答会话 key(行程沿用 w2g_planner_session)
+const ASSIST_HISTORY_LIMIT=50;   // 回放条数(与后端 LIST_LIMIT_DEFAULT 同口径,后端上限 200)
+const ASSIST_MSG_MAX=2000;       // 单条提问字数上限(与后端 assistant.MAX_MESSAGE_LEN 同口径)
+const ASSIST_CTX_MAX=500;        // 前端拼的页面上下文上限(与后端 CONTEXT_MAX_CHARS 同口径)
+const ASSIST_MODES=["chat","trip"];
+const ASSIST_SEND_LABEL="📨 发送(Enter)";
+const ASSIST_BUSY_LABEL="AI 思考中…";            // 问答的进行中文案(行程沿用 PLANNER_BUSY_LABEL)
+const ASSIST_CLEAR_LABEL="🗑 清空对话";
+const ASSIST_EMPTY_TEXT="还没有提问:问一句旅行问题(如「这个分段带娃合适吗」),AI 会按当前页面上下文回答。";
+const ASSIST_LOADING_TEXT="正在读取问答历史(GET /api/assistant/messages)…";
+const ASSIST_WAIT_TEXT="AI 正在想这一轮回答,别关页面…";
+const ASSIST_ROLE_LABEL={user:"我",assistant:"🤖 AI"};
+const ASSIST_CTX_PREFIX="📎 本轮发送时会带上的页面上下文(发送前按当前页面实时重算,";
+const ASSIST_CTX_EMPTY="还没有起点:先搜索城市或点「📍 我的位置」,上下文里才有城市与分段。";
+
+// 问答会话 key:后端补发("chat-"+uuid4().hex),前端只负责存 / 取;读不到就当新会话
+function assistSessionKey(){
+  if(state.assist.sessionKey) return state.assist.sessionKey;
+  let stored="";
+  try{stored=String(localStorage.getItem(ASSIST_SESSION_STORE)||"").trim();}
+  catch(error){stored="";}
+  state.assist.sessionKey=stored;
+  return stored;
+}
+function rememberAssistSession(key){
+  const value=String(key||"").trim();
+  if(!value) return;
+  state.assist.sessionKey=value;
+  try{localStorage.setItem(ASSIST_SESSION_STORE,value);}
+  catch(error){/* 存不下只影响刷新续聊,这一轮问答照常 */}
+}
+function setAssistErr(message){
+  const box=$("assistErr");
+  if(!box) return;
+  box.textContent=message||"";
+  box.style.display=message?"block":"none";
+}
+// 降级绝不静默:原因码 + 中文原因(复用 10c 的 PLANNER_REASON_TEXT,后端降级四态同一套码)
+function assistDegradedHtml(reason){
+  const code=String(reason||"").trim();
+  const label=PLANNER_REASON_TEXT[code]||"后端没给原因码(按 error 处理)";
+  return '<div class="ai-degraded">⚠️ 本轮降级(原因:'+(code?esc(code):"unknown")+" · "+esc(label)+
+    ")—— 没有编造答案,按下面这段说明重试即可。</div>";
+}
+// 问答气泡:用户/助手两种(与 10c 同一套 .ai-* 样式);助手气泡 degraded=true 就带降级块。
+// 问答没有结构化行程,所以不渲染行程卡片(那是「🧳 行程」模式的事,走 plannerBubbleHtml)。
+function assistBubbleHtml(item){
+  const mine=(item.role==="user");
+  return '<div class="ai-bubble '+(mine?"ai-me":"ai-bot")+'">'+
+    '<div class="ai-who">'+esc(ASSIST_ROLE_LABEL[item.role]||item.role)+
+      (item.at?('<span class="ai-time">'+esc(fmtGeneratedAt(item.at))+"</span>"):"")+"</div>"+
+    ((!mine&&item.degraded)?assistDegradedHtml(item.reason):"")+
+    '<div class="ai-text">'+esc(item.content).replace(/\n/g,"<br>")+"</div>"+
+    "</div>";
+}
+// 收藏条数摘要:与「⭐ 我的收藏」同源(state.fav.items + favGroupOf),只报条数不报明细
+function assistFavSummary(){
+  const items=state.fav.items||[];
+  const counts={place:0,route:0,stay:0};
+  items.forEach(item=>{
+    const group=favGroupOf(item);
+    if(counts[group]!==undefined) counts[group]+=1;
+  });
+  return "收藏 "+items.length+" 条(📍 目的地 "+counts.place+" · 🚗 路线 "+counts.route+
+    " · 🛏️ 住宿 "+counts.stay+")";
+}
+// POST 自动带的 context:当前起点城市 + 选中分段(+ 距离口径)+ 分类筛选 + 收藏条数摘要。
+// 全部取页面已有状态(不为拼上下文额外打接口),拼好后**截到 500 字**(ASSIST_CTX_MAX)。
+function assistContext(){
+  const origin=state.origin||{};
+  const city=String(origin.city||"").trim();
+  const name=String(origin.name||"").trim()||city;
+  const band=state.bandMeta||currentBand()||{};
+  const label=String(band.label||state.band||"").trim()||"(未选)";
+  const span=(band.low!==undefined&&band.high!==undefined)
+    ? ("("+Number(band.low)+"-"+Number(band.high)+" km)")
+    : (band.key?("("+String(band.key).replace("_","-")+" km)"):"");
+  const category=state.category?String(categoryMeta(state.category).label):"全部分类";
+  const text="起点城市:"+(name||"(未定)")+
+    ";距离分段:"+label+span+
+    ";分类筛选:"+category+
+    ";当前列表已显示 "+(state.places||[]).length+" 条目的地;"+
+    assistFavSummary();
+  return text.slice(0,ASSIST_CTX_MAX);
+}
+// 上下文回显:发的是什么就给用户看什么(≤500 字,发送时按当前页面实时重算)
+function renderAssistCtx(){
+  const box=$("assistCtx");
+  if(!box) return;
+  if(!state.origin||!state.origin.city){
+    box.textContent=ASSIST_CTX_EMPTY;
+    return;
+  }
+  const text=assistContext();
+  box.textContent=ASSIST_CTX_PREFIX+text.length+" / "+ASSIST_CTX_MAX+" 字):"+text;
+}
+// 按钮态:发送中禁用并换进行中文案(「AI 思考中…」);清空按钮同样禁用,免得并发
+function syncAssistActs(){
+  const busy=!!state.assist.busy;
+  const send=$("assistSend"),clear=$("assistClear");
+  if(send){send.disabled=busy;send.textContent=busy?ASSIST_BUSY_LABEL:ASSIST_SEND_LABEL;}
+  if(clear){clear.disabled=busy;clear.textContent=ASSIST_CLEAR_LABEL;}
+}
+function setAssistBusy(busy){
+  state.assist.busy=!!busy;
+  syncAssistActs();
+}
+function renderAssistMsgs(){
+  const box=$("assistMsgs");
+  if(!box) return;
+  const items=state.assist.items||[];
+  if(!items.length){
+    box.innerHTML='<div class="fp-empty">'+
+      esc(state.assist.busy?ASSIST_LOADING_TEXT:ASSIST_EMPTY_TEXT)+"</div>";
+  }else{
+    box.innerHTML=items.map(assistBubbleHtml).join("")+
+      (state.assist.busy?('<div class="fp-empty">'+esc(ASSIST_WAIT_TEXT)+"</div>"):"");
+  }
+  box.scrollTop=box.scrollHeight;   // 最新一轮总在下面
+  renderAssistCtx();
+  syncAssistActs();
+}
+function assistInputText(){
+  const input=$("assistInput");
+  return String(input?input.value:"").trim();
+}
+// 请求体:context 恒发(页面上下文就是问答的一半信息);session_key 空则由后端补发
+function assistRequestBody(message){
+  return {session_key:assistSessionKey()||null,message:message,context:assistContext()};
+}
+async function assistSend(){
+  if(state.assist.busy) return;
+  const message=assistInputText();
+  if(!message){
+    setAssistErr("先问一句(如「这个分段带娃合适吗」):空消息后端会 400。");
+    return;
+  }
+  if(message.length>ASSIST_MSG_MAX){
+    setAssistErr("这一句太长:"+message.length+" 字,上限 "+ASSIST_MSG_MAX+" 字(请分几句说)。");
+    return;
+  }
+  const input=$("assistInput");
+  if(input) input.value="";
+  setAssistErr("");
+  setAssistBusy(true);
+  // 归一器复用 10c 的 plannerItemOf:POST 的平铺响应与 GET 回放的 payload 两种形状都吃得下
+  state.assist.items.push(plannerItemOf({role:"user",content:message}));
+  renderAssistMsgs();
+  try{
+    const result=await sendJSON(ASSIST_MSG_API,{method:"POST",
+      headers:{"Content-Type":"application/json"},body:JSON.stringify(assistRequestBody(message))});
+    rememberAssistSession(result.session_key);
+    state.assist.items.push(plannerItemOf({role:"assistant",content:result.reply,
+      degraded:result.degraded,reason:result.reason}));
+  }catch(error){
+    // 这一轮没进历史(后端 400 / 网络失败):撤回本地那条用户气泡、原文放回输入框,改完直接重发
+    state.assist.items.pop();
+    if(input&&!input.value.trim()) input.value=message;
+    setAssistErr("AI 问答失败:"+((error&&error.message)||error)+"(这一轮没存进历史,可直接重发)");
+  }finally{
+    setAssistBusy(false);
+    renderAssistMsgs();
+  }
+}
+// Enter 发送 / Shift+Enter 换行(换行走 textarea 默认行为,不拦;与 10c 同口径)
+function onAssistKeydown(event){
+  if(event.key!=="Enter"||event.shiftKey) return;
+  event.preventDefault();
+  assistSend();
+}
+async function loadAssistMessages(){
+  const key=assistSessionKey();
+  if(!key){   // 本机没有会话 key = 后端也没有这段历史:直接空态(不打无谓的 400)
+    state.assist.items=[];
+    renderAssistMsgs();
+    return;
+  }
+  renderAssistMsgs();   // 先给「正在读取问答历史…」占位
+  try{
+    const result=await getJSON(ASSIST_MSG_API+"?session_key="+encodeURIComponent(key)+
+                               "&limit="+ASSIST_HISTORY_LIMIT);
+    state.assist.items=(Array.isArray(result.items)?result.items:[]).map(plannerItemOf);
+    setAssistErr("");
+  }catch(error){
+    setAssistErr("问答历史读取失败:"+((error&&error.message)||error));
+  }
+  renderAssistMsgs();
+}
+// 「🗑 清空对话」:DELETE **带请求体** {session_key}(后端只删消息、保留会话行,key 继续可用)
+async function assistClear(){
+  if(state.assist.busy) return;
+  const key=assistSessionKey();
+  if(!key){   // 本机没有会话 key:后端没有历史,清本地就够
+    state.assist.items=[];
+    renderAssistMsgs();
+    return;
+  }
+  setAssistBusy(true);setAssistErr("");
+  try{
+    await sendJSON(ASSIST_MSG_API,{method:"DELETE",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({session_key:key})});
+    state.assist.items=[];
+  }catch(error){
+    setAssistErr("清空问答失败:"+((error&&error.message)||error));
+  }finally{
+    setAssistBusy(false);
+    renderAssistMsgs();
+  }
+}
+
+// --- 「🧳 行程」模式:不另写一套,直接把抽屉的容器接在 10c 的同一份 state.planner 上 --- //
+// 输入框归一:收藏面板的「🤖 AI 行程」tab 与抽屉的「🧳 行程」模式各有一个 textarea,但共用
+// 同一份 state.planner(会话 / 点名 / 行程卡片),所以发送前要先认清"谁在前台":
+//   ① 有焦点线索就按焦点走 —— 焦点(或刚点下的发送按钮/标签)落在哪个 pane 里,就读那个 pane 的
+//      输入框(@引用也插到那一个,不会插进用户看不见的那个框里);
+//   ② 拿不到焦点线索时按层级兜底:收藏弹层(z-index 2000)盖在抽屉(1900)之上,它开着且正停在
+//      「🤖 AI 行程」tab 时优先读它那个;否则抽屉展开在行程模式就读抽屉的;都不是就回到 tab 那个。
+function plannerInputBox(){
+  const active=document.activeElement;
+  if(active&&active.closest){
+    if(active.closest("#assistPaneTrip")) return $("assistTripInput");
+    if(active.closest("#favPaneAi")) return $("plannerInput");
+  }
+  if(state.fav.open&&state.tripPlan.tab==="ai") return $("plannerInput");
+  if(state.assist.open&&state.assist.mode==="trip") return $("assistTripInput");
+  return $("plannerInput");
+}
+// 消息流:复用 10c 的 plannerBubbleHtml(用户/助手气泡 + 降级块 + 按天行程卡片 + @点名收藏标签)
+function renderAssistTripMsgs(){
+  const box=$("assistTripMsgs");
+  if(!box) return;
+  const items=state.planner.items||[];
+  if(!items.length){
+    box.innerHTML='<div class="fp-empty">'+
+      esc(state.planner.busy?PLANNER_LOADING_TEXT:PLANNER_EMPTY_TEXT)+"</div>";
+  }else{
+    box.innerHTML=items.map(plannerBubbleHtml).join("")+
+      (state.planner.busy?('<div class="fp-empty">'+esc(PLANNER_WAIT_TEXT)+"</div>"):"");
+  }
+  box.scrollTop=box.scrollHeight;
+  syncAssistTripActs();
+}
+// 点名标签:复用 10c 的 plannerTagHtml(同一份 state.planner.mentioned,选中态自动一致)
+function renderAssistTripTags(){
+  const box=$("assistTripTags");
+  if(!box) return;
+  const items=state.fav.items||[];
+  box.innerHTML=items.length
+    ? items.map(plannerTagHtml).join("")
+    : '<div class="fp-empty">'+esc(PLANNER_TAG_EMPTY)+"</div>";
+  syncAssistTripActs();
+}
+// 按钮态:行程的进行中文案沿用 10c 的「AI 规划中…(首次约 1 分钟)」,禁用口径也一致
+function syncAssistTripActs(){
+  const busy=!!state.planner.busy;
+  const send=$("assistTripSend"),save=$("assistTripSave"),clear=$("assistTripClear");
+  if(send){send.disabled=busy;send.textContent=busy?PLANNER_BUSY_LABEL:PLANNER_SEND_LABEL;}
+  if(save){save.disabled=busy||!state.planner.lastItinerary;save.textContent=PLANNER_SAVE_LABEL;}
+  if(clear){clear.disabled=busy;clear.textContent=PLANNER_CLEAR_LABEL;}
+  const count=$("assistTripTagCount");
+  if(count) count.textContent="已点名 "+plannerMentionedIds().length+" 条";
+}
+function setAssistTripErr(message){
+  const box=$("assistTripErr");
+  if(!box) return;
+  box.textContent=message||"";
+  box.style.display=message?"block":"none";
+}
+function renderAssistTripSaveOut(content){
+  const box=$("assistTripSaveOut");
+  if(!box) return;
+  box.innerHTML=content||"";
+  box.style.display=content?"block":"none";
+}
+
+// --- 抽屉开关 / 模式切换:两个 pane 互斥显示(state.assist.mode),与收藏面板 tab 同套路 --- //
+function switchAssistMode(which){
+  state.assist.mode=(ASSIST_MODES.indexOf(which)>=0)?which:"chat";
+  const panes={chat:$("assistPaneChat"),trip:$("assistPaneTrip")};
+  const tabs={chat:$("assistTabChat"),trip:$("assistTabTrip")};
+  ASSIST_MODES.forEach(key=>{
+    const active=(key===state.assist.mode);
+    if(panes[key]) panes[key].style.display=active?"block":"none";
+    if(tabs[key]){
+      tabs[key].classList.toggle("sel",active);
+      tabs[key].setAttribute("aria-selected",active?"true":"false");
+    }
+  });
+  // 每次切换都回放一次历史:问答走 /api/assistant/messages,行程复用 10c 的 openPlannerTab()
+  if(state.assist.mode==="chat"){renderAssistCtx();loadAssistMessages();}
+  else openPlannerTab();
+  const input=$(state.assist.mode==="chat"?"assistInput":"assistTripInput");
+  if(input&&state.assist.open) input.focus();
+}
+function openAssistDrawer(mode){
+  const drawer=$("assistDrawer");
+  if(!drawer) return;
+  if(!state.assist.open) state.assist.lastFocus=document.activeElement||null;   // 记住来源焦点
+  state.assist.open=true;
+  drawer.hidden=false;
+  document.body.classList.add("assist-open");    // 路线面板让位(见 CSS body.assist-open #routePanel)
+  const fab=$("assistFab");
+  if(fab) fab.setAttribute("aria-expanded","true");
+  switchAssistMode(mode);
+}
+function closeAssistDrawer(){
+  if(!state.assist.open) return;   // 已经收着:Esc 兜底那一层不该再做任何事
+  state.assist.open=false;
+  const drawer=$("assistDrawer");
+  if(drawer) drawer.hidden=true;
+  document.body.classList.remove("assist-open");
+  const fab=$("assistFab");
+  if(fab) fab.setAttribute("aria-expanded","false");
+  const back=state.assist.lastFocus;
+  state.assist.lastFocus=null;
+  if(back&&back.focus&&document.contains(back)) back.focus();   // 焦点归还来源元素(没了就静默)
+}
+function toggleAssistDrawer(){
+  if(state.assist.open) closeAssistDrawer();
+  else openAssistDrawer(state.assist.mode);
+}
+
+// 抽屉的全部交互走 addEventListener(页面里仍不许出现内联 onclick);「🧳 行程」那一列
+// 直接绑 10c 的处理器 —— 同一份 state.planner,所以发送/存为方案/清空/点名行为完全一致。
+$("assistFab").addEventListener("click",toggleAssistDrawer);
+$("assistCollapse").addEventListener("click",closeAssistDrawer);
+$("assistTabChat").addEventListener("click",()=>switchAssistMode("chat"));
+$("assistTabTrip").addEventListener("click",()=>switchAssistMode("trip"));
+$("assistSend").addEventListener("click",assistSend);
+$("assistInput").addEventListener("keydown",onAssistKeydown);
+$("assistInput").addEventListener("input",()=>setAssistErr(""));
+$("assistClear").addEventListener("click",assistClear);
+$("assistTripSend").addEventListener("click",plannerSend);
+$("assistTripInput").addEventListener("keydown",onPlannerKeydown);
+$("assistTripInput").addEventListener("input",()=>setPlannerErr(""));
+$("assistTripTags").addEventListener("click",onPlannerTagClick);
+$("assistTripSave").addEventListener("click",plannerSavePlan);
+$("assistTripClear").addEventListener("click",plannerClear);
+renderAssistMsgs();          // 空态占位(抽屉默认收着,打开时才回放历史)
+renderAssistTripMsgs();
+renderAssistTripTags();
 
 (async function boot(){
   // 地图(TASK-9d):先运行时取 key(GET /api/map-config,key 不进 git、不写在本页),

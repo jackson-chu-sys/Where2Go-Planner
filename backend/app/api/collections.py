@@ -210,6 +210,55 @@ def _cat_name(session: Session, cat_id: Optional[int]) -> Optional[str]:
     return cat.name if cat else None
 
 
+# --------------------------------------------------------------------------- #
+# TASK-13:GET /api/collections items 增 place_id(收藏 → 库内 Place 行匹配)
+# --------------------------------------------------------------------------- #
+
+
+def _match_place_id(session: Session, item: Mapping[str, Any]) -> Optional[int]:
+    """按收藏快照的身份在 Place 表匹配 ``place_id``;匹配不到返回 ``None``(不猜)。
+
+    只认 ``kind=place`` 且 ``ref_key`` 以 ``place:`` 开头的目的地收藏;身份口径与
+    :func:`db.models.collection_ref_key` 完全一致:优先 OSM/amap 身份
+    (``place:<osm_type>/<osm_id>``,重抓改名都不飘),退化到坐标定点串
+    (``place:<lat,lng>``,7 位小数精确比对)。住宿收藏虽也是 kind=place,但它的
+    身份来自 Stay 表,在 Place 表里天然匹配不到 → ``None``,前端走外链兜底。
+    """
+    if str(item.get("kind") or "") != models.KIND_PLACE:
+        return None
+    ref_key = str(item.get("ref_key") or "")
+    if not ref_key.startswith(f"{models.KIND_PLACE}:"):
+        return None
+    target = ref_key.split(":", 1)[1]
+    row = None
+    if "/" in target:
+        osm_type, _, osm_id = target.partition("/")
+        try:
+            numeric_id = int(osm_id)
+        except ValueError:
+            return None
+        row = (
+            session.query(models.Place)
+            .filter(models.Place.osm_type == osm_type, models.Place.osm_id == numeric_id)
+            .order_by(models.Place.id.asc())
+            .first()
+        )
+    elif "," in target:
+        lat_text, _, lng_text = target.partition(",")
+        try:
+            lat = round(float(lat_text), models.COORD_PRECISION)
+            lng = round(float(lng_text), models.COORD_PRECISION)
+        except ValueError:
+            return None
+        row = (
+            session.query(models.Place)
+            .filter(models.Place.lat == lat, models.Place.lng == lng)
+            .order_by(models.Place.id.asc())
+            .first()
+        )
+    return int(row.id) if row is not None else None
+
+
 @router.post("/collections")
 def create_collection(
     payload: Any = Body(None, description="收藏内容 JSON 对象:kind / mode / 起终点 / summary"),
@@ -273,6 +322,9 @@ def list_collections(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # TASK-13:**只加键不改既有键**(place_id,目的地收藏 → 库内 Place 行;匹配不到=None)
+    for item in items:
+        item["place_id"] = _match_place_id(session, item)
     return {
         "collections": items,
         "count": len(items),

@@ -114,6 +114,10 @@
   .fp-sub{color:#6b7280;font-size:12px;margin-top:4px}
   .fp-item{border:1px solid #e5e7eb;border-radius:10px;padding:9px 11px;margin-top:9px;background:#fff}
   .fp-nm{font-weight:700;font-size:14px}
+  .fp-nm-link{color:#1d4ed8;text-decoration:underline;cursor:pointer}
+  .fp-nm-dim{color:#9ca3af;cursor:not-allowed}
+  .fp-amap{margin-left:6px;font-size:12px;color:#0f766e;white-space:nowrap}
+  a.fp-amap.pop-go{display:inline-block;text-decoration:none}
   .fp-badges{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
   .fp-meta{color:#6b7280;font-size:12px;margin-top:5px}
   .fp-time{color:#9ca3af;font-size:11px;margin-top:4px}
@@ -1618,6 +1622,15 @@ function onDocumentClick(event){
     deleteFav(delButton.getAttribute("data-id"));
     return;
   }
+  // TASK-13:收藏列表「📍 目的地」名称可点 → 打开既有 #placeModal(数据零新接口:
+  // place_id 来自 GET /api/collections,详情内容用收藏快照 + 弹窗内既有的 media/details/highlights 链路)
+  const favDetailLink=target.closest("#favPanelList .js-fav-detail");
+  if(favDetailLink){
+    event.preventDefault();
+    event.stopPropagation();
+    openFavPlaceModal(Number(favDetailLink.getAttribute("data-id")));
+    return;
+  }
   const popupButton=target.closest(".js-routes");
   if(popupButton){
     event.stopPropagation();   // 列表整行可点后(TASK-8b):行内按钮一律不冒泡到行点击
@@ -2657,6 +2670,27 @@ async function addFavRoute(route,button){
     syncFavButtons();
   }
 }
+// TASK-13:「在高德中查看」外链(收藏行兜底 + 详情弹窗动作行通用):
+// uri.amap.com/search 按名称搜索,有坐标就带 center(lng,lat;库内高德行是 GCJ-02,自洽)。
+function amapViewUrl(name,lat,lng){
+  const params=new URLSearchParams({keyword:String(name||"").trim()});
+  if(isFinite(num(lat))&&isFinite(num(lng))) params.set("center",num(lng)+","+num(lat));
+  return "https://uri.amap.com/search?"+params.toString();
+}
+function favPlaceNameHtml(item){
+  const plain=String(item.name||"(无名)").replace(/^📍\s*/,"").replace(/\s*·\s*目的地$/,"");
+  const pid=item.place_id;
+  if(pid!==null&&pid!==undefined){
+    // 库内有行:名称变可点链接 → 打开既有 #placeModal(图片/介绍/要点,数据走自家 API)
+    return '<a href="#" class="fp-nm-link js-fav-detail" data-id="'+Number(item.id)+
+      '" title="打开详情弹窗(图片 / 详细介绍 / 类别要点)">'+esc(plain||item.name||"(无名)")+"</a>";
+  }
+  // 库已清/种子行:链接置灰 + title 说明,另给高德外链兜底(不丢条目)
+  return '<span class="fp-nm-dim" title="该目的地不在当前库内(清库/种子数据),无法打开详情;可用右侧「在高德中查看」">'+
+    esc(plain||item.name||"(无名)")+"</span>"+
+    '<a class="fp-amap" href="'+esc(amapViewUrl(plain||item.name,item.to_lat,item.to_lng))+
+    '" target="_blank" rel="noopener" title="在高德地图中搜索该地点">🔗 在高德中查看</a>';
+}
 function favItemHtml(item){
   const summary=item.summary||{};
   const group=favGroupOf(item);
@@ -2680,7 +2714,7 @@ function favItemHtml(item){
         (summary.kind?'<span class="badge '+(KIND_BADGE[summary.kind]?KIND_BADGE[summary.kind].cls:"")+'">'+
           esc((KIND_BADGE[summary.kind]||{}).text||summary.kind)+"</span>":"")+"</div>");
   return '<div class="fp-item" data-id="'+Number(item.id)+'">'+
-    '<div class="fp-nm">'+esc(item.name||"(无名)")+"</div>"+
+    '<div class="fp-nm">'+(group==="place"?favPlaceNameHtml(item):esc(item.name||"(无名)"))+"</div>"+
     '<div class="fp-badges">'+kindBadge+(modeLabel?'<span class="badge">'+esc(modeLabel)+"</span>":"")+
     (stayLabel?'<span class="badge">'+esc(stayLabel)+"</span>":"")+
     (item.cat_name?'<span class="badge deg">'+esc(item.cat_name)+"</span>":"")+"</div>"+
@@ -3852,7 +3886,40 @@ function modalActsHtml(place,index){
   return placeFavButtonHtml(place,index)+
     '<button type="button" class="pop-go js-routes" data-i="'+Number(index)+'"'+
     ' title="打开路线面板:🚗 驾车/铁路/飞机对比 + 🛏️ 周边住宿(点它会自动关掉本弹窗,免得挡住面板)">'+
-    "🚗 路线 / 🛏️ 住宿</button>";
+    "🚗 路线 / 🛏️ 住宿</button>"+
+    // TASK-13:「在高德中查看」外链(所有入口通用;名称搜索,库内坐标是 GCJ-02 直接可用作 center)
+    '<a class="pop-go fp-amap" href="'+esc(amapViewUrl(place.name,place.lat,place.lng))+
+    '" target="_blank" rel="noopener" title="在高德地图中搜索该地点(新页打开)">🔗 在高德中查看</a>';
+}
+// TASK-13:收藏列表点目的地名称 → 用 place_id + 收藏快照拼一条 place,开既有 #placeModal。
+// 图片/类别要点走弹窗内既有的 /api/places/media、/api/places/highlights(按 place_id,零新接口);
+// 详细介绍优先用收藏快照的 detail_text,缺则弹窗里的「生成介绍」按钮兜底(照旧按 id 调 details)。
+function openFavPlaceModal(favId){
+  const item=(state.fav.items||[]).find(row=>Number(row.id)===Number(favId));
+  if(!item||item.place_id===null||item.place_id===undefined){
+    showNote("该收藏不在当前目的地库内(清库/种子数据),无法打开详情;可用「在高德中查看」。",true);
+    return;
+  }
+  const summary=item.summary||{};
+  const plain=String(item.name||"(无名)").replace(/^📍\s*/,"").replace(/\s*·\s*目的地$/,"");
+  const place={
+    id:Number(item.place_id),
+    name:plain||item.name||"(无名)",
+    lat:num(item.to_lat),lng:num(item.to_lng),
+    category:summary.category||null,
+    intro:summary.intro||null,
+    detail:summary.detail_text||null,
+    distance_km:isFinite(num(summary.distance_km))?num(summary.distance_km):NaN,
+    source:summary.source||null,
+    tags:(summary.source==="种子")?{}:{source:"高德"}
+  };
+  // 收藏快照里有 OSM/amap 身份就带上:弹窗内 ⭐ 收藏按钮的「已收藏」判定与
+  // placeFavItem(ref_key 口径)完全一致,不带就会误显示成「可收藏」。
+  if(item.osm_type&&item.osm_id!==null&&item.osm_id!==undefined){
+    place.osm_type=item.osm_type;place.osm_id=item.osm_id;
+  }
+  if(summary.detail_text) state.reco.details[Number(item.place_id)]=String(summary.detail_text);
+  openPlaceModal(place,-1);
 }
 // 「生成介绍」写完库后,弹窗里那一段就地补上(与列表 .pl-detail 同源,都读 detailTextOf)
 function syncPlaceModalDetail(){

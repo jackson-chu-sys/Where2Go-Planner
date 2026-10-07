@@ -2619,3 +2619,56 @@ def test_assist_drawer_keeps_existing_features(html: str) -> None:
     assert re.search(r'assist:\{open:false,mode:"chat",sessionKey:"",items:\[\],busy:false,'
                      r'lastFocus:null\}', state_row), "state.assist 六个键照契约写死"
     assert "onclick=" not in html and "alert(" not in html, "仍不许内联 onclick / alert"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-13:收藏目的地详情链接(#placeModal 复用 + 「在高德中查看」外链)
+# --------------------------------------------------------------------------- #
+
+
+def test_task13_fav_place_name_is_clickable_link() -> None:
+    html = read_index()
+    assert "js-fav-detail" in html, "收藏列表目的地名称应是可点链接(.js-fav-detail)"
+    assert 'favPlaceNameHtml' in html, "名称渲染应走 favPlaceNameHtml(place 分组专属)"
+    assert "openFavPlaceModal" in html, "点击应调 openFavPlaceModal"
+
+
+def test_task13_modal_reuse_and_place_id_consumption() -> None:
+    html = read_index()
+    assert "openPlaceModal(place,-1)" in html.replace(" ", ""), "详情应复用既有 openPlaceModal(#placeModal)"
+    assert "item.place_id" in html, "前端应消费 GET /api/collections 新增的 place_id 键"
+    assert "place_id===null" in html.replace(" ", ""), "place_id 缺失应走降级分支(不猜)"
+
+
+def test_task13_dim_state_and_amap_fallback_link() -> None:
+    html = read_index()
+    assert "fp-nm-dim" in html, "库外收藏名称应置灰(fp-nm-dim)"
+    assert "amapViewUrl" in html, "「在高德中查看」外链应有统一拼接函数"
+    assert "uri.amap.com/search" in html, "外链应指向高德搜索页"
+    assert 'keyword' in html and 'center' in html, "外链应带 keyword 与 center 参数"
+
+
+def test_task13_amap_link_in_modal_actions_for_all_entries() -> None:
+    html = read_index()
+    idx = html.index("function modalActsHtml")
+    section = html[idx:idx + 900]
+    assert "amapViewUrl" in section, "placeModal 动作行应加「在高德中查看」(所有入口通用)"
+    assert 'target="_blank"' in section and 'rel="noopener"' in section, "外链新页打开 + noopener"
+
+
+def test_task13_delegation_and_stop_propagation() -> None:
+    html = read_index()
+    assert '#favPanelList .js-fav-detail' in html, "点击应走收藏面板事件委托"
+    idx = html.index("js-fav-detail\")")
+    around = html[max(0, idx - 400):idx + 500]
+    assert "stopPropagation" in around, "链接点击应 stopPropagation(不误触行/面板)"
+    assert "preventDefault" in around, "href=# 应 preventDefault"
+
+
+def test_task13_fav_snapshot_identity_passthrough() -> None:
+    """合成 place 应带收藏快照的 OSM 身份(⭐ 已收藏判定与 placeFavItem 同口径)。"""
+    html = read_index()
+    idx = html.index("function openFavPlaceModal")
+    section = html[idx:idx + 1600]
+    assert "place.osm_type=item.osm_type" in section.replace(" ", ""), "osm 身份应透传"
+    assert "detail_text" in section, "快照 detail_text 应进详细介绍缓存"

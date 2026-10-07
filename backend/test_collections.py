@@ -1051,3 +1051,62 @@ def test_collection_module_does_not_import_network_clients() -> None:
     text = source.read_text(encoding="utf-8")
     for forbidden in ("import requests", "from data_sources", "urlopen"):
         assert forbidden not in text, f"收藏 API 不该{forbidden}"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-13:GET /api/collections items 增 place_id(收藏 → 库内 Place 行匹配)
+# --------------------------------------------------------------------------- #
+
+
+def _make_place(session, *, name: str, lat: float, lng: float,
+                osm_type: str = "amap", osm_id: int = 12345) -> models.Place:
+    row = models.Place(osm_type=osm_type, osm_id=osm_id, name=name, lat=lat, lng=lng,
+                       category="自然风光", tags={}, origin_city="上海", band="50_100")
+    session.add(row)
+    session.commit()
+    return row
+
+
+def test_api_list_collections_place_id_matches_by_osm_identity(session) -> None:
+    place_row = _make_place(session, name="西沙湿地", lat=31.5, lng=121.5, osm_id=777)
+    repo.upsert_collection(session, kind="place", osm_type="amap", osm_id=777,
+                           to_lat=31.5, to_lng=121.5, to_name="西沙湿地")
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert item["place_id"] == place_row.id, "OSM/amap 身份优先匹配"
+
+
+def test_api_list_collections_place_id_matches_by_coordinate_fallback(session) -> None:
+    place_row = _make_place(session, name="东滩湿地", lat=31.6, lng=121.6, osm_id=888)
+    repo.upsert_collection(session, kind="place", to_lat=31.6, to_lng=121.6, to_name="东滩湿地")
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert "place_id" in item
+    assert item["place_id"] == place_row.id, "无 OSM 身份时按坐标定点 7 位匹配"
+
+
+def test_api_list_collections_place_id_none_when_unmatched(session) -> None:
+    repo.upsert_collection(session, kind="place", to_lat=31.9, to_lng=121.9, to_name="库外点")
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert item["place_id"] is None, "库内匹配不到 → None(不猜),前端走外链兜底"
+
+
+def test_api_list_collections_place_id_none_for_routes(session) -> None:
+    repo.upsert_collection(session, kind="route", mode="driving",
+                           from_lat=31.2304, from_lng=121.4737,
+                           to_lat=31.5, to_lng=121.5, to_name="西沙湿地")
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert item["place_id"] is None, "路线收藏不做目的地匹配"
+
+
+def test_api_list_collections_existing_keys_unchanged(session) -> None:
+    """place_id 是**只加键**:既有键逐键零变化(前端向后兼容的证据)。"""
+    repo.upsert_collection(session, kind="place", to_lat=31.5, to_lng=121.5, to_name="西沙湿地")
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert REQUIRED_DICT_KEYS <= set(item), f"缺既有键:{REQUIRED_DICT_KEYS - set(item)}"
+    assert set(item) == REQUIRED_DICT_KEYS | {"place_id"}, "除 place_id 外不许多出/缺少键"
+    assert set(payload) >= {"collections", "count", "kind", "cat_id", "total",
+                            "counts_by_kind", "cats", "kinds", "modes", "elapsed_s", "note"}

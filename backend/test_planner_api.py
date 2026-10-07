@@ -928,7 +928,8 @@ def test_collections_response_keys_unchanged(http, session, llm) -> None:
     status, listing = http("GET", "/api/collections")
     assert status == 200
     assert set(listing) == COLLECTION_GET_KEYS
-    assert set(listing["collections"][0]) == COLLECTION_DICT_KEYS
+    # TASK-13:GET 列表 items **只加** place_id 键(收藏 → 库内 Place 匹配),既有键零变化
+    assert set(listing["collections"][0]) == COLLECTION_DICT_KEYS | {"place_id"}
     assert listing["kinds"] == ["route", "place"] or set(listing["kinds"]) == {"route", "place"}
 
 
@@ -940,7 +941,8 @@ def test_saved_planner_place_shows_up_in_collections_with_same_keys(http, sessio
     listed = http("GET", "/api/collections", query="kind=place")[1]["collections"]
     assert len(listed) == 1
     item = listed[0]
-    assert set(item) == COLLECTION_DICT_KEYS
+    assert set(item) == COLLECTION_DICT_KEYS | {"place_id"}  # TASK-13 只加键
+    assert item["place_id"] == place.id, "place 收藏应匹配到库内 Place 行(TASK-13)"
     assert item["id"] == body["matched"][0]["collection_id"]
     assert item["kind"] == "place" and item["mode"] == ""
     assert item["ref_key"] == f"place:{place.osm_type}/{place.osm_id}"

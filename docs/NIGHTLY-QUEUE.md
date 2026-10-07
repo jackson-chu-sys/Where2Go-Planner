@@ -788,6 +788,66 @@
 
 ---
 
+## [TASK-11a] 全局 AI 助手后端:/api/assistant/messages(通用旅行问答,复用 Planner 会话表)
+
+- 状态: pending
+- 背景: 神朱 2026-10-07 拍板:所有界面侧边加 AI 对话窗口,用户可描述、提问(定位=通用旅行助手,兼可触发现有行程规划)。本条只做后端;前端侧边抽屉属 TASK-11b。
+- 目标: 新建 `backend/services/assistant.py`:`chat_turn(session_key, message, *, context=None)` —— 复用 `PlannerSession`/`PlannerMessage` 两表(**表结构零改动**,session_key 由调用方带 `chat-` 前缀区分行程会话);系统提示=通用旅行助手(答旅行问题/描述目的地/给实用建议;拿不到的事实明说、禁编造;中文回复,纯文本 ≤400 字);`context`(前端传当前城市/band/收藏摘要,截 500 字)拼入 prompt;LLM 预算 `ASSISTANT_MAX_TOKENS=800 / ASSISTANT_TIMEOUT_S=120` **按调用传给 llm.chat()**(勿沿用 intro 的 120/20s);降级四态 no_key/timeout/error/parse_error 一律不抛、reply 中文兜底含原因码。新建 `backend/app/api/assistant.py`:POST/GET/DELETE `/api/assistant/messages`,风格照 planner.py(裸 JSON、400 中文、未知 session 返回空 items 不 404、message 空/超 2000 字 400);main.py 挂 `/api`。
+- 只读清单: `backend/services/planner.py`、`backend/app/api/planner.py`、`backend/services/intro.py`(LLMClient 唯一入口)、`backend/db/models.py`、`backend/test_planner_api.py`(mock 套路)。
+- 涉及: backend/services/assistant.py(新)、backend/app/api/assistant.py(新)、backend/app/main.py、backend/test_assistant.py(新)
+- 验收: pytest 零回归(基线 1268)+ ≥15 新增全 mock;预算按调用传入有用例断言;降级四态各有用例(不抛且 reply 非空);context 截断有用例;`/api/planner/*` 与 `/api/trip-plans` 响应键零变化断言;不动 index.html。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-11b] 全局 AI 助手前端:右侧边抽屉(💬 问答 / 🧳 行程 双模式)
+
+- 状态: pending
+- 依赖: TASK-11a
+- 目标: `index.html` 加**全局侧边抽屉**(右侧,可折叠,悬浮入口按钮,展开时不遮挡地图主操作区;与详情弹窗/收藏弹层/路线面板共存,Esc 层级排在最外层):消息流用户/助手气泡;双模式切换——💬 问答走 `/api/assistant/messages`(自动带 context:当前起点城市+选中 band+收藏条数摘要),🧳 行程走既有 `/api/planner/messages`(复用 10c 的按天行程卡片渲染/点名收藏标签/存为方案,可直接把 10c 的 UI 组件抽出复用,收藏面板里的「🤖 AI 行程」tab 保留不删);degraded 显示可见原因绝不静默;session_key 存 localStorage(与行程 session 分开);Enter 发送/Shift+Enter 换行/发送中禁用态。不新增前端 key。
+- 只读清单: `backend/app/static/index.html`(收藏面板 tab 区块 + 10c 段)、`backend/test_frontend_routes.py`、`backend/app/api/assistant.py`(11a 产物)。
+- 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
+- 验收: pytest 零回归 + ≥12 静态断言(抽屉 DOM/双模式接口字符串/context 拼接/Esc 层级/与 placeModal 共存)+ node --check;browser_exec 真机 QA(受信任点击):开页 0 error → 开抽屉问「上海周边有什么古镇」→ 出回答 → 切 🧳 模式发行程请求 → 出行程卡片 → 既有收藏面板「🤖 AI 行程」tab 零回归 → `window.__errs` 0 条。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-12] 性能调查+优化:搜索位置/重新抓取慢(执行器手写,不派 Codex)
+
+- 状态: pending
+- 背景: 神朱 2026-10-07 反馈:切高德后搜索位置和重新抓取仍慢(比 Overpass 时代好一些)。已知线索(夜班执行器写码前实测确认,勿直接采信):①`load_segment` 的 LLM 简介回填是**同步**的(INTRO_BATCH_LIMIT=40、workers=4,首屏冷抓要等最多 40 条 LLM,9d QA 实测上海 50-100 冷抓 ~125s 大头疑似在此);②amap 节流 0.6s 是**进程级**、`default_fetcher` 五组是**串行** for 循环,ring band 还要 × 格子数 × 翻页数,请求次数×(0.6s+RTT) 线性累积;③page_limit 可能发出拿不满的空页请求。
+- 目标: 先**分段计时**(uvicorn 真机冷抓 0_50 与 ring band 各一次 + 「加载更多」扩抓一次:amap 网络请求次数/耗时、LLM intro 耗时、落库耗时,落一份 docs/PERF-NOTES.md);再按数据实施优化,候选(按计时结果取舍):a) intro 回填改**异步后台**(照 stays 6c 的 estimating 口径:先返回列表 intro=null,后台线程池补,前端已有「补简介」入口兜底);b) 首查 INTRO_BATCH_LIMIT 降到 15(=首屏显示数);c) default_fetcher 组间并行(节流锁天然串行化请求,收益=RTT 重叠,需测 QPS 10021 不触发);d) 消除空页请求。**渐进配额/page_size/offset/more 口径与 /api/places 响应形状一律不变,前端零改动**。
+- 涉及: backend/services/place_loader.py、backend/services/intro.py、backend/data_sources/amap.py(如需)、docs/PERF-NOTES.md(新)、backend/test_*.py
+- 验收: PERF-NOTES.md 有基线/优化后对照数字;优化后冷抓首屏墙钟较基线**降 ≥30%**(达不到须给数据说明原因);pytest 零回归(基线含 11a 增量)+ 新增用例覆盖异步 intro 不阻塞返回;真机冒烟:冷抓秒级回列表、intro 后台补齐可见;uvicorn 重启。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-13] 收藏目的地加详情链接:站内 #placeModal + 「在高德中查看」外链
+
+- 状态: pending
+- 背景: 神朱 2026-10-07:我的收藏中的目的地应可点开具体介绍页面。拍板口径=站内详情弹窗(复用 TASK-8b 的 #placeModal:图片/详细介绍/类别要点,数据走自家 API)+ 另附「在高德中查看」外链按钮。
+- 目标: ①后端 `GET /api/collections` items 增 `place_id` 字段(按收藏快照的 amap 身份/osm_key 在 Place 表匹配,匹配不到=None;**只加键不改既有键**,响应向后兼容);②前端收藏列表「📍 目的地」分组条目名称变可点链接 → 有 place_id 则打开既有 #placeModal(复用 openPlaceModal 同款入口,数据零新接口);无 place_id(库已清/种子)则链接置灰+title 说明,另给「在高德中查看」外链兜底(`https://uri.amap.com/search?keyword=<名称>&center=<lng>,<lat>`,target=_blank rel=noopener);③placeModal 动作行加「🔗 在高德中查看」外链按钮(所有入口通用)。
+- 只读清单: `backend/app/api/collections.py`、`backend/db/repository.py`(ref_key 口径)、`backend/app/static/index.html`(renderFavItems + placeModal 段)、`backend/test_frontend_routes.py`、`backend/test_collections.py`。
+- 涉及: backend/app/api/collections.py(加键)、backend/app/static/index.html、backend/test_collections.py、backend/test_frontend_routes.py
+- 验收: pytest 零回归 + 后端 ≥4 用例(place_id 匹配/无匹配=None/既有键逐键零变化断言)+ 前端 ≥8 静态断言(链接 DOM/置灰态/高德外链 URL 拼接/placeModal 复用);browser QA:收藏一个库内目的地 → 列表点名称 → 详情弹窗出图/介绍/要点 → 「在高德中查看」URL 正确 → Esc 层级正常 → 0 JS error。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-14] 收藏/预订模块:每目的地行加 路线/住宿 外链(「取消收藏」旁)+ 预订模块按目的地分组
+
+- 状态: pending
+- 依赖: TASK-13(同区域改动,串行避免冲突)
+- 背景: 神朱 2026-10-07:前往预订模块应改为**每个目的地下边挂该目的地的路线和住宿外链**,且路线/住宿外链按钮放在收藏行「取消收藏」旁边。
+- 目标: 仅前端。①「我的收藏」目的地行:「取消收藏」旁加「🚗 路线」「🛏️ 住宿」外链按钮——路线按该目的地坐标生成(有已收藏路线快照优先按其 mode 出链:铁路→12306、飞机→去哪儿、驾车→高德导航;无收藏路线则给高德导航+12306 双链),住宿→携程/Booking/Airbnb 按名称搜索(复用 renderBookSection 既有 URL 拼接函数,不新造);②「🎫 前往预订」区块重组为**按目的地分组**:目的地小标题(名称+「📄 详情」链接复用 13 的 placeModal 入口)→ 缩进子项=该目的地的路线外链行+住宿外链行(已收藏的带时长/费用/预估价快照),不再是平铺两张列表;无对应收藏的目的地给默认搜索链;免责声明口径不变(价格仅供参考 · 不代订 · 以官方/OTA 实时为准);③目的地↔路线/住宿收藏的归属关系用收藏快照里的坐标/osm 身份判定(前端判定,后端零改动;判不出归属的收藏落「未分组」小节,不丢条目)。
+- 只读清单: `backend/app/static/index.html`(renderFavItems/renderBookSection/deleteFav 段)、`backend/test_frontend_routes.py`、`backend/app/api/collections.py`(summary 字段)。
+- 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
+- 验收: pytest 零回归 + ≥10 静态断言(分组 DOM/外链 URL 拼接与既有渠道覆盖一致/取消收藏旁按钮位置/未分组兜底/免责文案保留)+ node --check;browser QA:备 目的地+路线+住宿 三条收藏 → 收藏列表目的地行见 🚗/🛏️ 外链且 URL 正确 → 前往预订区块按目的地分组、子项外链齐 → 取消收藏联动刷新 → 既有收藏/方案/AI tab 零回归 → 0 JS error;测试收藏清理。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

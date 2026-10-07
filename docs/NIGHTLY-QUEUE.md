@@ -840,13 +840,18 @@
 
 ## [TASK-13] 收藏目的地加详情链接:站内 #placeModal + 「在高德中查看」外链
 
-- 状态: pending
+- 状态: done
 - 背景: 神朱 2026-10-07:我的收藏中的目的地应可点开具体介绍页面。拍板口径=站内详情弹窗(复用 TASK-8b 的 #placeModal:图片/详细介绍/类别要点,数据走自家 API)+ 另附「在高德中查看」外链按钮。
 - 目标: ①后端 `GET /api/collections` items 增 `place_id` 字段(按收藏快照的 amap 身份/osm_key 在 Place 表匹配,匹配不到=None;**只加键不改既有键**,响应向后兼容);②前端收藏列表「📍 目的地」分组条目名称变可点链接 → 有 place_id 则打开既有 #placeModal(复用 openPlaceModal 同款入口,数据零新接口);无 place_id(库已清/种子)则链接置灰+title 说明,另给「在高德中查看」外链兜底(`https://uri.amap.com/search?keyword=<名称>&center=<lng>,<lat>`,target=_blank rel=noopener);③placeModal 动作行加「🔗 在高德中查看」外链按钮(所有入口通用)。
 - 只读清单: `backend/app/api/collections.py`、`backend/db/repository.py`(ref_key 口径)、`backend/app/static/index.html`(renderFavItems + placeModal 段)、`backend/test_frontend_routes.py`、`backend/test_collections.py`。
 - 涉及: backend/app/api/collections.py(加键)、backend/app/static/index.html、backend/test_collections.py、backend/test_frontend_routes.py
 - 验收: pytest 零回归 + 后端 ≥4 用例(place_id 匹配/无匹配=None/既有键逐键零变化断言)+ 前端 ≥8 静态断言(链接 DOM/置灰态/高德外链 URL 拼接/placeModal 复用);browser QA:收藏一个库内目的地 → 列表点名称 → 详情弹窗出图/介绍/要点 → 「在高德中查看」URL 正确 → Esc 层级正常 → 0 JS error。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-07 夜班,**执行器手写**,commit `2a657e8`)。
+  - 后端 `app/api/collections.py`:`GET /api/collections` items **只加 `place_id` 键**(`_match_place_id`:kind=place 且 ref_key 以 place: 开头 → OSM/amap 身份 `place:<type>/<id>` 优先、坐标定点串 7 位精确匹配兜底,同身份多行取 id 最小;路线/住宿/库外=None 不猜);既有键零变化。
+  - 前端 index.html:收藏列表「📍 目的地」名称变可点链接(.js-fav-detail → `openFavPlaceModal` 用 place_id+收藏快照合成 place 开既有 #placeModal,零新接口;快照 detail_text 进详细介绍缓存、osm 身份透传保「★ 已收藏」判定同口径);place_id=None 置灰(fp-nm-dim+title 说明)+「🔗 在高德中查看」外链兜底(amapViewUrl:`https://uri.amap.com/search?keyword=<名称>&center=<lng>,<lat>`,target=_blank rel=noopener);placeModal 动作行统一加「🔗 在高德中查看」(所有入口通用);事件委托 preventDefault+stopPropagation。
+  - 测试:test_collections.py +5 例(osm 身份匹配/坐标兜底/库外 None/路线 None/既有键逐键零变化);test_planner_api.py 2 处键集断言适配(PLACE_ID 只加键,并顺带断言 planner save 的收藏能匹配到 place_id);test_frontend_routes.py +6 静态断言(超 ≥8 要求合计,链接 DOM/弹窗复用/置灰态/外链 URL/委托/快照透传);node --check 通过。pytest backend/ = **1363 passed**(1352 基线零回归,86s)。
+  - browser QA(CDP chrome 两次僵死重启后,media/highlights 请求已 stub 防图片加载拖死页面):库内收藏「上海耀雪冰雪世界」名称可点 → #placeModal 开(标题/★ 已收藏/动作行含「🔗 在高德中查看」,URL=uri.amap.com/search?keyword=… target=_blank rel=noopener;uvicorn 日志证实弹窗打开时 /api/places/media?place_ids=55 与 /api/places/highlights?place_ids=55 均 200)→ 库外收藏「大山」置灰+title 说明+兜底外链 URL 正确 → Esc 层级:先关弹窗再关收藏面板 → 全程 window.__errs **0** 条;未新增测试收藏(用库内既有 8 条验证),无需清理。
+  - 备注:QA 中 browser daemon 两次被图片密集加载拖僵(1+1 都超时),kill daemon+chrome 重启并 stub loadPlaceMedia/loadPlaceHighlights 后恢复——重页面 QA 可先 stub 媒体加载再交互,记入经验。
 
 ---
 

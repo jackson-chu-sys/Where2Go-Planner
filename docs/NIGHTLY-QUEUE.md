@@ -806,13 +806,18 @@
 
 ## [TASK-11b] 全局 AI 助手前端:右侧边抽屉(💬 问答 / 🧳 行程 双模式)
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-11a
 - 目标: `index.html` 加**全局侧边抽屉**(右侧,可折叠,悬浮入口按钮,展开时不遮挡地图主操作区;与详情弹窗/收藏弹层/路线面板共存,Esc 层级排在最外层):消息流用户/助手气泡;双模式切换——💬 问答走 `/api/assistant/messages`(自动带 context:当前起点城市+选中 band+收藏条数摘要),🧳 行程走既有 `/api/planner/messages`(复用 10c 的按天行程卡片渲染/点名收藏标签/存为方案,可直接把 10c 的 UI 组件抽出复用,收藏面板里的「🤖 AI 行程」tab 保留不删);degraded 显示可见原因绝不静默;session_key 存 localStorage(与行程 session 分开);Enter 发送/Shift+Enter 换行/发送中禁用态。不新增前端 key。
 - 只读清单: `backend/app/static/index.html`(收藏面板 tab 区块 + 10c 段)、`backend/test_frontend_routes.py`、`backend/app/api/assistant.py`(11a 产物)。
 - 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
 - 验收: pytest 零回归 + ≥12 静态断言(抽屉 DOM/双模式接口字符串/context 拼接/Esc 层级/与 placeModal 共存)+ node --check;browser_exec 真机 QA(受信任点击):开页 0 error → 开抽屉问「上海周边有什么古镇」→ 出回答 → 切 🧳 模式发行程请求 → 出行程卡片 → 既有收藏面板「🤖 AI 行程」tab 零回归 → `window.__errs` 0 条。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-07 夜班,Codex 执行,**~32.7min 自行完成实现+测试+commit,未触止损线**,commit `a952552`)。
+  - index.html(+486 行,仅前端,后端 Python 零改动):右侧可折叠抽屉 #assistDrawer + 悬浮入口 #assistFab(宽 ≤340px、z-index 1900=盖路线面板低于收藏弹层/详情弹窗,四者共存互不遮挡;展开时 body.assist-open 把路线面板左移让位);💬 问答走 /api/assistant/messages,context=起点城市+分段+分类筛选+收藏摘要 前端截 500 字并在 #assistCtx 回显,degraded 复用 PLANNER_REASON_TEXT 可见原因绝不静默,key 存 w2g_assistant_session;🧳 行程与收藏面板「🤖 AI 行程」tab 共用 state.planner/w2g_planner_session(镜像钩子同步、plannerInputBox() 按焦点认前台),点名收藏标签/按天行程卡片/存为方案全复用 10c,该 tab 原样保留;Enter 发送/Shift+Enter 换行/发送中禁用+进行中文案;Esc 层级 详情弹窗→收藏弹层→路线面板→抽屉(既有三层行为一字未改)。
+  - test_frontend_routes.py +426 行(16 新用例:抽屉 DOM/层级/双模式接口字符串/context 拼接与 500 字上限/Esc 层级/placeModal 共存/degraded 可见/双 localStorage key/发送禁用态/10c 复用零回归/无前端 key + 1 例真跑 11a 端点契约(no_key 降级路径,零触网));node --check 通过;index.html 无 32 位 key 样态。执行器复跑 pytest backend/ = **1343 passed**(1327 基线零回归,78s)。
+  - browser_exec 真机 QA(uvicorn 已重启):开页 0 error → 点 #assistFab 开抽屉、#assistCtx 回显「起点城市:上海;距离分段:50-100 km;收藏 8 条…」(97/500字)→ 发问答:首轮 **LLM 超时 120s → degraded=timeout 气泡可见**(原因码+重试指引+「没有编造答案」,降级口径正确)→ 重试成功出中文回答(朱家角,含「请出行前再核实」)→ 切 🧳 模式:点名标签渲染 8 条既有收藏 → 发「一天,只排上海耀雪冰雪世界」→ 按天行程卡片正确 → 收藏面板「🤖 AI 行程」tab 见同一消息(state 共用生效、零回归)→ Esc 层级实测:第一次 Esc 关收藏弹层、第二次才关抽屉 → localStorage 双 key(w2g_assistant_session 带 chat- 前缀 / w2g_planner_session 独立)→ 全程 window.__errs **0** 条;QA 会话消息已 DELETE 清理(deleted 2/4/2,会话行保留属契约口径)。
+  - **Codex 256K 统计**:单次调用 ~32.7min(14:28-15:01 UTC,止损线内),function_calls **70**,首写 **12.2min**(R8 前端放宽线 20min 内),tokens **5.09M total**(含 cache 重放 4.86M)/output 72K+reasoning 45K,零 compact。
+  - 备注(报主会话):问答首轮实测再次超时(token-plan 端点 120s 线),重试 ~110s 成功——与 10c 备注同源问题:LLM 端点高峰期延迟大,ASSISTANT_TIMEOUT_S=120 与 PLANNER_TIMEOUT_S=180 是否上调待神朱拍板,未擅自改。
 
 ---
 

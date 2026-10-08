@@ -85,6 +85,8 @@
   .badge{font-size:11px;padding:1px 7px;border-radius:9px;color:#fff;background:#9ca3af}
   .badge.real{background:#0f766e}
   .badge.est{background:#b45309}
+  .badge.price{background:#fef3c7;color:#000}   /* 价格药丸:浅琥珀底 + 黑字(旧版棕字棕底会隐形) */
+  .badge.price .sc-meta{color:#4b5563;font-size:11px}   /* 药丸内「估价生成中/暂无预估」灰字加深到 AA 达标(浅底 6.8:1) */
   .badge.deg{background:#6b7280}
   .rp-figs{display:flex;gap:16px;margin-top:8px;flex-wrap:wrap}
   .rp-fig{font-size:11px;color:#6b7280}
@@ -247,7 +249,7 @@
   .scard{border:1px solid #e5e7eb;border-radius:10px;padding:8px 10px;margin-top:8px;background:#fff}
   .sc-nm{font-weight:700;font-size:13px}
   .sc-badges{margin-top:4px;display:flex;gap:6px;flex-wrap:wrap}
-  .sc-price{color:#b45309;font-weight:700}
+  .sc-price{color:#000;font-weight:700}   /* 黑字:配 .badge.price 浅底,不再被底色掩盖(神朱 2026-10-08) */
   .sc-meta{color:#6b7280;font-size:12px;margin-top:4px}
   .sc-intro{color:#1f2937;font-size:12px;line-height:1.5;margin-top:5px}
   .sc-intro.empty{color:#9ca3af;font-style:italic}
@@ -1453,7 +1455,7 @@ function stayCardHtml(item,index){
   return '<div class="scard">'+
     '<div class="sc-nm">'+meta.emoji+" "+esc(item.name||"(无名住宿)")+"</div>"+
     '<div class="sc-badges"><span class="badge">'+esc(meta.label)+"</span>"+
-      '<span class="badge est">'+price+"</span>"+
+      '<span class="badge price">'+price+"</span>"+
       '<span class="sc-est" title="价格是 LLM 依据名称/类型/高德标签估的参考价区间,不是报价">'+
         esc(item.estimated||STAYS_EST_FALLBACK)+"</span></div>"+
     '<div class="sc-meta">距目的地 '+esc(isFinite(km)?(km.toFixed(1)+" km"):"—")+

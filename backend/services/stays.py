@@ -161,7 +161,10 @@ PRICE_BATCH_SIZE = 5
 PRICE_BATCH_RETRIES = 1
 # 批量输出比单家长得多,token 预算与超时按调用放宽(照 intro.chat 的口径,不放开会被截断)
 PRICE_BATCH_MAX_TOKENS = 1200
-PRICE_BATCH_TIMEOUT_S = 90.0
+# 超时给足高峰期:token-plan 端点(qwen3.8-max)高峰单轮实测 73~184s,90s 会被砍断
+# → estimate_batch 静默降级空 → 价格永远 null → 前端一直「估价生成中」(神朱 2026-10-08 报)。
+# 估价跑在**后台线程**、不阻塞 /api/stays 请求,放宽到 240s 没有首屏代价,只让高峰任务别早死。
+PRICE_BATCH_TIMEOUT_S = 240.0
 # 后台回填线程数:估价是限流敏感路径,2 条足够,不与 place 简介抢额度
 PRICE_BACKGROUND_WORKERS = 2
 # 待估价行数 ≤ 这个值(= 一批)就地算完再返回;超过才转后台(首屏价格 vs. 请求不被拖死的折中)

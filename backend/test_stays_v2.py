@@ -1089,3 +1089,11 @@ def test_bad_origin_and_radius_degrade_without_network(session: Session) -> None
     assert result.items == [] and client.calls == 0
     result = stay_service.load_stays(session, ORIGIN_LAT, ORIGIN_LNG, radius_m=0, fetch_fn=client)
     assert result.items == [] and client.calls == 0
+
+
+def test_price_batch_timeout_covers_llm_peak_hours() -> None:
+    """神朱 2026-10-08:估价一直「生成中」的根因是后台批量超时(90s)在高峰期被砍断。
+    token-plan 端点(qwen3.8-max)高峰单轮实测 73~184s → 90s 必超时 → estimate_batch
+    静默降级空 → 价格永远 null。后台线程不阻塞请求,超时必须给足(≥200s)。"""
+    assert stay_service.PRICE_BATCH_TIMEOUT_S >= 200.0, \
+        f"批量估价超时太短({stay_service.PRICE_BATCH_TIMEOUT_S}s),高峰期会砍断 → 价格估不出"

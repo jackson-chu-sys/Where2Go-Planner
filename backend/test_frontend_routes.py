@@ -2672,3 +2672,17 @@ def test_task13_fav_snapshot_identity_passthrough() -> None:
     section = html[idx:idx + 1600]
     assert "place.osm_type=item.osm_type" in section.replace(" ", ""), "osm 身份应透传"
     assert "detail_text" in section, "快照 detail_text 应进详细介绍缓存"
+
+
+def test_stay_price_text_is_black_on_light_pill(html: str) -> None:
+    """神朱 2026-10-08:价格文字被底色掩盖看不见。旧版 .sc-price 棕字(#b45309)套在
+    .badge.est 棕底(#b45309)里 → 完全隐形,选中反色才现。改成黑字 + 浅琥珀底。"""
+    nospace = html.replace(" ", "")
+    assert ".sc-price{color:#000" in nospace, "价格字体应为黑色(不再 #b45309 棕字)"
+    assert ".badge.price{background:#fef3c7;color:#000" in nospace, \
+        "价格药丸应为浅琥珀底 + 黑字(badge.price),对比度足够、不再棕字棕底隐形"
+    # stayCardHtml 里价格用 badge price 包裹(不再是 badge est)
+    card = html[html.index("function stayCardHtml"):html.index("function stayPriceHtml")]
+    assert '"badge price">' in card, "价格应由 .badge.price 浅底药丸承载"
+    assert '#b45309' not in nospace.split('.badge.deg')[0].split('.badge.price')[1], \
+        "价格药丸不应再用棕底 #b45309"

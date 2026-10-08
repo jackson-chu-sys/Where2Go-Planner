@@ -857,14 +857,19 @@
 
 ## [TASK-14] 收藏/预订模块:每目的地行加 路线/住宿 外链(「取消收藏」旁)+ 预订模块按目的地分组
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-13(同区域改动,串行避免冲突)
 - 背景: 神朱 2026-10-07:前往预订模块应改为**每个目的地下边挂该目的地的路线和住宿外链**,且路线/住宿外链按钮放在收藏行「取消收藏」旁边。
 - 目标: 仅前端。①「我的收藏」目的地行:「取消收藏」旁加「🚗 路线」「🛏️ 住宿」外链按钮——路线按该目的地坐标生成(有已收藏路线快照优先按其 mode 出链:铁路→12306、飞机→去哪儿、驾车→高德导航;无收藏路线则给高德导航+12306 双链),住宿→携程/Booking/Airbnb 按名称搜索(复用 renderBookSection 既有 URL 拼接函数,不新造);②「🎫 前往预订」区块重组为**按目的地分组**:目的地小标题(名称+「📄 详情」链接复用 13 的 placeModal 入口)→ 缩进子项=该目的地的路线外链行+住宿外链行(已收藏的带时长/费用/预估价快照),不再是平铺两张列表;无对应收藏的目的地给默认搜索链;免责声明口径不变(价格仅供参考 · 不代订 · 以官方/OTA 实时为准);③目的地↔路线/住宿收藏的归属关系用收藏快照里的坐标/osm 身份判定(前端判定,后端零改动;判不出归属的收藏落「未分组」小节,不丢条目)。
 - 只读清单: `backend/app/static/index.html`(renderFavItems/renderBookSection/deleteFav 段)、`backend/test_frontend_routes.py`、`backend/app/api/collections.py`(summary 字段)。
 - 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
 - 验收: pytest 零回归 + ≥10 静态断言(分组 DOM/外链 URL 拼接与既有渠道覆盖一致/取消收藏旁按钮位置/未分组兜底/免责文案保留)+ node --check;browser QA:备 目的地+路线+住宿 三条收藏 → 收藏列表目的地行见 🚗/🛏️ 外链且 URL 正确 → 前往预订区块按目的地分组、子项外链齐 → 取消收藏联动刷新 → 既有收藏/方案/AI tab 零回归 → 0 JS error;测试收藏清理。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-08 上午神朱点名后**执行器手写**,commits `627c9fb`+`aeb9be8`)。
+  - ①目的地行动作排 `.fp-acts`:「取消收藏」旁并排路线外链(有已收藏路线→复用 bookLinksForRoute 按 mode 出链:驾车→高德导航/铁路→12306/飞机→去哪儿;无收藏路线→高德导航+12306 双链兜底,终点=目的地坐标)+ 住宿外链(携程/Booking/Airbnb 按 plainFavName 纯名搜索,完全复用既有 URL 拼接,不新造);全部 target=_blank rel=noopener。
+  - ②「🎫 前往预订」重组为按目的地分组:`groupBookByPlace` 用收藏快照 `summary.parent.ref_key` 归属判定(与 favTree 同源)→ `.bk-grp` 小标题(📍 名称 + 「📄 详情」链接复用 TASK-13 的 openFavPlaceModal 开既有 #placeModal + 计数)→ 缩进子项 `bookRowHtml`(路线=🚗 名称+时长/费用快照,住宿=🛏️ 纯名+AI 预估价快照);判不出归属落「🗂️ 未分组」小节按类型平铺,一条不丢;免责声明口径原样保留。
+  - ③**抓到并修复一个真 bug**:我初版 `plainFavName` 用字符类 `[📍🛏️🛏]` 剥前缀——JS 正则无 u 标志时字符类按 UTF-16 单元匹配,把 emoji 代理对拆开剥掉半个 → 孤立代理项 → `encodeURIComponent` 抛 `URI malformed`,**整个收藏面板渲染崩**。改为交替序列 `(?:📍|🛏️|🛏|🏨)` 修复,并新增 node 真跑回归用例(6 种前缀全过、无孤立代理);另修真机 QA 发现的住宿子项 emoji 双写(bookSubTitle 对住宿名先过 plainFavName)。
+  - 测试:test_frontend_routes.py **+11 静态断言**(动作排位置/路线外链复用与兜底双链/住宿三渠道/分组 DOM/归属判定口径/未分组兜底/免责保留/📄详情复用 openFavPlaceModal/子项快照/新页打开/不新增前端 key)+ 代理项真 bug 回归(node 子进程真跑);node --check 通过;pytest backend/ = **1376 passed**(1365 基线零回归,71s)。
+  - browser QA(真机,库内既有 11 条收藏,未污染数据):收藏列表 4 个目的地行动作排齐(取消收藏+路线/住宿外链,URL 正确、全部 _blank/noopener)→ 前往预订 4 组(亭林园/上海耀雪冰雪世界/松花湖滑雪场/大山),📍有 place_id 的 3 组带「📄 详情」→ 点开 #placeModal 正常、Esc 层级(先弹窗后面板)正常 → 子项快照真实显示(昆山柏轩 ¥220-380/皇冠假日 ¥720-1440/驾车 1小时16分 ¥59)→ 联动:POST 一条亭林园铁路路线收藏 → 刷新后亭林园组 2→3 行、收藏 11→12 → DELETE → 3→2 行、12→11,两处联动刷新全对 → 三 tab(收藏/行程方案/AI 行程)零回归 → 全程 window.__errs **0**;测试收藏(id=15)已删,库还原 11 条。
 
 ---
 

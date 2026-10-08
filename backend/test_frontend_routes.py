@@ -2686,3 +2686,141 @@ def test_stay_price_text_is_black_on_light_pill(html: str) -> None:
     assert '"badge price">' in card, "价格应由 .badge.price 浅底药丸承载"
     assert '#b45309' not in nospace.split('.badge.deg')[0].split('.badge.price')[1], \
         "价格药丸不应再用棕底 #b45309"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-14:目的地行「取消收藏」旁加路线/住宿外链 + 前往预订按目的地分组重组
+# --------------------------------------------------------------------------- #
+
+
+def book_section(html: str) -> str:
+    """切出前往预订(TASK-4b/14)那段 JS。"""
+    start = html.index("// 前往预订(TASK-4b)")
+    end = html.index("// AI 行程(TASK-10c", start)
+    return html[start:end]
+
+
+def test_task14_place_row_has_route_and_stay_links(html: str) -> None:
+    """目的地行动作排:取消收藏 + 路线外链 + 住宿外链同一行(.fp-acts)。"""
+    assert "function placeActsHtml" in html, "目的地行应有专属动作排渲染函数"
+    acts = html[html.index("function placeActsHtml"):]
+    acts = acts[:acts.index("\n}")]
+    assert "fp-del js-fav-del" in acts, "取消收藏按钮要保留在动作排里"
+    assert "bookLinksForPlaceRoute" in acts and "bookLinksForPlaceStay" in acts, \
+        "取消收藏旁应并排路线 + 住宿外链"
+    assert "fp-acts" in acts, "路线/住宿外链与取消收藏同一动作排(.fp-acts)"
+
+
+def test_task14_place_route_link_reuses_existing_builders(html: str) -> None:
+    """路线外链复用既有 bookLinksForRoute(按 mode 出链),不新造 URL。"""
+    fn = html[html.index("function bookLinksForPlaceRoute"):]
+    fn = fn[:fn.index("\n}")]
+    assert "bookLinksForRoute(routes[0])" in fn, "有收藏路线 → 复用 bookLinksForRoute"
+    assert "ditu.amap.com" in fn and "12306" in fn, "无收藏路线 → 高德导航 + 12306 双链兜底"
+
+
+def test_task14_place_stay_link_covers_channels(html: str) -> None:
+    """住宿外链覆盖 携程/Booking/Airbnb(与既有渠道口径一致)。"""
+    fn = html[html.index("function bookLinksForPlaceStay"):]
+    fn = fn[:fn.index("\n}")]
+    for host in ("ctrip.com", "booking.com", "airbnb.com"):
+        assert host in fn, f"住宿外链应覆盖 {host}"
+
+
+def test_task14_book_section_groups_by_place(html: str) -> None:
+    """前往预订区块按目的地分组(不再是平铺两张列表)。"""
+    section = book_section(html)
+    assert "function groupBookByPlace" in section, "应有按目的地归组的函数"
+    assert "function bookPlaceGroupHtml" in section, "应有目的地分组渲染函数"
+    grp = section[section.index("function groupBookByPlace"):]
+    grp = grp[:grp.index("\nfunction ")]
+    assert "summary" in grp and "parent" in grp and "ref_key" in grp, \
+        "归属判定用收藏快照 summary.parent.ref_key(与 favTree 同源)"
+
+
+def test_task14_book_ungrouped_fallback(html: str) -> None:
+    """判不出归属的收藏落「未分组」小节,一条不丢。"""
+    section = book_section(html)
+    assert "ungrouped" in section, "归属判定函数要单列 ungrouped"
+    render = section[section.index("function renderBookSection"):]
+    render = render[:render.index("\nfunction ")]
+    assert "groups.ungrouped" in render and "未分组" in render, \
+        "renderBookSection 要渲染未分组兜底小节"
+
+
+def test_task14_book_disclaimer_kept(html: str) -> None:
+    """免责声明口径不变(价格仅供参考 · 不代订 · 以官方/OTA 实时为准)。"""
+    section = book_section(html)
+    render = section[section.index("function renderBookSection"):]
+    render = render[:render.index("\nfunction ")]
+    assert "BOOK_DISCLAIMER" in render, "重组后仍要输出免责声明"
+
+
+def test_task14_book_detail_link_reuses_modal(html: str) -> None:
+    """目的地小标题「📄 详情」复用 TASK-13 的 openFavPlaceModal 入口(同一弹窗)。"""
+    section = book_section(html)
+    assert "js-book-detail" in section, "分组小标题应带 📄 详情链接"
+    assert "openFavPlaceModal" in html, "详情入口应复用 openFavPlaceModal"
+    # 事件委托里 js-book-detail → openFavPlaceModal
+    idx = html.index("#favBookList .js-book-detail")
+    around = html[idx:idx + 300]
+    assert "openFavPlaceModal" in around, "委托应把 📄 详情接到 openFavPlaceModal"
+
+
+def test_task14_book_subitem_snapshot(html: str) -> None:
+    """预订子项带快照摘要(路线=时长/费用,住宿=AI 预估价)。"""
+    section = book_section(html)
+    assert "function bookSubTitle" in section, "子项标题应含快照摘要"
+    fn = section[section.index("function bookSubTitle"):]
+    fn = fn[:fn.index("\n}")]
+    assert "duration_min" in fn and "cost_cny" in fn, "路线子项应带时长/费用快照"
+    assert "price_estimate" in fn, "住宿子项应带预估价快照"
+
+
+def test_task14_book_links_open_new_page(html: str) -> None:
+    """前往预订的外链仍是新页打开 + noopener(沿用既有 bookRowHtml)。"""
+    row = html[html.index("function bookRowHtml"):html.index("function renderBookSection")]
+    assert 'target="_blank"' in row and 'rel="noopener"' in row
+    # 目的地行动作排的外链也要新页打开
+    bhl = html[html.index("function bookLinksHtml"):]
+    bhl = bhl[:bhl.index("\n}")]
+    assert 'target="_blank"' in bhl and 'rel="noopener"' in bhl
+
+
+def test_task14_no_new_frontend_key(html: str) -> None:
+    """TASK-14 不新增前端 key/新接口:仍只经既有 deep-link 模板拼 URL。"""
+    section = book_section(html)
+    assert "amap_js_key" not in section and "securityJsCode" not in section, \
+        "预订区块不得引入地图 key"
+    assert "/api/" not in section or "openFavPlaceModal" in html, \
+        "预订分组是纯前端(详情复用既有 openFavPlaceModal,不新增接口)"
+
+
+def test_task14_plain_fav_name_no_surrogate_split(html: str) -> None:
+    """plainFavName 的 emoji 前缀必须用交替序列 (?:📍|🛏️…) 而非字符类 [📍🛏️]:
+    JS 正则无 u 标志时字符类会把代理对拆成孤立代理项 → encodeURIComponent 抛
+    URI malformed,整个收藏面板渲染崩(2026-10-08 实测踩坑)。"""
+    fn = html[html.index("function plainFavName"):]
+    fn = fn[:fn.index("\n}") + 2]   # +2 含闭合的 "\n}"
+    assert "(?:📍|" in fn, "emoji 前缀应是交替序列 (?:📍|🛏️|…)"
+    assert "[📍" not in fn, "不得用字符类剥 emoji 前缀(拆代理对 → URI malformed)"
+    # 用 node 真跑一遍:各种前缀都不产生孤立代理、encodeURIComponent 不炸
+    import subprocess, tempfile, os
+    js = fn + """
+const cases=["📍 亭林园 · 目的地","🛏️ 某酒店 · 住宿","🛏 民宿 · 住宿","🏨 酒店 · 住宿","无前缀 · 目的地",""];
+const out=cases.map(n=>{const p=plainFavName(n);try{encodeURIComponent(p);return p;}catch(e){return "ERR:"+e.message;}});
+console.log(JSON.stringify(out));
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as f:
+        f.write(js); path = f.name
+    try:
+        r = subprocess.run(["node", path], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, f"node 执行失败:{r.stderr[:200]}"
+        import json as _json
+        results = _json.loads(r.stdout.strip())
+        assert results[0] == "亭林园", f"应剥掉 📍 前缀与 · 目的地 后缀:{results[0]}"
+        assert results[1] == "某酒店" and results[2] == "民宿", f"住宿前缀剥离:{results[:3]}"
+        assert not any(str(x).startswith("ERR:") for x in results), f"有 URI malformed:{results}"
+        assert results[4] == "无前缀", f"无 emoji 前缀只剥后缀:{results[4]}"
+    finally:
+        os.unlink(path)

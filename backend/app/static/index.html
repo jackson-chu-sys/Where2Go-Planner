@@ -3381,7 +3381,8 @@ function groupBookByPlace(items){
   });
   return {grouped:order.map(key=>map[key]),ungrouped};
 }
-// TASK-14:预订子项标题(🚗/🛏️ + 名称 + 快照摘要:路线=时长/费用,住宿=AI 预估价)
+// TASK-14:预订子项标题(🚗/🛏️ + 名称 + 快照摘要:路线=时长/费用,住宿=AI 预估价)。
+// 名称先过 plainFavName 去掉自带的 🛏️ 前缀与「· 住宿」后缀,免得 emoji 双写。
 function bookSubTitle(item){
   const isStay=favGroupOf(item)==="stay";
   const summary=item.summary||{};
@@ -3391,7 +3392,8 @@ function bookSubTitle(item){
         ? "("+(isFinite(num(summary.duration_min))?(fmtDuration(summary.duration_min)+" / "):"")+
           (isFinite(num(summary.cost_cny))?fmtCost(summary.cost_cny):"")+")"
         : "");
-  return (isStay?"🛏️ ":"🚗 ")+String(item.name||"(无名)")+snap;
+  const label=isStay?plainFavName(item.name):String(item.name||"(无名)");
+  return (isStay?"🛏️ ":"🚗 ")+label+snap;
 }
 // 一个目的地分组:小标题(名称 + 📄详情链接,若有 place_id)→ 缩进子项(路线行 + 住宿行)
 function bookPlaceGroupHtml(g){

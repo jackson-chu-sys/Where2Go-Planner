@@ -55,6 +55,7 @@ TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "source", "note", "items"}
 ITEM_KEYS = {
     "id", "osm_type", "osm_id", "name", "kind", "lat", "lng",
     "distance_km", "price_estimate", "price_kind", "currency", "intro", "estimated",
+    "city",   # TASK-15:只加这一个键(既有键零变化)
 }
 EXISTING_PATHS = {
     "/api/discover", "/api/categories", "/api/places", "/api/places/meta",
@@ -548,3 +549,32 @@ def test_llm_degradation_keeps_200_and_null_price(http, fake_amap, monkeypatch, 
     assert by_name["老船长青旅"]["price_estimate"] == "约¥50-150/晚"
     assert by_name["老船长青旅"]["price_kind"] == "rule"
     assert by_name["外滩华尔道夫酒店"]["price_estimate"] == "约¥1200-3000/晚"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-15:/api/stays 每行只加一个 city 键(stay_city 现成口径;缺失=None 不炸)
+# --------------------------------------------------------------------------- #
+
+
+def test_item_carries_city_from_cityname(http, session, fake_amap, fake_llm) -> None:
+    """高德行 tags.cityname → city 键(去尾市,与 stays.stay_city 同口径)。"""
+    fake_amap.pois = [dict(p, cityname="杭州市") for p in sample_pois()]
+    status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, refresh="true")
+    assert status == 200, body
+    assert all(item["city"] == "杭州" for item in body["items"]), "cityname=杭州市 → city=杭州"
+
+
+def test_item_city_none_when_no_clue(http, session, fake_amap, fake_llm) -> None:
+    """cityname 空且名称不含已知城市 → city=None(不炸、不猜)。"""
+    status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, refresh="true")
+    assert status == 200, body
+    # SAMPLE_POIS 的 cityname 全空;「外滩华尔道夫酒店」等名称也不含 KNOWN_TIER_CITIES
+    assert all(item["city"] is None for item in body["items"]), "无线索 → None"
+
+
+def test_item_city_from_known_city_in_name(http, session, fake_amap, fake_llm) -> None:
+    """名称里的已知城市兜底(stay_city 第三层线索)。"""
+    fake_amap.pois = [dict(sample_pois()[0], name="上海虹桥康得思酒店")]
+    status, body = http("/api/stays", lat=ORIGIN_LAT, lng=ORIGIN_LNG, refresh="true")
+    assert status == 200, body
+    assert body["items"][0]["city"] == "上海", "名称含已知城市 → 名称兜底"

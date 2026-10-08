@@ -601,7 +601,8 @@ def test_stays_contract_matches_api_item_shape(html: str) -> None:
     section = stay_section(html)
     referenced = referenced_fields(section, "item") - {"kind"}
     # item.kind 也在白名单里;剔除 JS 本地变量后逐一核对
-    allowed = set(ITEM_KEYS) | {"estimated", "kind"}
+    # TASK-15:/api/stays 只加一个 city 键(既有键零变化),前端可引用
+    allowed = set(ITEM_KEYS) | {"estimated", "kind", "city"}
     unknown = {name for name in referenced if name not in allowed}
     assert not unknown, f"前端引用了 /api/stays 不存在的字段:{sorted(unknown)}"
 
@@ -650,11 +651,11 @@ def test_book_section_has_disclaimer(html: str) -> None:
 
 
 def test_book_links_cover_required_channels(html: str) -> None:
+    # TASK-15 口径:路线外链=高德导航 + Google Maps(12306/去哪儿随外链迁移下线)
     route_fn = html[html.index("function bookLinksForRoute"):html.index("function bookLinksForStay")]
-    assert "kyfw.12306.cn" in route_fn, "铁路应跳 12306"
-    assert "flight.qunar.com" in route_fn, "飞机应跳 OTA 机票搜索"
-    assert "amap.com" in route_fn and "google.com/maps" in route_fn, "自驾应跳地图导航"
-    stay_fn = html[html.index("function bookLinksForStay"):html.index("function bookRowHtml")]
+    assert "uri.amap.com/navigation" in route_fn, "路线应给高德导航外链"
+    assert "google.com/maps/dir" in route_fn, "路线应给 Google Maps 外链"
+    stay_fn = html[html.index("function bookLinksForStay"):html.index("function plainFavName")]
     for host in ("ctrip.com", "booking.com", "airbnb.com"):
         assert host in stay_fn, f"住宿应可跳 {host}"
 
@@ -2701,30 +2702,57 @@ def book_section(html: str) -> str:
 
 
 def test_task14_place_row_has_route_and_stay_links(html: str) -> None:
-    """目的地行动作排:取消收藏 + 路线外链 + 住宿外链同一行(.fp-acts)。"""
+    """(TASK-15 返工后)目的地父行动作排只留「取消收藏」,外链挪到子行。"""
     assert "function placeActsHtml" in html, "目的地行应有专属动作排渲染函数"
     acts = html[html.index("function placeActsHtml"):]
-    acts = acts[:acts.index("\n}")]
+    acts = acts[:acts.index("\n}\n")]
     assert "fp-del js-fav-del" in acts, "取消收藏按钮要保留在动作排里"
-    assert "bookLinksForPlaceRoute" in acts and "bookLinksForPlaceStay" in acts, \
-        "取消收藏旁应并排路线 + 住宿外链"
-    assert "fp-acts" in acts, "路线/住宿外链与取消收藏同一动作排(.fp-acts)"
+    assert "bookLinks" not in acts, "TASK-15:父行不再有路线/住宿外链"
+    assert "fp-acts" in acts, "取消收藏仍在动作排(.fp-acts)里"
 
 
-def test_task14_place_route_link_reuses_existing_builders(html: str) -> None:
-    """路线外链复用既有 bookLinksForRoute(按 mode 出链),不新造 URL。"""
-    fn = html[html.index("function bookLinksForPlaceRoute"):]
-    fn = fn[:fn.index("\n}")]
-    assert "bookLinksForRoute(routes[0])" in fn, "有收藏路线 → 复用 bookLinksForRoute"
-    assert "ditu.amap.com" in fn and "12306" in fn, "无收藏路线 → 高德导航 + 12306 双链兜底"
+def test_task15_child_rows_have_links_next_to_delete(html: str) -> None:
+    """TASK-15:路线/住宿子行的「取消收藏」旁并排外链(childActsHtml)。"""
+    assert "function childActsHtml" in html, "子行应有专属动作排渲染函数"
+    fn = html[html.index("function childActsHtml"):]
+    fn = fn[:fn.index("\n}\n")]
+    assert "fp-del js-fav-del" in fn, "子行动作排含「取消收藏」"
+    assert "bookLinksForStay" in fn and "bookLinksForRoute" in fn, \
+        "住宿子行→OTA 外链,路线子行→高德+Google 外链"
+    assert "bookLinksHtml" in fn, "外链与取消收藏同一动作排"
+    # favItemHtml 里:非 place 行走 childActsHtml
+    fav = html[html.index("function favItemHtml"):html.index("function placeActsHtml")]
+    assert "childActsHtml(item)" in fav, "路线/住宿子行渲染要接 childActsHtml"
 
 
-def test_task14_place_stay_link_covers_channels(html: str) -> None:
-    """住宿外链覆盖 携程/Booking/Airbnb(与既有渠道口径一致)。"""
-    fn = html[html.index("function bookLinksForPlaceStay"):]
-    fn = fn[:fn.index("\n}")]
-    for host in ("ctrip.com", "booking.com", "airbnb.com"):
-        assert host in fn, f"住宿外链应覆盖 {host}"
+def test_task15_route_links_use_own_coordinates(html: str) -> None:
+    """TASK-15:路线外链用该路线收藏自身 from/to 坐标;mode 映射 driving→car、其他→bus/transit。"""
+    fn = html[html.index("function bookLinksForRoute"):]
+    fn = fn[:fn.index("function stayCityOf")]
+    assert "uri.amap.com/navigation" in fn and "item.from_lat" in fn and "item.to_lat" in fn
+    assert '"car"' in fn and '"bus"' in fn, "高德 mode 映射:driving→car,其余→bus"
+    assert "travelmode=" in fn and '"transit"' in fn, "Google travelmode 映射:driving→driving,其余→transit"
+    assert "maps/search/?api=1&query=" in fn, "无坐标的库外收藏退化为目的地搜索链"
+
+
+def test_task15_stay_links_keyword_has_city(html: str) -> None:
+    """TASK-15:住宿 OTA 搜索词=城市+酒店纯名;无 city 退化纯名(不比现状差)。"""
+    fn = html[html.index("function bookLinksForStay"):]
+    fn = fn[:fn.index("function plainFavName")]
+    assert "stayCityOf" in fn and "plainFavName" in fn
+    assert "city+name" in fn or "city + name" in fn.replace(" ", " "), "搜索词拼城市+纯名"
+    assert "hotels.ctrip.com/hotels/list?keyword=" in fn and "searchresults.zh-cn.html?ss=" in fn \
+        and "/homes" in fn, "三渠道 URL 模板在"
+    city_fn = html[html.index("function stayCityOf"):]
+    city_fn = city_fn[:city_fn.index("\n}\n")]
+    assert "summary.city" in city_fn, "城市来自收藏快照 summary.city"
+
+
+def test_task15_stay_fav_payload_carries_city(html: str) -> None:
+    """TASK-15:收藏住宿时把 /api/stays 的 city 写进 summary.city(新收藏快照)。"""
+    fn = html[html.index("async function addFavStay"):]
+    fn = fn[:fn.index("\n}\n")]
+    assert "city:item.city||null" in fn, "summary 要带 city 键"
 
 
 def test_task14_book_section_groups_by_place(html: str) -> None:

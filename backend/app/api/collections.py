@@ -18,11 +18,14 @@
 校验口径与 ``/api/places``、``/api/routes`` 一致:缺参 / 非法一律 **400 + 中文报错**。
 所以请求体故意收成裸 JSON 对象(``Body(None)``)而不是 pydantic 模型 —— 否则字段类型不对
 会被 FastAPI 拦成 422 英文报错,同一个"参数不对"就有两种状态码。
-本模块**不触网**:只读写 SQLite(收藏是快照,不需要重新算路线)。
+本模块**基本不触网**:只读写 SQLite(收藏是快照,不需要重新算路线);唯一例外是
+TASK-15 的存量住宿收藏 ``summary.city`` **懒补齐**(逆地理降级链,每坐标一次、
+进程内 TTL 缓存,失败留空不阻塞响应)。
 """
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Mapping
 from typing import Any, Optional
@@ -33,6 +36,7 @@ from sqlalchemy.orm import Session
 from db import models
 from db import repository as repo
 from db.base import get_session
+from services import place_loader
 from services import routes as route_service
 
 router = APIRouter()
@@ -259,6 +263,91 @@ def _match_place_id(session: Session, item: Mapping[str, Any]) -> Optional[int]:
     return int(row.id) if row is not None else None
 
 
+# --------------------------------------------------------------------------- #
+# TASK-15:存量住宿收藏 summary.city 懒补齐(OTA 搜索词=城市+酒店名)
+# --------------------------------------------------------------------------- #
+
+#: 逆地理反查城市的进程内缓存:坐标定点串 → (city, 过期时刻)。仿 OriginCache 的
+#: 7 天口径;反查失败缓存 1 小时(避免每次开面板都重打逆地理,但不永久判死)。
+_CITY_CACHE_TTL_S = 7 * 24 * 3600
+_CITY_CACHE_NEG_TTL_S = 3600
+_city_cache: dict[str, tuple[Optional[str], float]] = {}
+_city_cache_lock = threading.Lock()
+
+
+def _is_stay_row(row: Mapping[str, Any]) -> bool:
+    """住宿收藏判定(与前端 favGroupOf 同口径):kind=place + 住宿指纹。"""
+    if str(row.get("kind") or "") != models.KIND_PLACE:
+        return False
+    summary = row.get("summary") or {}
+    if not isinstance(summary, Mapping):
+        summary = {}
+    if summary.get("stay_kind") is not None or summary.get("price_estimate"):
+        return True
+    name = str(row.get("name") or "")
+    return name.startswith("🛏️") or "🛏" in name
+
+
+def city_of_coordinates(lat: Any, lng: Any) -> Optional[str]:
+    """坐标 → 城市名(逆地理降级链:高德 → Photon → Nominatim);失败返回 ``None`` 不抛。
+
+    结果进进程内 TTL 缓存(同坐标 7 天内只打一次逆地理);城市名去尾「市」
+    (与 :func:`services.stays.normalize_city_name` 同口径,搜「昆山」比「苏州市」准的
+    县级市情形由 adname 线索在前端快照里另行兜底,这里只保证不比现状差)。
+    """
+    try:
+        latitude = round(float(lat), models.COORD_PRECISION)
+        longitude = round(float(lng), models.COORD_PRECISION)
+    except (TypeError, ValueError):
+        return None
+    key = f"{latitude},{longitude}"
+    now = time.time()
+    with _city_cache_lock:
+        cached = _city_cache.get(key)
+        if cached is not None and cached[1] > now:
+            return cached[0]
+    city: Optional[str] = None
+    try:
+        geo, _source = place_loader.reverse_with_fallback(latitude, longitude)
+        raw = place_loader.city_from_display_name(geo.get("display_name"))
+        city = str(raw or "").strip().rstrip("市").strip() or None
+    except Exception:  # noqa: BLE001 - 懒补齐失败只留空,绝不阻塞收藏列表
+        city = None
+    ttl = _CITY_CACHE_TTL_S if city else _CITY_CACHE_NEG_TTL_S
+    with _city_cache_lock:
+        _city_cache[key] = (city, now + ttl)
+    return city
+
+
+def backfill_stay_cities(session: Session) -> int:
+    """存量住宿收藏懒补齐 ``summary.city``:反查得到才写回持久化,失败留空不阻塞。
+
+    返回本次写回的行数。只碰 ``kind=place`` 的住宿行、只在 summary 缺 ``city`` 且有
+    坐标时反查;新收藏由前端把 ``/api/stays`` 的 ``city`` 写进 summary,不走这里。
+    """
+    rows = (
+        session.query(models.Collection)
+        .filter(models.Collection.kind == models.KIND_PLACE)
+        .all()
+    )
+    updated = 0
+    for row in rows:
+        summary = dict(row.summary or {})
+        if not _is_stay_row({"kind": row.kind, "summary": summary, "name": row.name}):
+            continue
+        if str(summary.get("city") or "").strip():
+            continue  # 已有城市(前端新收藏或上次补齐过),不重复触网
+        city = city_of_coordinates(row.to_lat, row.to_lng)
+        if not city:
+            continue  # 反查失败留空:下次开面板再试(负缓存 1h 内不打网络)
+        summary["city"] = city
+        row.summary = summary  # 整 dict 重赋值,JSON 列的变更才会被 SQLAlchemy 追踪
+        updated += 1
+    if updated:
+        session.commit()
+    return updated
+
+
 @router.post("/collections")
 def create_collection(
     payload: Any = Body(None, description="收藏内容 JSON 对象:kind / mode / 起终点 / summary"),
@@ -322,6 +411,12 @@ def list_collections(
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    # TASK-15:存量住宿收藏懒补 summary.city(逆地理一次、进程内 TTL 缓存;
+    # 失败留空不阻塞——补完后 items 里的 summary 即含新 city,持久化写回)
+    if backfill_stay_cities(session):
+        items = repo.list_collections(
+            session, kind=wanted_kind, cat_id=resolved_cat, limit=resolved_limit
+        )
     # TASK-13:**只加键不改既有键**(place_id,目的地收藏 → 库内 Place 行;匹配不到=None)
     for item in items:
         item["place_id"] = _match_place_id(session, item)

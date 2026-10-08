@@ -1110,3 +1110,103 @@ def test_api_list_collections_existing_keys_unchanged(session) -> None:
     assert set(item) == REQUIRED_DICT_KEYS | {"place_id"}, "除 place_id 外不许多出/缺少键"
     assert set(payload) >= {"collections", "count", "kind", "cat_id", "total",
                             "counts_by_kind", "cats", "kinds", "modes", "elapsed_s", "note"}
+
+
+# --------------------------------------------------------------------------- #
+# TASK-15:存量住宿收藏 summary.city 懒补齐(逆地理降级链,失败留空不阻塞)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_city_cache():
+    """每个用例前清空 city 懒补齐的进程内缓存,避免串味。"""
+    collections_api._city_cache.clear()
+    yield
+    collections_api._city_cache.clear()
+
+
+def _stay_kwargs(name="🛏️ 昆山柏轩酒店 · 住宿", summary=None):
+    return dict(kind="place", to_lat=31.3856, to_lng=120.9807, to_name=name,
+                summary=summary if summary is not None
+                else {"stay_kind": "hotel", "price_estimate": "约¥300-500/晚"})
+
+
+def test_backfill_writes_city_into_summary(session, monkeypatch) -> None:
+    repo.upsert_collection(session, **_stay_kwargs())
+    calls = []
+
+    def fake_reverse(lat, lng, **kwargs):
+        calls.append((lat, lng))
+        return {"lat": lat, "lng": lng, "display_name": "玉山镇, 昆山市, 苏州市, 江苏省"}, "amap"
+
+    monkeypatch.setattr(collections_api.place_loader, "reverse_with_fallback", fake_reverse)
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    item = payload["collections"][0]
+    assert item["summary"]["city"] == "昆山", "懒补齐:反查城市写回 summary.city(县级市优先且更准,去尾市)"
+    # 持久化验证:重查(清缓存也不该再触网——summary 已有 city)
+    collections_api._city_cache.clear()
+    calls.clear()
+    payload2 = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    assert payload2["collections"][0]["summary"]["city"] == "昆山"
+    assert calls == [], "已补齐的行不再反查"
+
+
+def test_backfill_skips_rows_with_city_and_non_stays(session, monkeypatch) -> None:
+    repo.upsert_collection(session, **_stay_kwargs(name="🛏️ 已有城市 · 住宿",
+                                                   summary={"stay_kind": "hotel", "city": "杭州"}))
+    repo.upsert_collection(session, kind="place", to_lat=31.5, to_lng=121.5, to_name="📍 西沙湿地 · 目的地")
+    repo.upsert_collection(session, kind="route", mode="driving",
+                           from_lat=31.2, from_lng=121.4, to_lat=31.5, to_lng=121.5)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("有 city 的住宿行与非住宿行都不该触网")
+
+    monkeypatch.setattr(collections_api.place_loader, "reverse_with_fallback", boom)
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    assert len(payload["collections"]) == 3
+    cities = {item["summary"].get("city") for item in payload["collections"]}
+    assert cities == {"杭州", None}, "只补住宿且只补没 city 的"
+
+
+def test_backfill_failure_leaves_empty_and_does_not_block(session, monkeypatch) -> None:
+    repo.upsert_collection(session, **_stay_kwargs())
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("三个逆地理编码源都失败")
+
+    monkeypatch.setattr(collections_api.place_loader, "reverse_with_fallback", fail)
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    assert payload["count"] == 1, "反查失败不阻塞响应"
+    item = payload["collections"][0]
+    assert not item["summary"].get("city"), "失败留空不写回(下次开面板再试)"
+    assert "price_estimate" in item["summary"], "既有 summary 键零变化"
+
+
+def test_backfill_no_coordinates_skips(session, monkeypatch) -> None:
+    # 无坐标的住宿行(name 指纹判定):没坐标可反查,直接跳过
+    repo.upsert_collection(session, kind="place", ref_key="place:31.9,121.9",
+                           to_lat=31.9, to_lng=121.9, to_name="🛏️ 某民宿 · 住宿",
+                           summary={"stay_kind": "guest_house"})
+
+    def fail(*args, **kwargs):
+        raise AssertionError("有坐标但反查函数不该在这被调:先验证缓存路径")
+
+    monkeypatch.setattr(collections_api.place_loader, "reverse_with_fallback",
+                        lambda lat, lng, **kw: ({"lat": lat, "lng": lng,
+                                                 "display_name": "崇明区, 上海市"}, "amap"))
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    assert payload["collections"][0]["summary"].get("city") == "上海"
+
+
+def test_city_of_coordinates_normalizes_and_caches(monkeypatch) -> None:
+    calls = []
+
+    def fake_reverse(lat, lng, **kwargs):
+        calls.append((lat, lng))
+        return {"lat": lat, "lng": lng, "display_name": "西湖区, 杭州市, 浙江省"}, "amap"
+
+    monkeypatch.setattr(collections_api.place_loader, "reverse_with_fallback", fake_reverse)
+    assert collections_api.city_of_coordinates(30.25, 120.15) == "杭州"
+    assert collections_api.city_of_coordinates(30.25, 120.15) == "杭州"
+    assert len(calls) == 1, "同坐标 TTL 缓存内只反查一次"
+    assert collections_api.city_of_coordinates(None, 120.15) is None, "坐标非法 → None 不抛"

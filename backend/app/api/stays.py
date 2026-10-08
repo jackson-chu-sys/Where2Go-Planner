@@ -190,8 +190,14 @@ def _resolve_origin(
 
 
 def _item(row: Mapping[str, Any]) -> dict[str, Any]:
-    """服务层的一行 → 出参形状(白名单投影 + 估算标注)。"""
+    """服务层的一行 → 出参形状(白名单投影 + 估算标注)。
+
+    TASK-15:**只加一个 ``city`` 键**(用现成的 :func:`services.stays.stay_city`:
+    高德行 ``tags.cityname`` > 显式 city 字段 > 名称里的已知城市;都没有 → ``None``),
+    给前端住宿收藏快照 ``summary.city`` 用(OTA 搜索词=城市+酒店名)。既有键零变化。
+    """
     item: dict[str, Any] = {key: row.get(key) for key in ITEM_KEYS}
+    item["city"] = stay_service.stay_city(row)
     item["estimated"] = ESTIMATED_LABEL
     return item
 

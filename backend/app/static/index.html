@@ -1443,7 +1443,8 @@ async function addFavStay(item,button){
     to_lat:num(item.lat),to_lng:num(item.lng),
     name:"🛏️ "+String(item.name||"(无名住宿)")+" · 住宿",
     summary:{kind:"estimate",price_estimate:item.price_estimate||null,
-             stay_kind:item.kind||null,distance_km:item.distance_km}};
+             stay_kind:item.kind||null,distance_km:item.distance_km,
+             city:item.city||null}};   // TASK-15:城市快照 → OTA 搜索词=城市+酒店名
   // 功能4:住宿收藏显式带上所属目的地 → 后端写进 summary.parent,收藏面板才能两层挂载
   const parent=stayParentPayload(state.routePanel.place);
   if(parent) payload.parent=parent;
@@ -2745,25 +2746,29 @@ function favItemHtml(item,placeKids){
     (item.cat_name?'<span class="badge deg">'+esc(item.cat_name)+"</span>":"")+"</div>"+
     meta+
     (item.created_at?'<div class="fp-time">收藏于 '+esc(fmtGeneratedAt(item.created_at))+"</div>":"")+
-    (group==="place"?placeActsHtml(item,placeKids):
-      '<button type="button" class="fp-del js-fav-del" data-id="'+Number(item.id)+
-      '" title="DELETE /api/collections/'+Number(item.id)+'">取消收藏</button>')+
+    (group==="place"?placeActsHtml(item):childActsHtml(item))+
     "</div>";
 }
-// TASK-14:目的地行的动作排 —— 「取消收藏」旁并排「路线」「住宿」外链组。
-// placeKids = 挂在该目的地下的子收藏(favTree 传入);路线外链优先按其 mode 出链
-// (有收藏路线→复用 bookLinksForRoute:铁路 12306/飞机 去哪儿/驾车 高德导航;无收藏→高德导航+12306 双链),
-// 住宿外链复用既有 携程/Booking/Airbnb 按名搜索。全部复用 renderBookSection 的 URL 拼接,不新造。
-function placeActsHtml(item,placeKids){
-  const kids=(placeKids&&placeKids.routes)||[];
+// TASK-15:目的地父行的动作排**只留「取消收藏」**(外链挪到路线/住宿子行各自旁边;
+// 「📄 详情」入口在收藏列表名称链接与前往预订分组小标题上,不在父行动作排)。
+function placeActsHtml(item){
   const id=Number(item.id);
-  const routeLinks=bookLinksForPlaceRoute(item,kids);
-  const stayLinks=bookLinksForPlaceStay(item);
   return '<div class="fp-acts">'+
     '<button type="button" class="fp-del js-fav-del" data-id="'+id+
       '" title="DELETE /api/collections/'+id+'">取消收藏</button>'+
-    bookLinksHtml(routeLinks)+
-    bookLinksHtml(stayLinks)+
+    "</div>";
+}
+// TASK-15:路线/住宿子行的动作排 —— 「取消收藏」旁并排外链:
+// 路线子行=高德导航 + Google Maps(用该路线收藏自身 from/to 坐标,见 bookLinksForRoute);
+// 住宿子行=OTA 三渠道(携程/Booking/Airbnb,搜索词=城市+酒店纯名,见 bookLinksForStay)。
+function childActsHtml(item){
+  const group=favGroupOf(item);
+  if(group==="place") return placeActsHtml(item);   // 未归类的裸目的地行:无外链,只取消收藏
+  const links=(group==="stay")?bookLinksForStay(item):bookLinksForRoute(item);
+  return '<div class="fp-acts">'+
+    '<button type="button" class="fp-del js-fav-del" data-id="'+Number(item.id)+
+      '" title="DELETE /api/collections/'+Number(item.id)+'">取消收藏</button>'+
+    bookLinksHtml(links)+
     "</div>";
 }
 function renderFavItems(){
@@ -3263,34 +3268,59 @@ function cleanStayName(name){
   return String(name||"").replace(/^🛏️?\s*/,"").replace(/\s*·\s*住宿\s*$/,"").trim();
 }
 function bookLinksForRoute(item){
+  // TASK-15:路线外链=高德导航 + Google Maps,用该路线收藏**自身的 from/to 坐标**拼;
+  // mode 映射:driving→car/driving,rail/flight→bus/transit(导航兜底口径)。
+  const mode=String(item.mode||"");
+  const amapMode=(mode==="driving")?"car":"bus";
+  const gMode=(mode==="driving")?"driving":"transit";
+  const hasTo=isFinite(num(item.to_lat))&&isFinite(num(item.to_lng));
+  const hasFrom=isFinite(num(item.from_lat))&&isFinite(num(item.from_lng));
+  if(hasFrom&&hasTo){
+    const fromName=String(item.from_name||"").trim();
+    const toName=String(item.to_name||"").trim();
+    const from=num(item.from_lng)+","+num(item.from_lat)+(fromName?(","+encodeURIComponent(fromName)):"");
+    const to=num(item.to_lng)+","+num(item.to_lat)+(toName?(","+encodeURIComponent(toName)):"");
+    return [{label:"🚗 高德导航",cls:"",
+      url:"https://uri.amap.com/navigation?from="+from+"&to="+to+"&mode="+amapMode},
+      {label:"🌐 Google 地图",cls:"alt",
+      url:"https://www.google.com/maps/dir/?api=1&origin="+num(item.from_lat)+","+num(item.from_lng)+
+          "&destination="+num(item.to_lat)+","+num(item.to_lng)+"&travelmode="+gMode}];
+  }
+  if(hasTo){
+    // 只有终点坐标(旧收藏/单点):给 to 点导航,不猜起点
+    const toName=String(item.to_name||"").trim();
+    const to=num(item.to_lng)+","+num(item.to_lat)+(toName?(","+encodeURIComponent(toName)):"");
+    return [{label:"🚗 高德导航",cls:"",
+      url:"https://uri.amap.com/navigation?to="+to+"&mode="+amapMode},
+      {label:"🌐 Google 地图",cls:"alt",
+      url:"https://www.google.com/maps/dir/?api=1&destination="+num(item.to_lat)+","+num(item.to_lng)+
+          "&travelmode="+gMode}];
+  }
+  // 库外收藏(无坐标):退化为目的地搜索链(高德 uri.amap.com/search + Google query)
   const nm=splitRouteNames(item.name);
-  const from=encodeURIComponent(nm.from),to=encodeURIComponent(nm.to);
-  const date=todayCST();
-  if(item.mode==="rail"){
-    return [{label:"🚄 12306 查票",cls:"",
-      url:"https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc&fs="+from+"&ts="+to+
-          "&date="+date+"&flag=N,N,Y"}];
-  }
-  if(item.mode==="flight"){
-    return [{label:"✈️ 去哪儿机票",cls:"",
-      url:"https://flight.qunar.com/site/oneway_list.htm?searchDepartureAirport="+from+
-          "&searchArrivalAirport="+to+"&searchDepartureTime="+date+
-          "&nextNDays=0&startSearch=true&from=flight_index"},
-      {label:"🚄 12306(比价)",cls:"alt",
-      url:"https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc&fs="+from+"&ts="+to+
-          "&date="+date+"&flag=N,N,Y"}];
-  }
-  // driving 及未知方式:地图导航
-  return [{label:"🚗 高德导航",cls:"",
-    url:"https://ditu.amap.com/dir?type=car&policy=1&from%5Bname%5D="+from+"&to%5Bname%5D="+to},
+  const target=nm.to||nm.from||String(item.name||"");
+  return [{label:"🚗 高德导航",cls:"",url:amapViewUrl(target,null,null)},
     {label:"🌐 Google 地图",cls:"alt",
-    url:"https://www.google.com/maps/dir/"+from+"/"+to+"/?travelmode=driving"}];
+    url:"https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(target)}];
+}
+// TASK-15:住宿 OTA 外链搜索词=「城市 + 酒店纯名」(只拿酒店名 OTA 基本搜错地方)。
+// 城市三层兜底:a) 新收藏 summary.city(/api/stays 的 city 键快照)→ b) 存量收藏由后端
+// GET /api/collections 懒补齐写回 summary.city → c) 都拿不到退回纯酒店名(不比现状差)。
+function stayCityOf(item){
+  const summary=(item&&item.summary)||{};
+  return String(summary.city||"").trim();
 }
 function bookLinksForStay(item){
-  const q=encodeURIComponent(cleanStayName(item.name));
-  return [{label:"🏨 携程",cls:"",url:"https://so.ctrip.com/s?keyword="+q},
-    {label:"🏨 Booking",cls:"alt",url:"https://www.booking.com/searchresults.html?ss="+q},
-    {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+q+"/homes"}];
+  const name=plainFavName(item.name);
+  const city=stayCityOf(item);
+  const kw=encodeURIComponent(city?(city+name):name);
+  const ss=encodeURIComponent(city?(city+" "+name):name);
+  const ab=encodeURIComponent(city?(city+"--"+name):name);
+  // ⚠️ 携程搜索域 so.ctrip.com 已死(2026-10-08 实测公共 DNS NXDOMAIN),
+  // 换酒店搜索列表页 hotels.ctrip.com/hotels/list?keyword=(实测 200、keyword 正确带入)。
+  return [{label:"🏨 携程",cls:"",url:"https://hotels.ctrip.com/hotels/list?keyword="+kw},
+    {label:"🏨 Booking",cls:"alt",url:"https://www.booking.com/searchresults.zh-cn.html?ss="+ss},
+    {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+ab+"/homes"}];
 }
 // TASK-14:收藏条目名去装饰前缀/后缀(「📍 松花湖滑雪场 · 目的地」→「松花湖滑雪场」),
 // 目的地行的路线/住宿外链按这个纯名 + 坐标生成。
@@ -3299,26 +3329,8 @@ function bookLinksForStay(item){
 function plainFavName(name){
   return String(name||"").replace(/^(?:📍|🛏️|🛏|🏨)\s*/,"").replace(/\s*·\s*(目的地|住宿)\s*$/,"").trim();
 }
-// 目的地行的「🚗 路线」外链:该目的地下**已收藏路线**→ 复用 bookLinksForRoute(按 mode 出链:
-// 铁路→12306 / 飞机→去哪儿 / 驾车→高德导航);没有收藏路线 → 高德导航 + 12306 双链(终点=目的地)。
-function bookLinksForPlaceRoute(item,kidRoutes){
-  const routes=(kidRoutes||[]).filter(r=>favGroupOf(r)==="route");
-  if(routes.length) return bookLinksForRoute(routes[0]);   // 复用既有拼接,不新造
-  const to=encodeURIComponent(plainFavName(item.name));
-  const from=(state.origin&&state.origin.city)?encodeURIComponent(state.origin.city):"";
-  const date=todayCST();
-  return [{label:"🚗 高德导航",cls:"",
-    url:"https://ditu.amap.com/dir?type=car&policy=1"+(from?("&from%5Bname%5D="+from):"")+"&to%5Bname%5D="+to},
-    {label:"🚄 12306 查票",cls:"alt",
-    url:"https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc"+(from?("&fs="+from):"")+"&ts="+to+"&date="+date+"&flag=N,N,Y"}];
-}
-// 目的地行的「🛏️ 住宿」外链:按目的地名在携程/Booking/Airbnb 搜周边住宿(复用既有渠道口径)。
-function bookLinksForPlaceStay(item){
-  const q=encodeURIComponent(plainFavName(item.name));
-  return [{label:"🏨 携程",cls:"",url:"https://so.ctrip.com/s?keyword="+q},
-    {label:"🏨 Booking",cls:"alt",url:"https://www.booking.com/searchresults.html?ss="+q},
-    {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+q+"/homes"}];
-}
+// (TASK-15:原 TASK-14 的 bookLinksForPlaceRoute/bookLinksForPlaceStay 已下线——
+//  外链从目的地父行挪到路线/住宿子行各自的「取消收藏」旁,父行只留「取消收藏」。)
 // 外链组 → 锚点(与 bookRowHtml 同款:新页打开 + noopener)
 function bookLinksHtml(links){
   return '<span class="fp-book">'+(links||[]).map(link=>

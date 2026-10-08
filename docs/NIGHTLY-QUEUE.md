@@ -873,6 +873,28 @@
 
 ---
 
+## [TASK-15] 外链挪到路线/住宿子行「取消收藏」旁 + OTA 搜索词加城市
+
+- 状态: pending
+- 依赖: TASK-14(同区域改动,串行避免冲突)
+- 背景: 神朱 2026-10-08 对 TASK-14 的两点返工意见:①外链按钮放错了行——应放在**路线子行和住宿子行各自的「取消收藏」旁边**(交通路线旁=高德+Google Maps 外链,住宿旁=OTA 外链),而不是挂在目的地父行上;②住宿 OTA 链接只拿酒店名去搜,OTA 基本搜错地方或搜不到——搜索词应带**城市+酒店名**(如「昆山 昆山柏轩酒店」)。
+- 目标:
+  ① **外链位置迁移**(收藏面板 + 前往预订区块两处一致):
+     - 目的地父行 `.fp-acts`:移除 TASK-14 加的路线/住宿外链(placeActsHtml 只留「取消收藏」),前往预订分组小标题保留「📄 详情」。
+     - 路线子行(favTree 缩进子行 + `.bk-row` 预订子行)的「取消收藏」旁:**高德导航外链 + Google Maps 外链**——用该路线收藏自身的 from/to 坐标拼:高德 `https://uri.amap.com/navigation?from=<lng>,<lat>,<from_name>&to=<lng>,<lat>,<to_name>&mode=<car|bus>`(mode 映射:driving→car,rail/flight→bus 兜底或仅给 to 点),Google `https://www.google.com/maps/dir/?api=1&origin=<lat>,<lng>&destination=<lat>,<lng>&travelmode=driving`(铁路/飞机映射 transit);无 from 坐标(库外收藏)则退化为目的地搜索链(高德 uri.amap.com/search + Google maps/search/?api=1&query=)。
+     - 住宿子行(收藏树缩进住宿子行 + `.bk-row` 预订住宿行)的「取消收藏」旁:**OTA 外链(携程/Booking/Airbnb,渠道沿用既有 bookLinksForStay)**,但搜索词按 ② 改为「城市 + 酒店纯名」。
+     - 注意:预订区块 `.bk-row` 目前行内没有「取消收藏」按钮,只有收藏树子行有——预订区块保持「行尾外链」布局即可,收藏树子行外链放 `.fp-del` 同一动作排(参照 TASK-14 `.fp-acts` 样式,子行复用)。
+  ② **住宿 OTA 搜索词加城市**(神朱原话:「应该是加城市和住宿名称」):
+     - 城市来源(三层,按序兜底):a) 新收藏:`/api/stays` 响应**只加一个 `city` 键**(用现成的 `services/stays.py:stay_city()`——高德行有 `cityname` tag,OSM 行有 `addr:city`,名称兜底;既有键零变化,口径同 TASK-13 的 place_id),前端收藏住宿时把 `city` 写进 `summary.city`(summary 是自由 JSON 快照,`_summary_of` 原样收,后端零迁移);b) 存量收藏(summary 无 city):后端 `GET /api/collections` 对住宿条目按 to_lat/to_lng 用既有逆地理降级链(place_loader 的高德 regeo,有 OriginCache 同款缓存思路可仿)一次性反查城市、写回 summary 持久化(懒补齐,失败就留空不阻塞响应);c) 都拿不到:退回纯酒店名搜索(现状,不比现在差)。
+     - 搜索词拼法:携程 `https://so.ctrip.com/s?keyword=<city><酒店纯名>`(中文直接连写,如「昆山昆山柏轩酒店」或 `<city> <酒店纯名>`,以实际搜索效果为准,QA 时真开一次链接验证能搜到);Booking `https://www.booking.com/searchresults.zh-cn.html?ss=<city>+<酒店纯名>`;Airbnb `https://www.airbnb.com/s/<city>--<酒店纯名>/homes` 或 query 参数形式(以能出结果为准)。
+  ③ 酒店纯名继续用 `plainFavName`(剥 🛏️ 前缀与「· 住宿」后缀;⚠️ TASK-14 踩坑:剥 emoji 必须用交替序列,禁字符类)。
+- 只读清单: `backend/app/static/index.html`(placeActsHtml/favItemHtml/favKidsHtml/bookRowHtml/bookSubTitle/bookLinksForStay/bookLinksForRoute/renderBookSection 段)、`backend/services/stays.py`(stay_city/stay payload 组装处 L843 附近)、`backend/app/api/stays.py`、`backend/app/api/collections.py`(_summary_of)、`backend/services/place_loader.py`(逆地理降级链)、`backend/test_frontend_routes.py`、`backend/test_collections.py`、`backend/test_stays*.py`。
+- 涉及: backend/app/api/stays.py(+city 键)、backend/services/stays.py(payload)、backend/app/api/collections.py(存量懒补 city,可挪 repository/service 层)、backend/app/static/index.html、backend/test_frontend_routes.py、backend/test_collections.py、backend/test_stays*.py
+- 验收: pytest 零回归(当前基线 **1376 passed**)+ 后端用例≥5(/api/stays 带 city 且既有键零变化、city 缺失=None 不炸、存量收藏懒补 city 写回 summary、逆地理失败不阻塞)+ 前端静态断言≥8(父行不再有外链、路线子行含高德+Google 且 URL 拼接正确含 mode 映射、住宿子行含三 OTA 且搜索词含 city+纯名、无 city 退化为纯名、全部 _blank/noopener)+ node --check;browser QA:收藏面板路线子行取消收藏旁见高德/Google 外链且 URL 坐标正确 → 住宿子行 OTA 链接搜索词=「城市+酒店名」→ **真开一次携程链接确认能搜到那家酒店**(昆山柏轩酒店为验收样例,它的高德 cityname=苏州市/昆山,注意县级市口径,搜「昆山」比「苏州市」更准——stay_city 若返回地级市,QA 时看实际效果再定是否用名称里的城市优先)→ 前往预订区块同步生效 → 取消收藏联动刷新 → 三 tab 零回归 → 0 JS error;测试收藏清理。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

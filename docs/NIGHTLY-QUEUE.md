@@ -875,7 +875,7 @@
 
 ## [TASK-15] 外链挪到路线/住宿子行「取消收藏」旁 + OTA 搜索词加城市
 
-- 状态: pending
+- 状态: done
 - 依赖: TASK-14(同区域改动,串行避免冲突)
 - 背景: 神朱 2026-10-08 对 TASK-14 的两点返工意见:①外链按钮放错了行——应放在**路线子行和住宿子行各自的「取消收藏」旁边**(交通路线旁=高德+Google Maps 外链,住宿旁=OTA 外链),而不是挂在目的地父行上;②住宿 OTA 链接只拿酒店名去搜,OTA 基本搜错地方或搜不到——搜索词应带**城市+酒店名**(如「昆山 昆山柏轩酒店」)。
 - 目标:
@@ -891,7 +891,14 @@
 - 只读清单: `backend/app/static/index.html`(placeActsHtml/favItemHtml/favKidsHtml/bookRowHtml/bookSubTitle/bookLinksForStay/bookLinksForRoute/renderBookSection 段)、`backend/services/stays.py`(stay_city/stay payload 组装处 L843 附近)、`backend/app/api/stays.py`、`backend/app/api/collections.py`(_summary_of)、`backend/services/place_loader.py`(逆地理降级链)、`backend/test_frontend_routes.py`、`backend/test_collections.py`、`backend/test_stays*.py`。
 - 涉及: backend/app/api/stays.py(+city 键)、backend/services/stays.py(payload)、backend/app/api/collections.py(存量懒补 city,可挪 repository/service 层)、backend/app/static/index.html、backend/test_frontend_routes.py、backend/test_collections.py、backend/test_stays*.py
 - 验收: pytest 零回归(当前基线 **1376 passed**)+ 后端用例≥5(/api/stays 带 city 且既有键零变化、city 缺失=None 不炸、存量收藏懒补 city 写回 summary、逆地理失败不阻塞)+ 前端静态断言≥8(父行不再有外链、路线子行含高德+Google 且 URL 拼接正确含 mode 映射、住宿子行含三 OTA 且搜索词含 city+纯名、无 city 退化为纯名、全部 _blank/noopener)+ node --check;browser QA:收藏面板路线子行取消收藏旁见高德/Google 外链且 URL 坐标正确 → 住宿子行 OTA 链接搜索词=「城市+酒店名」→ **真开一次携程链接确认能搜到那家酒店**(昆山柏轩酒店为验收样例,它的高德 cityname=苏州市/昆山,注意县级市口径,搜「昆山」比「苏州市」更准——stay_city 若返回地级市,QA 时看实际效果再定是否用名称里的城市优先)→ 前往预订区块同步生效 → 取消收藏联动刷新 → 三 tab 零回归 → 0 JS error;测试收藏清理。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-08 夜班,**执行器手写**,commit `747e5b8`)。
+  - ① 外链迁移:目的地父行 `placeActsHtml` 只留「取消收藏」;新增 `childActsHtml` —— 收藏树路线/住宿子行的 `.fp-acts` 动作排=「取消收藏」+外链组(路线=`uri.amap.com/navigation` 高德导航(自身 from/to 坐标+名称,driving→car、rail/flight→bus)+ Google Maps dir(origin/destination=自身坐标,driving→driving、其余→transit);无 from 坐标退化 to 点导航;全库外无坐标退化目的地搜索链;住宿=OTA 三渠道);前往预订 `.bk-row` 保持行尾外链布局,与收藏树子行同一 URL 构造函数(bookLinksForRoute/bookLinksForStay),两处一致;TASK-14 的 `bookLinksForPlaceRoute/bookLinksForPlaceStay` 随父行外链下线(12306/去哪儿按契约「路线=高德+Google Maps」口径移除)。
+  - ② 城市三层兜底:a) 后端 `/api/stays` items **只加一个 `city` 键**(用现成 `services/stays.stay_city()`,既有键零变化),前端收藏住宿时写进 `summary.city`(后端 `_summary_of` 原样收,零迁移);b) 存量收藏:`GET /api/collections` 里 `backfill_stay_cities()` 懒补齐——住宿指纹行(kid=place+住宿指纹)summary 缺 city 且有坐标 → `place_loader.reverse_with_fallback`(高德→Photon→Nominatim 降级链)反查城市(去尾「市」),**写回 summary 持久化**,进程内 TTL 缓存(成功 7 天/失败 1h,仿 OriginCache 口径),反查失败留空不阻塞响应(下次开面板再试);c) 都拿不到 → 前端退纯酒店名搜索。搜索词拼法:携程 `keyword=<city><纯名>`(连写)、Booking `ss=<city>+<纯名>`(空格)、Airbnb `/s/<city>--<纯名>/homes`。
+  - ③ **抓到并修复一个真 bug(验收时发现)**:携程搜索域 `so.ctrip.com` **已死**(公共 DNS 223.5.5.5/1.12.12.12 均 NXDOMAIN,与容器网络无关;`www.ctrip.com` 正常)——即 TASK-4b 以来所有携程外链对真实用户都打不开。换成实测可用的 `https://hotels.ctrip.com/hotels/list?keyword=`(curl 200、页面内 keyword=「昆山昆山柏轩酒店」正确带入;headless 下被携程风控跳登录页,真浏览器无此问题)。
+  - 验收样例(昆山柏轩酒店,县级市口径):其收藏行懒补齐反查得 **city=昆山**(比 stay_city 的 cityname=苏州市 更准,正是神朱提示的「搜昆山比苏州市准」);新收藏走 /api/stays city 键(stay_city 返回地级市「苏州」,契约指定用现成函数,未改其行为)——存量懒补齐路径恰好补上县级市精度。
+  - 测试:后端 +8 用例(test_stays_api 3 例:city 键来源 cityname/缺失=None 不炸/名称兜底+形状断言只加 city 键;test_collections 5 例:懒补写回+持久化后不再反查/有 city 与非住宿行零触网/失败留空不阻塞+既有 summary 键零变化/缓存去重) ;前端 test_frontend_routes +5 新断言函数(childActsHtml 子行动作排/路线外链自身坐标+mode 映射+库外退化/住宿搜索词含 city+无 city 退化/summary.city 快照/addFavStay payload 带 city)+ TASK-14 旧断言按返工口径改写(父行不再有外链、渠道断言更新)。pytest backend/ = **1386 passed**(1376 基线零回归;首跑 1 例 test_intro_backfill 真线程池偶发超时,复跑 2 次均过,与本任务无关)。node --check 通过。
+  - browser QA(真机,CDP chrome 又僵死按 skill 重启):收藏树 4 个父行动作排=仅「取消收藏」0 外链;7 条子行外链全对(路线=高德 navigation from/to 坐标+名称正确编码、Google dir origin/destination+travelmode 映射;住宿=携程/Booking/Airbnb 搜索词=城市+纯名,如「昆山昆山柏轩酒店(亭林园…)」);真开携程链接:hotels.ctrip.com 200 且 keyword 正确(风控跳登录页,见 ③);前往预订 4 组子行外链与收藏树一致、免责文案在、📄详情在;联动:POST QA 住宿收藏(id=15,city=昆山)→ fav 11→13、bookRows 7→8、子行三 OTA 链接搜索词含城市 → DELETE → 11/7 还原;三 tab(收藏/行程方案/AI 行程)零回归;Esc 关面板;全程 window.__errs **0** 条;测试收藏已清理(库回 11 条)。
+  - uvicorn :8000 已重启(带 /opt/data/.env);真机 curl:/api/stays 昆山坐标 189 行全带 city=苏州;/api/collections 存量 3 条住宿收藏懒补齐 city=昆山/上海/吉林 并持久化。
 
 ---
 

@@ -223,13 +223,20 @@ def select_places(
     band: Optional[str] = None,
     category: Optional[str] = None,
     missing_intro: bool = False,
+    only_ids: Optional[Iterable[Any]] = None,
     limit: Optional[int] = None,
 ) -> list[Place]:
     """按条件取 ``Place`` **ORM 行**(需要就地改字段时用这个,不是 :func:`list_places`)。
 
     ``missing_intro=True`` 只返回还没简介的行(LLM 简介按 POI 缓存的读侧)。
+    ``only_ids`` 给定就只在这些 id 里挑(TASK-16「按显示批次备齐」:前端只补
+    当前页可见的行;口径同 :func:`select_places_missing_detail`——传了空列表
+    就返回空,不退回全量)。
     排序按 (城市, band, id),保证批量回填的顺序稳定、可重复。
     """
+    wanted = [int(item) for item in (only_ids or []) if item is not None]
+    if only_ids is not None and not wanted:
+        return []
     stmt = select(Place)
     if origin_city:
         stmt = stmt.where(Place.origin_city == _clean_city(origin_city))
@@ -239,6 +246,8 @@ def select_places(
         stmt = stmt.where(Place.category == str(category))
     if missing_intro:
         stmt = stmt.where(_missing_intro_clause())
+    if wanted:
+        stmt = stmt.where(Place.id.in_(wanted))
     stmt = stmt.order_by(Place.origin_city, Place.band, Place.id)
     if limit:
         stmt = stmt.limit(max(1, int(limit)))

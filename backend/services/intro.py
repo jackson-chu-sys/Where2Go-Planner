@@ -390,12 +390,17 @@ def fill_missing_intros(
     band: Optional[str] = None,
     category: Optional[str] = None,
     limit: Optional[int] = None,
+    only_ids: Optional[Sequence[Any]] = None,
     client: Optional[LLMClient] = None,
     generator: Optional[IntroGenerator] = None,
     workers: int = DEFAULT_WORKERS,
     commit: bool = True,
 ) -> dict[str, Any]:
     """给库里**还没有简介**的 POI 批量补一句话简介(DB 即缓存,已有的不重复调用)。
+
+    ``only_ids`` 给定就只在这些 id 里补(TASK-16「按显示批次备齐」:前端只补
+    当前页显示的行,不再整段全量回填);口径同 details 的
+    :func:`services.details.fill_missing_details`。
 
     返回统计 ``{"scanned", "filled", "failed", "pending", "provider"}``;``failed`` 是
     降级成空简介的条数(网络/额度/格式问题),下次调用会自然重试。
@@ -407,6 +412,7 @@ def fill_missing_intros(
         band=band,
         category=category,
         missing_intro=True,
+        only_ids=only_ids,
         limit=limit,
     )
     llm = client if client is not None else default_client()

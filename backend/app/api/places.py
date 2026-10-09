@@ -139,6 +139,9 @@ DETAILS_NOTE = (
 )
 # 图片链路(TASK-8a1):一次最多 20 个 POI(详情弹窗按需拉,不做全量预热)
 MEDIA_BATCH_MAX = 20
+# TASK-16:「按显示批次备齐」——intros 一次最多补多少个 id(页大小 15,放宽到 40
+# 覆盖「本页 + 推荐置顶」两批同时落地的场景;口径同 details 的 MAX_BATCH)。
+INTROS_IDS_MAX = 40
 MEDIA_NOTE = (
     "目的地图片按 POI 缓存(DB 即缓存):读库优先,只有缓存缺失/过期才触网 —— "
     "高德 /place/text 的 POI 图为主(带坐标门控,同名异地误配当没查到),"
@@ -347,9 +350,15 @@ def fill_intros(
     band: Optional[str] = Query(None, description="距离分段 key,留空 = 该城市全部分段"),
     category: Optional[str] = Query(None, description="只补某个分类"),
     limit: Optional[int] = Query(None, ge=0, description="最多补多少条(0/留空 = 不限)"),
+    place_ids: Optional[str] = Query(None, description="只给这些 id 补(逗号分隔;TASK-16「按显示批次备齐」前端传当前页可见行)"),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """给已入库但缺简介的 POI 补 LLM 一句话简介(已有简介的不重复调用)。"""
+    """给已入库但缺简介的 POI 补 LLM 一句话简介(已有简介的不重复调用)。
+
+    TASK-16:``place_ids`` 给定就只在这些 id 里补(≤ :data:`INTROS_IDS_MAX`,
+    解析口径同 ``/places/details``);响应**只加** ``items``(这些 id 当前的
+    intro 文本,便于前端就地更新行,不用再拉一页 ``/places``),既有键零变化。
+    """
     city = _clean(origin)
     if not city:
         raise HTTPException(400, "起点城市不能为空")
@@ -359,6 +368,17 @@ def fill_intros(
     wanted_category = _clean(category)
     if wanted_category and not is_known_category(wanted_category):
         raise HTTPException(400, f"未知分类:{category}(可选:{'、'.join(category_keys())})")
+    raw_ids = _optional_text(place_ids)
+    wanted_ids: list[int] = []
+    if raw_ids is not None:
+        wanted_ids = [
+            int(chunk) for chunk in raw_ids.replace("，", ",").split(",")
+            if chunk.strip().lstrip("-").isdigit()
+        ]
+        if len(wanted_ids) > INTROS_IDS_MAX:
+            raise HTTPException(
+                400, f"place_ids 一次最多 {INTROS_IDS_MAX} 个,收到 {len(wanted_ids)} 个(请分批请求)"
+            )
 
     started = time.monotonic()
     stats = intro_service.fill_missing_intros(
@@ -367,12 +387,20 @@ def fill_intros(
         band=wanted_band,
         category=wanted_category,
         limit=(limit or None),
+        only_ids=(wanted_ids or None) if raw_ids is not None else None,
     )
+    items: Optional[list[dict[str, Any]]] = None
+    if raw_ids is not None:
+        rows = repo.select_places(session, only_ids=wanted_ids) if wanted_ids else []
+        items = [
+            {"id": int(row.id), "intro": row.intro or ""} for row in rows
+        ]
     return {
         "origin_city": city,
         "band": wanted_band,
         "category": wanted_category,
         **stats,
+        "items": items,
         "elapsed_s": round(time.monotonic() - started, 2),
         "note": INTROS_NOTE,
     }

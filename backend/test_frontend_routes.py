@@ -1696,8 +1696,10 @@ def test_place_modal_fetches_media_and_highlights_only_when_opened(html: str) ->
     assert "loadPlaceMedia(place.id,token)" in opener and "loadPlaceHighlights(place.id,token)" in opener
     assert opener.index("modalMediaLoadingHtml()") < opener.index("loadPlaceMedia(place.id,token)")
     assert opener.index("modalHighlightsLoadingHtml()") < opener.index("loadPlaceHighlights(place.id,token)")
+    assert "prepMedia(" in html[:html.index(MODAL_SECTION_START)], \
+        "TASK-16:弹窗段之前只允许**按页预热**(prepMedia,批 ≤20 落缓存);逐行渲染仍不得预拉图片"
     assert "loadPlaceMedia" not in html[:html.index(MODAL_SECTION_START)], \
-        "弹窗段之前(渲染 pin / 列表)不得预拉图片"
+        "弹窗段之前(渲染 pin / 列表)不得逐条拉图片(预热走 prepMedia 批量)"
     # token 守卫:关窗或换条目后,在飞的响应一律作废(media/highlights 的成功与失败分支各 2 处)
     assert section.count("token!==state.modal.token") == 4, "media/highlights 都要 token 守卫"
     assert f'MODAL_LOADING_TEXT="{MODAL_LOADING_TEXT}"' in html, "骨架态要有「加载中」文案"

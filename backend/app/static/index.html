@@ -1961,7 +1961,8 @@ function applyPlacesPage(data,append){
   state.page.rounds=Math.max(0,Math.round(num(data.fetch_rounds)||0));
   state.cached[state.band]=Object.values(data.counts_by_category||{})
     .reduce((sum,value)=>sum+value,0);
-  state.reco.pending=Math.max(0,Number(data.detail_pending)||0);
+  // TASK-16:pending 口径=**已显示行**的长介绍缺口数(不再报全库 detail_pending)
+  state.reco.pending=visibleDetailPending();
   renderBandOptions();
   if(!append){drawRings();fitRings();renderLegend(data.counts_by_category);}
   setStatus(placesStatusHtml(data));
@@ -2028,6 +2029,7 @@ async function loadPlaces(refresh){
     renderPinsByScope();
     renderPlaceList();
     syncMoreButton();
+    prepPageBatch(data.places,token);   // TASK-16:本页三件套(简介/长介绍/图片)自动备齐
     if(!(state.places||[]).length)
       showErr("该分段/分类下暂无已入库目的地,可换分段、换分类,或点「重新抓取」。");
     loadRecommend(false);   // 功能2:AI 推荐异步补(不 await,首屏不等它;失败只落 #recoMsg)
@@ -2058,6 +2060,7 @@ async function loadMorePlaces(){
     const added=applyPlacesPage(data,true).added;
     drawMorePins(added);
     renderPlaceList();
+    prepPageBatch(added,token);   // TASK-16:新一页三件套自动备齐
     setListMsg(added.length
       ? ("已加载 "+added.length+" 条 · 现共显示 "+(state.places||[]).length+" / 库内 "+
          state.page.total+" 条"+(state.page.hasMore?"":" · 到底了,没有更多了"))
@@ -2083,30 +2086,114 @@ function sourceNote(data){
     (counts["OSM"]?(" · 存量 OSM "+counts["OSM"]+" 条"):"");
 }
 
-// 简介进度:抓取路径会带回本次 LLM 生成统计;读库路径只报还缺多少条
+// 简介进度(TASK-16:口径=**本页已显示行**的缺口,不再报全库 intro_pending)
 function introNote(data){
   const stats=data.intro_stats;
-  if(stats) return " · 简介:新增 <b>"+stats.filled+"</b> 条 / 降级 "+stats.failed+" 条 · 仍缺 "+data.intro_pending+" 条";
-  return (data.intro_pending>0)?(" · 待补简介 <b>"+data.intro_pending+"</b> 条(点「补简介」)"):"";
+  if(stats) return " · 简介:新增 <b>"+stats.filled+"</b> 条 / 降级 "+stats.failed+" 条";
+  const missing=missingIntroIds(PREP_INTRO_MAX).length;
+  return (missing>0)?(" · 本页待补简介 <b>"+missing+"</b> 条(自动补齐中,可点「补简介」)"):"";
 }
 
-// 补简介:给该分段还没有 intro 的 POI 调 LLM(DB 即缓存,已有的不重复调用)
+// --------------------------------------------------------------------------- //
+// TASK-16「按显示批次备齐」:每页落地(首屏/加载更多)后,自动把**当前已显示行**的
+// 三件套备好——①缺简介的行调 /api/places/intros?place_ids=…(就地写回 state,
+// popup 点开即有);②缺长介绍的行沿用既有 loadDetails 分批(pendingDetailIds 本就
+// 只取已显示行);③本页 id 预热 /api/places/media(读库优先、落 PlaceMedia 缓存,
+// 详情弹窗打开即秒出)。全部 fire-and-forget:失败静默(既有手动按钮兜底),不阻塞 UI。
+// 库内**未显示**的行不再被生成(全量续批已下线,pending 口径=已显示行缺口数)。
+// --------------------------------------------------------------------------- //
+const PREP_INTRO_MAX=40;   // 与后端 INTROS_IDS_MAX 同口径
+const PREP_MEDIA_MAX=20;   // 与后端 MEDIA_BATCH_MAX 同口径(页 15 条正好一批)
+// 当前已显示行里还缺 intro 的 id(推荐置顶在前)
+function missingIntroIds(limit){
+  const size=Math.max(1,Math.min(PREP_INTRO_MAX,Math.round(num(limit)||PREP_INTRO_MAX)));
+  const rows=listSplit();
+  const wanted=[];
+  rows.reco.concat(rows.other).forEach(place=>{
+    if(wanted.length>=size) return;
+    const id=Number(place&&place.id);
+    if(!isFinite(id)||id<=0) return;
+    if(String((place&&place.intro)||"").trim()) return;
+    wanted.push(id);
+  });
+  return wanted;
+}
+// 已显示行里还缺长介绍的条数(pending 展示口径,TASK-16:不再报全库 detail_pending)
+function visibleDetailPending(){
+  const rows=listSplit();
+  return rows.reco.concat(rows.other).filter(place=>!detailTextOf(place)).length;
+}
+// ① 简介:只给这些 id 调 intros,响应 items 就地写回 state.places(不整页重拉)
+async function prepIntros(ids,token){
+  if(!state.origin||!ids.length) return;
+  const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),
+    place_ids:ids.join(",")});
+  if(state.category) params.set("category",String(state.category));
+  try{
+    const data=await getJSON("/api/places/intros?"+params.toString());
+    if(token!==undefined&&token!==state.page.token) return;   // 换段/换页:作废
+    ((data&&data.items)||[]).forEach(entry=>{
+      const id=Number(entry&&entry.id);
+      const text=String((entry&&entry.intro)||"");
+      if(!isFinite(id)||!text) return;
+      (state.places||[]).forEach(row=>{
+        if(row&&Number(row.id)===id&&!String(row.intro||"").trim()) row.intro=text;
+      });
+    });
+  }catch(error){/* 静默:「补简介」按钮兜底 */}
+}
+// ③ 图片预热:本页 id 一批(≤20),读库优先、miss 才触网;结果落 PlaceMedia 缓存,
+//    详情弹窗打开时图片直接命中缓存(秒出)。失败静默,弹窗内自有降级文案。
+async function prepMedia(ids){
+  const wanted=(ids||[]).map(value=>Number(value))
+    .filter(value=>isFinite(value)&&value>0).slice(0,PREP_MEDIA_MAX);
+  if(!wanted.length) return;
+  try{
+    await getJSON("/api/places/media?place_ids="+wanted.join(","));
+  }catch(error){/* 静默 */}
+}
+// 每页落地后的三件套总入口:rows=本页新落地的行(首屏=整页,加载更多=新增行)
+function prepPageBatch(rows,token){
+  const list=(rows||[]).filter(row=>!!row);
+  if(!list.length) return;
+  prepIntros(missingIntroIds(PREP_INTRO_MAX),token);
+  prepMedia(list.map(row=>row.id));
+  // ② 长介绍:沿用既有分批机制(busy/auto 守卫在 loadDetails 内),只补已显示行缺口
+  if(state.reco.auto&&!state.reco.busy){
+    const ids=pendingDetailIds(DETAIL_BATCH);
+    if(ids.length) loadDetails(DETAIL_BATCH,ids);
+  }
+}
+
+// 补简介(TASK-16:只补**当前已显示**的行,带 place_ids;不再整段全量)
 async function fillIntros(){
   if(!state.origin) return;
+  const ids=missingIntroIds(PREP_INTRO_MAX);
+  if(!ids.length){
+    setStatus("当前显示的目的地都已有简介(加载更多后会自动补新一页)。");
+    return;
+  }
   showErr("");setBusy(true);
-  setStatus("正在调 LLM 补缺失简介(最多 "+INTRO_LIMIT+" 条,已有简介的跳过)…");
-  const params=new URLSearchParams({origin:state.origin.city,band:state.band,limit:String(INTRO_LIMIT)});
+  setStatus("正在给本页 "+ids.length+" 条缺简介的目的地调 LLM(已有的跳过)…");
+  const params=new URLSearchParams({origin:state.origin.city,band:state.band,
+    limit:String(INTRO_LIMIT),place_ids:ids.join(",")});
   if(state.category) params.set("category",state.category);
   try{
     const data=await getJSON("/api/places/intros?"+params.toString());
+    ((data&&data.items)||[]).forEach(entry=>{
+      const id=Number(entry&&entry.id);
+      const text=String((entry&&entry.intro)||"");
+      if(!isFinite(id)||!text) return;
+      (state.places||[]).forEach(row=>{
+        if(row&&Number(row.id)===id&&!String(row.intro||"").trim()) row.intro=text;
+      });
+    });
     const summary="简介:生成 <b>"+data.filled+"</b> 条 · 降级 "+data.failed+
-      " 条 · 仍缺 "+data.pending+" 条 · "+esc(data.provider||"LLM")+" · 耗时 "+data.elapsed_s+"s";
-    if(data.filled>0){await loadPlaces(false);setStatus($("status").innerHTML+" · "+summary);}
-    else{
-      setStatus(summary);
-      showErr(data.scanned===0?"该分段没有缺简介的 POI(或 LLM 未配置 key)。"
+      " 条 · "+esc(data.provider||"LLM")+" · 耗时 "+data.elapsed_s+"s";
+    setStatus($("status").innerHTML+" · "+summary);
+    if(data.filled<=0)
+      showErr(data.scanned===0?"本页没有缺简介的目的地(或 LLM 未配置 key)。"
         :"本次没有拿到新简介(LLM 调用降级),可稍后再点「补简介」重试。");
-    }
   }catch(error){
     showErr("补简介失败:"+error.message);setStatus("补简介失败");
   }finally{setBusy(false);}
@@ -2370,9 +2457,8 @@ function applyDetails(payload){
     const text=(entry&&entry.text)?String(entry.text):"";
     if(text) state.reco.details[Number(entry.place_id)]=text;
   });
-  if(payload&&payload.pending!==undefined&&payload.pending!==null){
-    state.reco.pending=Math.max(0,Number(payload.pending)||0);
-  }
+  // TASK-16:pending 展示口径=已显示行缺口(后端 payload.pending 是全库数,不再透出)
+  state.reco.pending=visibleDetailPending();
   updateDetailCells(items);
   renderListSub();
   const filled=Number((payload&&payload.filled)||0);
@@ -2477,7 +2563,8 @@ function applyRecoData(payload){
     if(text) state.reco.details[Number(place.id)]=text;   // 推荐响应已带回的长介绍直接用
   });
   if(payload&&payload.detail_pending!==undefined&&payload.detail_pending!==null){
-    state.reco.pending=Math.max(0,Number(payload.detail_pending)||0);
+    // TASK-16:展示口径用已显示行缺口(后端全库 pending 不再透出给用户)
+    state.reco.pending=visibleDetailPending();
   }
   renderPinsByScope();
   renderPlaceList();

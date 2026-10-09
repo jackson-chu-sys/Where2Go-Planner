@@ -123,7 +123,9 @@ RING_PAGE_SLACK = 1
 METERS_PER_DEGREE = 111_320.0
 MIN_COS_LAT = 0.05
 # 交互式抓取时一次最多补多少条简介(全量回填走 ``python -m services.intro``)
-INTRO_BATCH_LIMIT = 40
+# TASK-16:40→30 = 页大小(15)×2——「按显示批次备齐」口径下后台回填只垫当前页
+# 与下一页的量,整段全量交给前端按页触发的 place_ids 精准补齐。
+INTRO_BATCH_LIMIT = 30
 # ``SegmentFetch.source`` / API 的 ``source`` 字段:TASK-9b 起抓取来源是 "amap"(§6.7)
 SOURCE_AMAP = "amap"
 SOURCE_DB = "db"

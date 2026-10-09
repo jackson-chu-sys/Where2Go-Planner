@@ -904,7 +904,7 @@
 
 ## [TASK-16] 简介/详情/图片改「按显示批次备齐」:只把已显示的 15 条做全,不再整批全量回填(神朱 2026-10-09 拍板)
 
-- 状态: pending
+- 状态: done
 - 背景: 神朱 2026-10-09 反馈:目的地生成简介还是「一批出来后全量生成所有介绍」,先显示的目的地反而没介绍、要等。拍板口径=**只把已经显示出来的目的地做全**(简介 intro/长介绍 detail/图片 media 都备好),延用「显示一批、预加载一批」,每批显示即触发该批备齐,不用等就能直接看。
 - 现状(写码前已核实):intro=整段异步后台回填(start_backfill,最多 40 条/轮);detail=前端自动续批直到该段 pending=0(全量);media=打开弹窗才拉。→ LLM 花费烧在没显示的行上,而显示中的行反而排在后面。
 - 目标(执行器手写,不派 Codex):
@@ -914,7 +914,12 @@
   ④ 状态栏/列表副标题的「还剩 N 条待生成」口径同步改为「本页已显示行」的缺口数,不再报全库 pending。
 - 涉及: backend/app/api/places.py(intros 端点)、backend/services/intro.py(fill_missing_intros 加 only_ids)、backend/services/place_loader.py(回填 limit)、backend/app/static/index.html、backend/test_*.py
 - 验收: pytest 零回归(基线 1386)+ 新增用例(intros place_ids 过滤/≤40 上限/detail pending 口径);真机 QA:换城市冷抓 → 首屏 15 条骨架秒出 → ≤90s 内本页 15 条 intro+detail 全齐、点任意行弹窗图片秒出(缓存命中)→「加载更多」下一页同样自动备齐 → **库内未显示行的 intro/detail 不再被生成**(抽查 detail_pending 全库数不降);0 JS error。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-09 夜班,执行器手写,commit `6bf314c`)。
+  - 后端:`GET /api/places/intros` 加 `place_ids`(逗号分隔、≤INTROS_IDS_MAX=40、解析口径同 details 端点;响应**只加** `items` 键=这些 id 的当前 intro 文本,既有键零变化);`repo.select_places` 加 `only_ids`(空列表=什么都不补,绝不退回全量);`intro.fill_missing_intros` 加 `only_ids` 透传;`INTRO_BATCH_LIMIT` 40→30(=页大小×2,后台回填只垫当前页与下一页的量)。
+  - 前端:每页落地(loadPlaces 首屏 + loadMorePlaces 加载更多)自动 `prepPageBatch(rows)` 三件套——①`prepIntros` 本页缺简介行(≤40)调 intros?place_ids=,items 就地写回 state.places(不整页重拉);②长介绍沿用 loadDetails 分批(pendingDetailIds 本就只取已显示行);③`prepMedia` 本页 id(≤20=MEDIA_BATCH_MAX)预热 /api/places/media 落 PlaceMedia 缓存,弹窗打开秒出。**全量自动续批下线**:state.reco.pending 三处(applyPlacesPage/applyRecoData/applyDetails)全改为 `visibleDetailPending()`(已显示行缺口数),状态栏 introNote 同口径(「本页待补简介 N 条」);「补简介」按钮只补当前显示行(missingIntroIds+place_ids)。
+  - 测试:新增 test_intros_page_batch.py **9 用例**(only_ids 过滤/空列表不退回全量/未点名行 0 LLM 调用/intros place_ids+items/既有键零变化 LEGACY_INTROS_KEYS/不带 place_ids 旧形状 items=None/超 40 上限 400/前端函数面与接线/pending 口径)+ test_place_modal_fetches 断言按预热口径改写(prepMedia 批量预热允许、loadPlaceMedia 逐条仍禁)。pytest backend/ = **1395 passed**(1386 基线零回归 + 9 新增,78s)。
+  - 真机验证(uvicorn 重启,curl+browser QA):南京 0_50 冷抓 3.4s 秒回 15 条(intro 0 条)→ intros place_ids=15 个 id:55s 生成 **15/15**、items 全带文本 → details place_ids 10 条:47s 生成 **10/10** → media 15 id 预热 14.8s(9 amap/4 mixed/1 wikimedia/1 no_data、43 张图)→ 二次 media **cached=true 0.011s**(弹窗秒出) → browser:上海 0_50 全新段,首屏骨架秒出 → 自动续批只在已显示行内补(17/17 长介绍齐)→ 点行开弹窗图片 5 张(source=mixed)→「加载更多」新一页 17→32 条自动备齐(32/32 detail、intro 31/32)→ **未显示行不再被生成**(全库 detail_pending 从 26 只降到与显示行数吻合)→ 全程 window.__errs **0** 条。
+  - 备注:后台 start_backfill(≤30 条)仍会在冷抓时垫一轮,与前端按页补齐同库缓存、天然幂等不冲突;LLM 高峰时单批 details 47-55s,intro+detail 双批并行时页面首屏不受影响(全异步)。
 
 ---
 
@@ -932,11 +937,14 @@
 
 ## [TASK-18] 移除「🎫 前往预订」区块(与收藏树子行外链功能重叠,神朱 2026-10-09 拍板)
 
-- 状态: pending
+- 状态: done
 - 目标: 仅前端。删除收藏弹层里的「🎫 前往预订」区块(renderBookSection/groupBookByPlace/bookRowHtml/bookSubTitle 及其 DOM、样式、调用点);**保留** bookLinksForRoute/bookLinksForStay(收藏树子行外链仍在用)与 TASK-13 的「📄 详情」入口;免责声明随区块一并移除(子行外链本身不带免责文案则无需补)。test_frontend_routes.py 里前往预订相关断言改删,收藏树子行外链断言保留。
 - 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
 - 验收: pytest 零回归(删断言后总数下降属预期,注明);node --check;browser QA:收藏面板只剩「我的收藏/行程方案/AI 行程」内容、目的地/路线/住宿子行外链正常、无前往预订残留 DOM、0 JS error。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-09 夜班,执行器手写,commit `d49ade6`)。
+  - index.html(-约130行,仅前端):favBookSection/favBookList DOM、bk-* 全套 CSS、renderBookSection/groupBookByPlace/bookRowHtml/bookSubTitle/bookPlaceGroupHtml/BOOK_DISCLAIMER/todayCST(12306 时代遗留,已无引用)、#favBookList .js-book-detail 事件委托分支一并下线;refreshFavItems 不再调 renderBookSection;**保留** bookLinksForRoute/bookLinksForStay/bookLinksHtml/splitRouteNames/cleanStayName/plainFavName/childActsHtml(收藏树子行外链在用)与 TASK-13「📄 详情」入口。
+  - test_frontend_routes.py:TASK-4b 段 5 个测试改为 test_book_section_removed(12 个 token 全仓 0 残留断言)+ test_book_link_builders_kept_for_fav_tree;TASK-14 段 7 个区块专属测试删除/改写为子行外链断言(新页打开+noopener、无前端 key);PLAN_SECTION_END/book_section 切片标记同步改。pytest backend/ = **1387 passed**(1395−8 区块专属断言,符合预期;node --check 通过)。
+  - browser QA:开收藏面板 → favBookSection/favBookList 均不存在、页面文本 0 处「前往预订」(仅 JS 注释)→ 收藏树 11 条目正常、子行外链 17 个照常渲染 → 全程 window.__errs **0** 条。
 
 ---
 

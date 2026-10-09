@@ -902,6 +902,44 @@
 
 ---
 
+## [TASK-16] 简介/详情/图片改「按显示批次备齐」:只把已显示的 15 条做全,不再整批全量回填(神朱 2026-10-09 拍板)
+
+- 状态: pending
+- 背景: 神朱 2026-10-09 反馈:目的地生成简介还是「一批出来后全量生成所有介绍」,先显示的目的地反而没介绍、要等。拍板口径=**只把已经显示出来的目的地做全**(简介 intro/长介绍 detail/图片 media 都备好),延用「显示一批、预加载一批」,每批显示即触发该批备齐,不用等就能直接看。
+- 现状(写码前已核实):intro=整段异步后台回填(start_backfill,最多 40 条/轮);detail=前端自动续批直到该段 pending=0(全量);media=打开弹窗才拉。→ LLM 花费烧在没显示的行上,而显示中的行反而排在后面。
+- 目标(执行器手写,不派 Codex):
+  ① 后端 `GET /api/places/intros` 加 `place_ids` 参数(逗号分隔,≤40,复用 details 端点的解析口径;`fill_missing_intros` 加 `only_ids` 透传 `repo.select_places(missing_intro=True, only_ids=…)`),既有键零变化;
+  ② 前端:**删掉「全量自动续批」**——detail 续批上限改为「当前已显示行里还缺文本的条数」(pendingDetailIds 已按显示行取 id,只需把 pending 口径从后端全量 detail_pending 改为前端已显示行的缺口数);「补简介」按钮与每页落地(applyPlacesPage 后)自动触发**本页三件套预加载**:`intros?place_ids=本页缺简介的 id` + `details?place_ids=本页缺长介绍的 id`(自动续批只在本页范围内)+ `media?place_ids=本页 id`(batch ≤20 正好覆盖 15 条,读库优先、落 PlaceMedia 缓存,弹窗打开即秒出);
+  ③ intro 后台全量回填(start_backfill)收窄:load_segment 异步回填只对**本页/本轮已入库且将被显示**的行没意义——保留后台回填但把 limit 收到 ≤ 页大小×2(30),不再整段 40+;「补简介」按钮改为只补当前显示行(带 place_ids);
+  ④ 状态栏/列表副标题的「还剩 N 条待生成」口径同步改为「本页已显示行」的缺口数,不再报全库 pending。
+- 涉及: backend/app/api/places.py(intros 端点)、backend/services/intro.py(fill_missing_intros 加 only_ids)、backend/services/place_loader.py(回填 limit)、backend/app/static/index.html、backend/test_*.py
+- 验收: pytest 零回归(基线 1386)+ 新增用例(intros place_ids 过滤/≤40 上限/detail pending 口径);真机 QA:换城市冷抓 → 首屏 15 条骨架秒出 → ≤90s 内本页 15 条 intro+detail 全齐、点任意行弹窗图片秒出(缓存命中)→「加载更多」下一页同样自动备齐 → **库内未显示行的 intro/detail 不再被生成**(抽查 detail_pending 全库数不降);0 JS error。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-17] 住宿外链修复:城市传 OTA 原生城市字段,不再拼进搜索词(神朱 2026-10-09 拍板)
+
+- 状态: pending
+- 依赖: 调研子任务产出 docs/research-ota-wechat-2026-10-09.md §A(三家 OTA 城市参数体系)
+- 背景: 神朱 2026-10-09:TASK-15 把城市拼进搜索词(如「昆山昆山柏轩酒店」)实测多例 OTA 搜不到。应把城市传给 OTA 的**城市字段**(携程 city 代码 / Booking dest_id+dest_type / Airbnb slug),搜索词只留酒店纯名。
+- 目标: 按调研结论改 `bookLinksForStay`(收藏树住宿子行 + 其余复用点):城市名→OTA 城市标识的映射(优先用调研确认的免维护拼法;必须建映射表时,表放前端 JS 常量或后端纯函数+单测,覆盖收藏里出现过的城市并给「映射不到→退回现状搜索词拼法」兜底,不丢链接);携程换回带 city 参数的列表页 URL;搜索词=酒店纯名(plainFavName,禁字符类剥 emoji)。
+- 涉及: backend/app/static/index.html(bookLinksForStay 及调用点)、backend/test_frontend_routes.py(静态断言改口径)
+- 验收: pytest 零回归;静态断言:三家 URL 含城市字段、搜索词不含城市前缀、映射不到时兜底旧拼法;browser QA:真开昆山柏轩酒店(样例)三家外链,携程/Booking 出正确酒店结果(截图 URL 佐证),0 JS error。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-18] 移除「🎫 前往预订」区块(与收藏树子行外链功能重叠,神朱 2026-10-09 拍板)
+
+- 状态: pending
+- 目标: 仅前端。删除收藏弹层里的「🎫 前往预订」区块(renderBookSection/groupBookByPlace/bookRowHtml/bookSubTitle 及其 DOM、样式、调用点);**保留** bookLinksForRoute/bookLinksForStay(收藏树子行外链仍在用)与 TASK-13 的「📄 详情」入口;免责声明随区块一并移除(子行外链本身不带免责文案则无需补)。test_frontend_routes.py 里前往预订相关断言改删,收藏树子行外链断言保留。
+- 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py
+- 验收: pytest 零回归(删断言后总数下降属预期,注明);node --check;browser QA:收藏面板只剩「我的收藏/行程方案/AI 行程」内容、目的地/路线/住宿子行外链正常、无前往预订残留 DOM、0 JS error。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

@@ -3353,9 +3353,17 @@ function bookLinksForRoute(item){
     {label:"🌐 Google 地图",cls:"alt",
     url:"https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(target)}];
 }
-// TASK-15:住宿 OTA 外链搜索词=「城市 + 酒店纯名」(只拿酒店名 OTA 基本搜错地方)。
-// 城市三层兜底:a) 新收藏 summary.city(/api/stays 的 city 键快照)→ b) 存量收藏由后端
-// GET /api/collections 懒补齐写回 summary.city → c) 都拿不到退回纯酒店名(不比现状差)。
+// TASK-17(神朱 10/9):城市传 OTA **原生城市字段**,不再拼进搜索词(实测经常搜不到)。
+// 携程三级(调研 docs/research-ota-wechat-2026-10-09.md §A1,后端懒补齐 summary):
+//   ① ctrip_hotel_id → /hotels/detail/?hotelId=(实测最可靠,免登录免日期直达详情页);
+//   ② 只有 ctrip_city_id → /hotels/list?cityId=&searchWord=&directSearch=1&old=1
+//     (old=1 是命中开关;searchWord 只放酒店纯名,城市走 cityId 原生字段);
+//   ③ 都没有 → 退回 TASK-15 的 keyword 搜索词拼法(不丢链接)。
+// Booking:ss=「酒店纯名,城市名」(§A2:服务端意图解析,酒店名在前命中更准;
+//   dest_id 需维护地级市映射表,暂不建,ss 已可出正确结果)。
+// Airbnb:/s/<城市>--China/homes(§A3:slug 宽容解析、中文可用;境内房源已停,
+//   保留入口只为境外目的地场景,不额外标注)。
+// 城市来源三层兜底不变:a) /api/stays city 键快照 → b) 后端懒补齐 → c) 无城市退化。
 function stayCityOf(item){
   const summary=(item&&item.summary)||{};
   return String(summary.city||"").trim();
@@ -3363,13 +3371,27 @@ function stayCityOf(item){
 function bookLinksForStay(item){
   const name=plainFavName(item.name);
   const city=stayCityOf(item);
-  const kw=encodeURIComponent(city?(city+name):name);
-  const ss=encodeURIComponent(city?(city+" "+name):name);
-  const ab=encodeURIComponent(city?(city+"--"+name):name);
-  // ⚠️ 携程搜索域 so.ctrip.com 已死(2026-10-08 实测公共 DNS NXDOMAIN),
-  // 换酒店搜索列表页 hotels.ctrip.com/hotels/list?keyword=(实测 200、keyword 正确带入)。
-  return [{label:"🏨 携程",cls:"",url:"https://hotels.ctrip.com/hotels/list?keyword="+kw},
-    {label:"🏨 Booking",cls:"alt",url:"https://www.booking.com/searchresults.zh-cn.html?ss="+ss},
+  const summary=(item&&item.summary)||{};
+  const hotelId=String(summary.ctrip_hotel_id||"").trim();
+  const cityId=Number(summary.ctrip_city_id)||0;
+  let ctripUrl;
+  if(hotelId){
+    ctripUrl="https://hotels.ctrip.com/hotels/detail/?hotelId="+encodeURIComponent(hotelId);
+  }else if(cityId>0){
+    ctripUrl="https://hotels.ctrip.com/hotels/list?cityId="+cityId+
+      "&searchWord="+encodeURIComponent(name)+"&directSearch=1&old=1";
+  }else{
+    // 兜底(TASK-15 旧拼法):后端 suggest 解析失败时不丢链接;
+    // 名字已含城市前缀不重复拼(「吉林冬日光辉…」别再拼成「吉林吉林…」)
+    const kw=encodeURIComponent(city?(name.startsWith(city)?name:(city+name)):name);
+    ctripUrl="https://hotels.ctrip.com/hotels/list?keyword="+kw;
+  }
+  const ss=encodeURIComponent(city?(name+","+city):name);
+  const ab=city?(encodeURIComponent(city)+"--China"):encodeURIComponent(name);
+  return [{label:"🏨 携程",cls:"",url:ctripUrl},
+    {label:"🏨 Booking",cls:"alt",
+     url:"https://www.booking.com/searchresults.zh-cn.html?ss="+ss+
+         "&group_adults=2&group_children=0&no_rooms=1"},
     {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+ab+"/homes"}];
 }
 // TASK-14:收藏条目名去装饰前缀/后缀(「📍 松花湖滑雪场 · 目的地」→「松花湖滑雪场」),

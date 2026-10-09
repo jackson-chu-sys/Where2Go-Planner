@@ -2721,13 +2721,19 @@ def test_task15_route_links_use_own_coordinates(html: str) -> None:
 
 
 def test_task15_stay_links_keyword_has_city(html: str) -> None:
-    """TASK-15:住宿 OTA 搜索词=城市+酒店纯名;无 city 退化纯名(不比现状差)。"""
+    """TASK-17:城市传 OTA 原生城市字段;携程三级(hotelId→cityId→搜索词兜底)。"""
     fn = html[html.index("function bookLinksForStay"):]
     fn = fn[:fn.index("function plainFavName")]
     assert "stayCityOf" in fn and "plainFavName" in fn
-    assert "city+name" in fn or "city + name" in fn.replace(" ", " "), "搜索词拼城市+纯名"
-    assert "hotels.ctrip.com/hotels/list?keyword=" in fn and "searchresults.zh-cn.html?ss=" in fn \
-        and "/homes" in fn, "三渠道 URL 模板在"
+    # 携程:①detail 页 hotelId ②list 页 cityId+searchWord+old=1 ③keyword 兜底
+    assert "hotels.ctrip.com/hotels/detail/?hotelId=" in fn, "首选携程详情页(hotelId)"
+    assert "cityId=" in fn and "searchWord=" in fn and "directSearch=1" in fn and "old=1" in fn, \
+        "次选列表页:城市走原生 cityId 字段,searchWord 只放酒店纯名"
+    assert "hotels.ctrip.com/hotels/list?keyword=" in fn, "解析失败退回搜索词兜底(不丢链接)"
+    assert "summary.ctrip_hotel_id" in fn and "summary.ctrip_city_id" in fn, \
+        "携程标识来自后端懒补齐的收藏快照"
+    # Booking/Airbnb 三渠道 URL 模板仍在
+    assert "searchresults.zh-cn.html?ss=" in fn and "/homes" in fn, "三渠道 URL 模板在"
     city_fn = html[html.index("function stayCityOf"):]
     city_fn = city_fn[:city_fn.index("\n}\n")]
     assert "summary.city" in city_fn, "城市来自收藏快照 summary.city"

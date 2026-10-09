@@ -1119,10 +1119,23 @@ def test_api_list_collections_existing_keys_unchanged(session) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_city_cache():
-    """每个用例前清空 city 懒补齐的进程内缓存,避免串味。"""
+    """每个用例前清空 city/ctrip 懒补齐的进程内缓存,避免串味。"""
+    from services import ota_links
     collections_api._city_cache.clear()
+    ota_links._cache.clear()
     yield
     collections_api._city_cache.clear()
+    ota_links._cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _stub_ctrip_suggest(monkeypatch):
+    """默认把携程 suggest 换成「解析不到」(懒补齐留空路径);要测解析成功的用例自行覆盖。
+
+    没有这个 stub,TASK-17 懒补齐会让既有 list_collections 用例真打 m.ctrip.com。
+    """
+    from services import ota_links
+    monkeypatch.setattr(ota_links.ctrip, "suggest_hotel", lambda *args, **kwargs: None)
 
 
 def _stay_kwargs(name="🛏️ 昆山柏轩酒店 · 住宿", summary=None):

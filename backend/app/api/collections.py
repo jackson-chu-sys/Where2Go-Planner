@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 from db import models
 from db import repository as repo
 from db.base import get_session
+from services import ota_links
 from services import place_loader
 from services import routes as route_service
 
@@ -413,7 +414,12 @@ def list_collections(
         raise HTTPException(400, str(exc)) from exc
     # TASK-15:存量住宿收藏懒补 summary.city(逆地理一次、进程内 TTL 缓存;
     # 失败留空不阻塞——补完后 items 里的 summary 即含新 city,持久化写回)
-    if backfill_stay_cities(session):
+    # TASK-17:住宿收藏再懒补携程原生标识(触网逻辑在 services.ota_links,本模块
+    # 不 import data_sources——架构护栏)。两次补齐都跑完再重读(不能用 or 短路:
+    # city 补齐成功会让 ctrip 补齐漏掉本轮;ctrip 解析词=city+酒店名,city 先行)。
+    cities_updated = backfill_stay_cities(session)
+    ctrip_updated = ota_links.backfill_stay_ctrip_ids(session)
+    if cities_updated or ctrip_updated:
         items = repo.list_collections(
             session, kind=wanted_kind, cat_id=resolved_cat, limit=resolved_limit
         )

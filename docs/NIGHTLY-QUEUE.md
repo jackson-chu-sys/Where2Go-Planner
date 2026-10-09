@@ -925,13 +925,18 @@
 
 ## [TASK-17] 住宿外链修复:城市传 OTA 原生城市字段,不再拼进搜索词(神朱 2026-10-09 拍板)
 
-- 状态: pending
+- 状态: done
 - 依赖: 调研子任务产出 docs/research-ota-wechat-2026-10-09.md §A(三家 OTA 城市参数体系)
 - 背景: 神朱 2026-10-09:TASK-15 把城市拼进搜索词(如「昆山昆山柏轩酒店」)实测多例 OTA 搜不到。应把城市传给 OTA 的**城市字段**(携程 city 代码 / Booking dest_id+dest_type / Airbnb slug),搜索词只留酒店纯名。
 - 目标: 按调研结论改 `bookLinksForStay`(收藏树住宿子行 + 其余复用点):城市名→OTA 城市标识的映射(优先用调研确认的免维护拼法;必须建映射表时,表放前端 JS 常量或后端纯函数+单测,覆盖收藏里出现过的城市并给「映射不到→退回现状搜索词拼法」兜底,不丢链接);携程换回带 city 参数的列表页 URL;搜索词=酒店纯名(plainFavName,禁字符类剥 emoji)。
 - 涉及: backend/app/static/index.html(bookLinksForStay 及调用点)、backend/test_frontend_routes.py(静态断言改口径)
 - 验收: pytest 零回归;静态断言:三家 URL 含城市字段、搜索词不含城市前缀、映射不到时兜底旧拼法;browser QA:真开昆山柏轩酒店(样例)三家外链,携程/Booking 出正确酒店结果(截图 URL 佐证),0 JS error。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-09 夜班,执行器手写,commit `5ab0b0c`;按调研报告 §A 结论实施,**不维护静态城市映射表**)。
+  - 后端:新 `data_sources/ctrip.py`(携程**公开免鉴权 suggest 接口** `m.ctrip.com/restapi/soa2/21881/json/gaHotelSearchEngine` 解析 hotelId/cityId/cityName;POST+0.5s 节流+直连代理口径;坏结构/HTTP 错/空结果一律 None 不抛;坐标消歧+城市名消歧兜底——实测 gdLat/gdLon 常为 0);新 `services/ota_links.py`(懒补齐 `backfill_stay_ctrip_ids`:写回 `summary.ctrip_hotel_id/ctrip_city_id/ctrip_city_name` 持久化、已有标识零网络、失败负缓存 1h、每请求限批 5 条;**两级关键词**:「城市+酒店名」失败退「纯酒店名」——实测「上海上海冰雪世界皇冠假日」重复前缀解析不到、纯名命中;plain_stay_name 剥 emoji 用交替序列);`GET /api/collections` 接线(city 补齐在前、ctrip 在后,不 or 短路;触网逻辑放 services 层——collections API 有「不 import data_sources」架构护栏,首版直接加在 API 被护栏用例抓住后迁移)。
+  - 前端 bookLinksForStay 携程三级:①`ctrip_hotel_id` → **`hotels.ctrip.com/hotels/detail/?hotelId=`**(调研实测最可靠,免登录免日期直达详情页);②只有 `ctrip_city_id` → `hotels/list?cityId=&searchWord=&directSearch=1&old=1`(old=1 是命中开关,searchWord 只放纯名,城市走原生 cityId);③解析失败 → keyword 兜底(不丢链接,且名字已含城市前缀不再重复拼「吉林吉林…」);Booking `ss=酒店纯名,城市名`+人数参数(dest_id 需 aid 不能裸调,调研结论暂不建映射表);Airbnb `/s/<城市>--China/homes`(slug 宽容解析;境内房源已停,入口保留给境外场景)。
+  - 测试:test_ctrip.py **22 用例**(parse 健壮性/坏形状/降级 None/坐标与城市名消歧/两级关键词/懒补齐写回+持久化后零网络/失败留空不阻塞/非住宿行跳过/限批 5+次轮补齐/纯名剥离);test_collections 加 autouse stub(防既有用例真打 m.ctrip.com);test_task15_stay_links 断言改三级口径。pytest backend/ = **1409 passed**(1387 基线零回归 + 22 新增,86s);node --check 通过。
+  - 真机验证(uvicorn 重启):GET /api/collections 两轮——昆山柏轩 `hotelId=83790270`/`cityId=83`、上海冰雪世界皇冠假日 `121198627`/`2` 解析成功并持久化,吉林冬日光辉(万科松花湖店)解析不到(携程无此词条)走 keyword 兜底且不再重复城市前缀;curl 真开两个 detail 链接 **200 且标题=正确酒店名**(「昆山柏轩酒店(亭林园玉山广场地铁站店)预订价格…」);携程 list 兜底页 `cityId=83&searchWord=柏轩` SSR 命中「柏轩酒店(亭林园玉山广场地铁站店)」;browser QA:收藏树 3 条住宿子行外链 URL 全对、_blank/noopener 齐、0 JS error。**Booking headless QA 受限**:容器内 headless 对任何 ss(含纯「上海」)都显示 0 家——AWS WAF 对无头环境的限制(调研 §A2 已预警「真人浏览器可开、不要服务端预取校验」),拼法按调研口径落地,真人浏览器复核留白天主会话。
+  - 备注(报主会话):①Airbnb 2022-07 起境内房源已停,境内住宿的 Airbnb 链接无实际可订结果——建议白天拍板是否对境内行隐藏该渠道;②Booking dest_id 若要消歧更准,可后续维护地级市映射表(autocomplete 需 aid,城市页可爬),当前 ss=「酒店名,城市名」已带城市语义。
 
 ---
 

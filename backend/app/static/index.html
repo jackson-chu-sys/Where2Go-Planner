@@ -241,22 +241,6 @@
     #assistDrawer{top:auto;height:min(74vh,540px);width:calc(100% - 20px);right:10px;bottom:10px}
     body.assist-open #routePanel{right:10px}
   }
-  /* 前往预订(TASK-4b):deep-link 聚合,只跳转不代订 */
-  .bk-row{margin-top:8px;border:1px solid #e5e7eb;border-radius:9px;padding:7px 9px;background:#fff}
-  /* TASK-14:前往预订按目的地分组(小标题 + 缩进子项) */
-  .bk-grp{margin-top:10px;border:1px solid #e5e7eb;border-radius:10px;padding:8px 10px;background:#f9fafb}
-  .bk-grp-ttl{font-size:13px;font-weight:700;color:#1f2937}
-  .bk-grp-ttl .js-book-detail{margin-left:8px;font-size:12px;color:#1d4ed8;font-weight:400;
-    text-decoration:underline;cursor:pointer}
-  .bk-grp .bk-row{background:#fff;margin-left:10px}
-  .bk-ungrouped{border-style:dashed}
-  .bk-nm{font-size:12px;font-weight:700;color:#374151}
-  .bk-links{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
-  .bk-links a{display:inline-block;background:#0f766e;color:#fff;font-size:12px;padding:4px 10px;
-              border-radius:7px;text-decoration:none}
-  .bk-links a:hover{background:#115e59}
-  .bk-links a.alt{background:#e5e7eb;color:#1f2937}
-  .bk-links a.alt:hover{background:#d1d5db}
   /* 住宿区块(TASK-3b):路线面板下方的周边住宿卡片 + AI 预估价强标注 */
   .stay-sec{margin-top:12px;border-top:2px solid #e5e7eb;padding-top:9px}
   .stay-hd{display:flex;align-items:center;gap:7px}
@@ -473,13 +457,6 @@
         <div class="fp-sub" id="favPanelSub">收藏存的是快照:收藏那一刻的方式/时长/费用/里程;要看最新数字请重新打开路线面板。</div>
         <div id="favPanelErr" class="fp-err" style="display:none"></div>
         <div id="favPanelList"></div>
-        <!-- 前往预订(TASK-4b):把收藏的路线/住宿聚合成 deep-link 入口,只跳转、不代订、不抓实时价 -->
-        <div class="fp-plan" id="favBookSection" style="display:none">
-          <div class="fp-plan-ttl">🎫 前往预订</div>
-          <div class="fp-sub">从收藏挑好路线与住宿后,点下面的按钮去官方渠道下单。
-            <b>免责声明:价格仅供参考 · 本页不代订、不抓实时价,一切以官方/OTA 实时为准。</b></div>
-          <div id="favBookList"></div>
-        </div>
       </div>
       <!-- 行程方案(TASK-5b):勾选收藏 + 晚数 → POST /api/trip-plans(重名=刷新幂等)
            → 卡片展示后端 quote(总花费区间 / 交通 / 每处住宿 / 已删除引用);列表来自 GET,可 DELETE -->
@@ -1647,14 +1624,6 @@ function onDocumentClick(event){
     event.preventDefault();
     event.stopPropagation();
     openFavPlaceModal(Number(favDetailLink.getAttribute("data-id")));
-    return;
-  }
-  // TASK-14:前往预订区块目的地小标题的「📄 详情」→ 复用 TASK-13 的 openFavPlaceModal(同一入口)
-  const bookDetailLink=target.closest("#favBookList .js-book-detail");
-  if(bookDetailLink){
-    event.preventDefault();
-    event.stopPropagation();
-    openFavPlaceModal(Number(bookDetailLink.getAttribute("data-id")));
     return;
   }
   const popupButton=target.closest(".js-routes");
@@ -2837,7 +2806,7 @@ function favItemHtml(item,placeKids){
     "</div>";
 }
 // TASK-15:目的地父行的动作排**只留「取消收藏」**(外链挪到路线/住宿子行各自旁边;
-// 「📄 详情」入口在收藏列表名称链接与前往预订分组小标题上,不在父行动作排)。
+// 「📄 详情」入口在收藏列表名称链接上,不在父行动作排;TASK-18 后前往预订分组已移除)。
 function placeActsHtml(item){
   const id=Number(item.id);
   return '<div class="fp-acts">'+
@@ -2978,7 +2947,7 @@ async function refreshFavItems(){
   state.fav.items=Array.isArray(data.collections)?data.collections:[];
   state.fav.favedKeys=currentFavKeys();
   if(state.fav.open){
-    renderFavItems();renderBookSection();setFavErr("");
+    renderFavItems();setFavErr("");
     renderPlanPicker();                                  // 勾选面与收藏同源(TASK-5b)
     renderPlannerTags();                                 // 点名标签与收藏同源(TASK-10c)
     if(state.tripPlan.tab==="plan") loadTripPlans();     // 删收藏会让方案 quote 出现 missing,顺手刷一次
@@ -3335,16 +3304,10 @@ function switchFavTab(which){
 }
 
 // --------------------------------------------------------------------------- //
-// 前往预订(TASK-4b):把收藏的路线/住宿聚合成外部渠道 deep-link,只跳转、不代订、
-// 不抓实时价。链接全部前端拼(纯 URL 模板,与后端 services/routes.py 的 deep-link
-// 口径一致):自驾→高德/Google 地图导航;铁路→12306 官方查询;飞机→去哪儿机票搜索;
-// 住宿→携程/Booking/Airbnb 搜索(按名称);目的地→高德/Google 搜索。
+// 收藏子行外链(TASK-15 收口,TASK-18 移除前往预订区块后仅剩收藏树子行在用):
+// 路线=高德导航 + Google Maps(用该路线收藏自身 from/to 坐标);住宿=OTA 三渠道
+// (携程/Booking/Airbnb,搜索词=城市+酒店纯名)。只跳转、不代订、不抓实时价。
 // --------------------------------------------------------------------------- //
-const BOOK_DISCLAIMER="价格仅供参考 · 不代订 · 以官方/OTA 实时为准";
-function todayCST(){
-  // 12306/OTA 的出发日:今天(本地即 CST 环境;跨时区最多差一天,用户在官方页可改)
-  return new Date().toISOString().slice(0,10);
-}
 function splitRouteNames(name){
   // 收藏名形如「上海 → 杭州西湖 · 驾车」(default_collection_name 口径);拆出起终点地名
   const base=String(name||"").split(" · ")[0];
@@ -3418,98 +3381,14 @@ function plainFavName(name){
 }
 // (TASK-15:原 TASK-14 的 bookLinksForPlaceRoute/bookLinksForPlaceStay 已下线——
 //  外链从目的地父行挪到路线/住宿子行各自的「取消收藏」旁,父行只留「取消收藏」。)
-// 外链组 → 锚点(与 bookRowHtml 同款:新页打开 + noopener)
+// 外链组 → 锚点(收藏树子行动作排用:新页打开 + noopener)
 function bookLinksHtml(links){
   return '<span class="fp-book">'+(links||[]).map(link=>
     '<a href="'+esc(link.url)+'" target="_blank" rel="noopener" class="'+esc(link.cls||"")+'">'+
     esc(link.label)+"</a>").join("")+"</span>";
 }
-function bookRowHtml(title,links){
-  return '<div class="bk-row"><div class="bk-nm">'+esc(title)+"</div>"+
-    '<div class="bk-links">'+links.map(link=>
-      '<a href="'+esc(link.url)+'" target="_blank" rel="noopener" class="'+esc(link.cls)+'">'+
-      esc(link.label)+"</a>").join("")+"</div></div>";
-}
-function renderBookSection(){
-  const section=$("favBookSection"),box=$("favBookList");
-  if(!section||!box) return;
-  // TASK-14:按目的地分组重组(不再平铺两张列表)。归属用收藏快照的 summary.parent.ref_key 判定
-  // (与 favTree 同源);判不出归属的落「未分组」小节,一条不丢。目的地小标题带「📄 详情」链接
-  // (复用 TASK-13 的 openFavPlaceModal 入口),子项=该目的地的路线外链行 + 住宿外链行。
-  const items=state.fav.items||[];
-  const routes=items.filter(item=>favGroupOf(item)==="route");
-  const stays=items.filter(item=>favGroupOf(item)==="stay");
-  if(!routes.length&&!stays.length){section.style.display="none";box.innerHTML="";return;}
-  const groups=groupBookByPlace(items);
-  let html="";
-  groups.grouped.forEach(g=>{html+=bookPlaceGroupHtml(g);});
-  if(groups.ungrouped.length){
-    html+='<div class="bk-grp bk-ungrouped"><div class="bk-grp-ttl">🗂️ 未分组'+
-      '<span class="fp-grp-cnt">'+groups.ungrouped.length+" 项(没标目的地,按类型平铺)</span></div>";
-    groups.ungrouped.forEach(item=>{
-      const links=favGroupOf(item)==="stay"?bookLinksForStay(item):bookLinksForRoute(item);
-      html+=bookRowHtml(bookSubTitle(item),links);
-    });
-    html+="</div>";
-  }
-  html+='<div class="fp-total-note">'+esc(BOOK_DISCLAIMER)+"</div>";
-  box.innerHTML=html;
-  section.style.display="block";
-}
-// 把路线/住宿收藏按 summary.parent.ref_key 归到各目的地;返回 {grouped:[{place,items}],ungrouped:[]}.
-// 目的地信息优先取被收藏的 place 行(有 place_id 可开详情弹窗),没收藏目的地则用 parent 快照名。
-function groupBookByPlace(items){
-  const placeByKey={};
-  items.forEach(item=>{
-    if(favGroupOf(item)==="place"&&String(item.ref_key||"").indexOf("place:")===0){
-      placeByKey[String(item.ref_key)]=item;
-    }
-  });
-  const map={},order=[],ungrouped=[];
-  (items||[]).forEach(item=>{
-    const g=favGroupOf(item);
-    if(g!=="route"&&g!=="stay") return;
-    const parent=(item.summary&&item.summary.parent)||null;
-    const key=String((parent&&parent.ref_key)||"");
-    if(!key){ungrouped.push(item);return;}
-    if(!map[key]){
-      map[key]={place:placeByKey[key]||null,parentName:String((parent&&parent.name)||""),items:[]};
-      order.push(key);
-    }
-    map[key].items.push(item);
-  });
-  return {grouped:order.map(key=>map[key]),ungrouped};
-}
-// TASK-14:预订子项标题(🚗/🛏️ + 名称 + 快照摘要:路线=时长/费用,住宿=AI 预估价)。
-// 名称先过 plainFavName 去掉自带的 🛏️ 前缀与「· 住宿」后缀,免得 emoji 双写。
-function bookSubTitle(item){
-  const isStay=favGroupOf(item)==="stay";
-  const summary=item.summary||{};
-  const snap=isStay
-    ? (summary.price_estimate?("("+summary.price_estimate+" · AI 预估)"):"")
-    : (isFinite(num(summary.duration_min))||isFinite(num(summary.cost_cny))
-        ? "("+(isFinite(num(summary.duration_min))?(fmtDuration(summary.duration_min)+" / "):"")+
-          (isFinite(num(summary.cost_cny))?fmtCost(summary.cost_cny):"")+")"
-        : "");
-  const label=isStay?plainFavName(item.name):String(item.name||"(无名)");
-  return (isStay?"🛏️ ":"🚗 ")+label+snap;
-}
-// 一个目的地分组:小标题(名称 + 📄详情链接,若有 place_id)→ 缩进子项(路线行 + 住宿行)
-function bookPlaceGroupHtml(g){
-  const place=g.place;
-  const name=place?plainFavName(place.name):(g.parentName||"(无名目的地)");
-  const pid=place&&place.place_id;
-  const detailBtn=(pid!==null&&pid!==undefined)
-    ? '<a href="#" class="js-book-detail" data-id="'+Number(place.id)+'" title="打开详情弹窗(图片/介绍/要点)">📄 详情</a>'
-    : "";
-  let inner="";
-  g.items.forEach(item=>{
-    const links=favGroupOf(item)==="stay"?bookLinksForStay(item):bookLinksForRoute(item);
-    inner+=bookRowHtml(bookSubTitle(item),links);
-  });
-  return '<div class="bk-grp"><div class="bk-grp-ttl">📍 '+esc(name)+detailBtn+
-    '<span class="fp-grp-cnt">'+g.items.length+" 项</span></div>"+inner+"</div>";
-}
+// (TASK-18:「前往预订」区块已按神朱 10/9 拍板移除——与收藏树子行外链功能重叠,
+//  区块的 DOM/CSS/渲染函数一并下线。)
 
 // --------------------------------------------------------------------------- //
 // AI 行程(TASK-10c,阶段 A):收藏面板第三个 tab「🤖 AI 行程」—— 多轮对话 +

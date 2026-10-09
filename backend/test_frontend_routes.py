@@ -633,41 +633,24 @@ def test_fav_group_of_stay_fingerprint(html: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# TASK-4b:前往预订(deep-link 聚合,纯前端;只跳转、不代订、不抓实时价)
+# TASK-18:「🎫 前往预订」区块移除(神朱 10/9:与收藏树子行外链功能重叠)。
+#          外链构造函数(bookLinksForRoute/Stay)与子行动作排保留(收藏树在用)。
 # --------------------------------------------------------------------------- #
-def test_book_dom_and_functions(html: str) -> None:
-    assert 'id="favBookSection"' in html and 'id="favBookList"' in html
-    for fn in ("function renderBookSection(", "function bookLinksForRoute(",
-               "function bookLinksForStay(", "function splitRouteNames(",
-               "function cleanStayName("):
-        assert fn in html, f"缺少 {fn}"
+def test_book_section_removed(html: str) -> None:
+    for token in ('id="favBookSection"', 'id="favBookList"', "function renderBookSection(",
+                  "function groupBookByPlace(", "function bookRowHtml(",
+                  "function bookSubTitle(", "function bookPlaceGroupHtml(",
+                  "BOOK_DISCLAIMER", "bk-grp", "bk-row", "js-book-detail",
+                  "renderBookSection()"):
+        assert token not in html, f"TASK-18:前往预订区块残留 {token}"
+    assert "🎫 前往预订" not in html, "区块标题应移除"
 
 
-def test_book_section_has_disclaimer(html: str) -> None:
-    section = html[html.index('id="favBookSection"'):html.index("</main>")]
-    assert "不代订" in section and "实时" in section, "预订区块必须含免责声明"
-    js_part = html[html.index("function renderBookSection"):]
-    assert "BOOK_DISCLAIMER" in js_part
-
-
-def test_book_links_cover_required_channels(html: str) -> None:
-    # TASK-15 口径:路线外链=高德导航 + Google Maps(12306/去哪儿随外链迁移下线)
-    route_fn = html[html.index("function bookLinksForRoute"):html.index("function bookLinksForStay")]
-    assert "uri.amap.com/navigation" in route_fn, "路线应给高德导航外链"
-    assert "google.com/maps/dir" in route_fn, "路线应给 Google Maps 外链"
-    stay_fn = html[html.index("function bookLinksForStay"):html.index("function plainFavName")]
-    for host in ("ctrip.com", "booking.com", "airbnb.com"):
-        assert host in stay_fn, f"住宿应可跳 {host}"
-
-
-def test_book_links_open_new_page(html: str) -> None:
-    row = html[html.index("function bookRowHtml"):html.index("function renderBookSection")]
-    assert 'target="_blank"' in row and 'rel="noopener"' in row
-
-
-def test_book_section_refreshes_with_fav_list(html: str) -> None:
-    refresh = html[html.index("async function refreshFavItems"):html.index("async function openFavPanel")]
-    assert "renderBookSection()" in refresh, "收藏列表刷新应同步预订区块"
+def test_book_link_builders_kept_for_fav_tree(html: str) -> None:
+    for fn in ("function bookLinksForRoute(", "function bookLinksForStay(",
+               "function splitRouteNames(", "function cleanStayName(",
+               "function bookLinksHtml(", "function childActsHtml("):
+        assert fn in html, f"收藏树子行外链仍在用,不得误删:{fn}"
 
 
 # --------------------------------------------------------------------------- #
@@ -678,7 +661,7 @@ def test_book_section_refreshes_with_fav_list(html: str) -> None:
 # --------------------------------------------------------------------------- #
 
 PLAN_SECTION_START = "行程方案(TASK-5b,M4)"
-PLAN_SECTION_END = "// 前往预订(TASK-4b)"
+PLAN_SECTION_END = "// 收藏子行外链(TASK-15 收口"
 
 # 方案 tab 必须有的 DOM id:两个 tab 钮 + 两个 pane + 表单 + 勾选面 + quote + 列表
 PLAN_DOM_IDS = [
@@ -2697,8 +2680,8 @@ def test_stay_price_text_is_black_on_light_pill(html: str) -> None:
 
 
 def book_section(html: str) -> str:
-    """切出前往预订(TASK-4b/14)那段 JS。"""
-    start = html.index("// 前往预订(TASK-4b)")
+    """切出收藏子行外链(TASK-15/18 后仅剩子行外链)那段 JS。"""
+    start = html.index("// 收藏子行外链(TASK-15 收口")
     end = html.index("// AI 行程(TASK-10c", start)
     return html[start:end]
 
@@ -2757,73 +2740,18 @@ def test_task15_stay_fav_payload_carries_city(html: str) -> None:
     assert "city:item.city||null" in fn, "summary 要带 city 键"
 
 
-def test_task14_book_section_groups_by_place(html: str) -> None:
-    """前往预订区块按目的地分组(不再是平铺两张列表)。"""
-    section = book_section(html)
-    assert "function groupBookByPlace" in section, "应有按目的地归组的函数"
-    assert "function bookPlaceGroupHtml" in section, "应有目的地分组渲染函数"
-    grp = section[section.index("function groupBookByPlace"):]
-    grp = grp[:grp.index("\nfunction ")]
-    assert "summary" in grp and "parent" in grp and "ref_key" in grp, \
-        "归属判定用收藏快照 summary.parent.ref_key(与 favTree 同源)"
-
-
-def test_task14_book_ungrouped_fallback(html: str) -> None:
-    """判不出归属的收藏落「未分组」小节,一条不丢。"""
-    section = book_section(html)
-    assert "ungrouped" in section, "归属判定函数要单列 ungrouped"
-    render = section[section.index("function renderBookSection"):]
-    render = render[:render.index("\nfunction ")]
-    assert "groups.ungrouped" in render and "未分组" in render, \
-        "renderBookSection 要渲染未分组兜底小节"
-
-
-def test_task14_book_disclaimer_kept(html: str) -> None:
-    """免责声明口径不变(价格仅供参考 · 不代订 · 以官方/OTA 实时为准)。"""
-    section = book_section(html)
-    render = section[section.index("function renderBookSection"):]
-    render = render[:render.index("\nfunction ")]
-    assert "BOOK_DISCLAIMER" in render, "重组后仍要输出免责声明"
-
-
-def test_task14_book_detail_link_reuses_modal(html: str) -> None:
-    """目的地小标题「📄 详情」复用 TASK-13 的 openFavPlaceModal 入口(同一弹窗)。"""
-    section = book_section(html)
-    assert "js-book-detail" in section, "分组小标题应带 📄 详情链接"
-    assert "openFavPlaceModal" in html, "详情入口应复用 openFavPlaceModal"
-    # 事件委托里 js-book-detail → openFavPlaceModal
-    idx = html.index("#favBookList .js-book-detail")
-    around = html[idx:idx + 300]
-    assert "openFavPlaceModal" in around, "委托应把 📄 详情接到 openFavPlaceModal"
-
-
-def test_task14_book_subitem_snapshot(html: str) -> None:
-    """预订子项带快照摘要(路线=时长/费用,住宿=AI 预估价)。"""
-    section = book_section(html)
-    assert "function bookSubTitle" in section, "子项标题应含快照摘要"
-    fn = section[section.index("function bookSubTitle"):]
-    fn = fn[:fn.index("\n}")]
-    assert "duration_min" in fn and "cost_cny" in fn, "路线子项应带时长/费用快照"
-    assert "price_estimate" in fn, "住宿子项应带预估价快照"
-
-
-def test_task14_book_links_open_new_page(html: str) -> None:
-    """前往预订的外链仍是新页打开 + noopener(沿用既有 bookRowHtml)。"""
-    row = html[html.index("function bookRowHtml"):html.index("function renderBookSection")]
-    assert 'target="_blank"' in row and 'rel="noopener"' in row
-    # 目的地行动作排的外链也要新页打开
+def test_task18_child_links_open_new_page(html: str) -> None:
+    """收藏树子行外链仍是新页打开 + noopener(bookLinksHtml,前往预订区块已移除)。"""
     bhl = html[html.index("function bookLinksHtml"):]
     bhl = bhl[:bhl.index("\n}")]
     assert 'target="_blank"' in bhl and 'rel="noopener"' in bhl
 
 
-def test_task14_no_new_frontend_key(html: str) -> None:
-    """TASK-14 不新增前端 key/新接口:仍只经既有 deep-link 模板拼 URL。"""
+def test_task18_no_new_frontend_key(html: str) -> None:
+    """外链段不新增前端 key/新接口:仍只经既有 deep-link 模板拼 URL。"""
     section = book_section(html)
     assert "amap_js_key" not in section and "securityJsCode" not in section, \
-        "预订区块不得引入地图 key"
-    assert "/api/" not in section or "openFavPlaceModal" in html, \
-        "预订分组是纯前端(详情复用既有 openFavPlaceModal,不新增接口)"
+        "外链段不得引入地图 key"
 
 
 def test_task14_plain_fav_name_no_surrogate_split(html: str) -> None:

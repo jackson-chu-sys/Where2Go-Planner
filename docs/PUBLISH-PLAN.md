@@ -1,7 +1,7 @@
 # Where2Go 发布计划(GitHub 容器 + 微信小程序 + 发布版 UI 精简)
 
 > 神朱 2026-10-09 拍板:DEMO 已成熟,规划两个发布平台 + 发布版去技术细节。
-> **本文件只是计划,不实施**;每条实施前需神朱确认。
+> **2026-10-10 神朱拍板:先做 GitHub 容器发布(第一节 P1-P5),微信小程序暂缓。**
 > 关联调研:docs/research-ota-wechat-2026-10-09.md(OTA 外链 / 微信小程序资质)。
 
 ---
@@ -23,12 +23,11 @@
 |---|---|---|
 | ① 高德 Web 服务 key | 图文教程(注册→创建应用→Web服务 key)+ 输入框 | 后端真调一次 `geocode("北京")`,报 `status!=1` 给出 infocode 中文解释 |
 | ② 高德 JS key + 安全密钥 | 同上(同应用加「Web端(JSAPI)」key,两 key 平台隔离的坑要写明,混用报 USERKEY_PLAT_NOMATCH) | 真调 JS key 校验接口或前端加载地图探活 |
-| ③ LLM key(可选) | DeepSeek / 阿里百炼(OpenAI 兼容)二选一;明说「不配也能用,只是没有 AI 简介/推荐/行程」 | 发一条 1-token 测试消息 |
+| ③ LLM key(可选) | **任意 OpenAI 兼容服务**(神朱 2026-10-10 拍板):预置下拉(DeepSeek/阿里百炼/OpenAI 等)+「自定义」档填 base_url+model+key——后端 intro.py 本就是 OpenAI 兼容抽象(WHERE2GO_LLM_BASE_URL/_MODEL/_API_KEY 覆盖),向导只是把这套 env 图形化;明说「不配也能用,只是没有 AI 简介/推荐/行程」 | 发一条 1-token 测试消息(打用户填的 base_url) |
 | ④ 完成 | 写入配置 → 重启提示或直接热生效 | — |
 
-**配置存储拍板点(需神朱定)**:
-- 方案 A(推荐):写 SQLite 新表 `AppConfig`(key 名/值/更新时间),后端读配置顺序 = env 优先 → AppConfig 兜底。优点:容器重建不丢、向导可反复改;缺点:要注意 AppConfig 永不进 API 响应/日志(照既有「key 不出响应」口径)。
-- 方案 B:向导生成 `.env` 写进挂载卷。简单,但改配置要重启、文件权限坑多。
+**配置存储(神朱 2026-10-10 拍板:方案 A)**:
+- 写 SQLite 新表 `AppConfig`(key 名/值/更新时间),后端读配置顺序 = env 优先 → AppConfig 兜底。容器重建不丢、向导可反复改;AppConfig 永不进 API 响应/日志(照既有「key 不出响应」口径)。
 
 ### 1.3 发布前必须清理/准备的东西(清单)
 

@@ -1,0 +1,17 @@
+## 高德卫星影像 webst style=6(境外因特拉肯):
+  z=10: status=200 bytes=4235 
+  z=12: status=200 bytes=4235 
+  z=14: status=200 bytes=4235 
+  z=16: status=200 bytes=4235 
+
+## 高德卫星+注记 style=8 vs 路网 style=7(境外 z=12):
+  style=6: status=200 bytes=4235
+  style=7: status=200 bytes=103
+  style=8: status=200 bytes=192
+
+## 天地图(无 key,预期 403,记录行为):
+  status=None time=1.03s body=b'HTTP Error 418: '
+
+## 腾讯地图瓦片(境外 z=12,腾讯用翻转y):
+  status=200 time=0.23s bytes=169
+  腾讯卫星: status=200 time=0.17s bytes=671

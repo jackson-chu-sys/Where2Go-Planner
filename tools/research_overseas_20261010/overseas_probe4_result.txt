@@ -1,0 +1,26 @@
+## A. Overpass 境外 POI(因特拉肯 5km 圆,自然+景点)
+  直连: status=200 time=8.45s elements=30 names=['Heimwehfluh', '?', '?', 'Daube', 'Oberberghorn']
+  代理: status=200 time=3.33s elements=30 names=['Heimwehfluh', '?', '?', 'Daube', 'Oberberghorn']
+
+## B. OSRM demo 境外驾车(因特拉肯->格林德瓦)
+  直连: status=200 time=1.27s dist=19.7km dur=24min
+  代理: status=200 time=0.54s dist=19.7km dur=24min
+
+## C. 前端底图候选瓦片(直连)
+  直连 OSM 标准: status=None time=12.02s bytes=50
+  直连 Carto light: status=None time=0.05s bytes=50
+  直连 高德无key栅格(webrd): status=200 time=0.05s bytes=8934
+  直连 高德境外区域瓦片(z=6 瑞士): status=200 time=0.08s bytes=15657
+
+## D. Azure Maps(走代理确认服务活着 + 中国区域名)
+  代理 atlas.microsoft.com: status=200 time=22.46s
+  代理 search.azuremapscn.com: status=None time=1.47s b'<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of '
+  直连 atlas.microsoft.com: status=None time=0.09s
+  直连 search.azuremapscn.com: status=None time=0.26s b'<urlopen error [Errno -2] Name or service not known>'
+
+## E. DNS 解析对比(直连失败是 DNS 还是路由)
+  maps.googleapis.com -> 69.171.235.22
+  atlas.microsoft.com -> DNS FAIL [Errno -5] No address associated with hostname
+  tile.openstreetmap.org -> 199.59.149.136
+  nominatim.openstreetmap.org -> 174.37.154.236
+  overpass-api.de -> 65.109.112.52

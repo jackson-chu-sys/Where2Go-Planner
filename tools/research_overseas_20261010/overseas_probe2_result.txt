@@ -1,0 +1,36 @@
+env proxies: {'no_proxy': 'localhost,127.0.0.1,::1,.aliyuncs.com,.dashscope.aliyuncs.com,.deepseek.com,.qq.com,.weixin.qq.com,.wechat.com,.wechatpay.com,.tencent.com,.tenpay.com,.baidu.com,.jd.com,.cn,.aliyun.com,.modelscope.cn,.hf-mirror.com', 'https_proxy': 'http://192.168.1.210:7892', 'NO_PROXY': 'localhost,127.0.0.1,::1,.aliyuncs.com,.dashscope.aliyuncs.com,.deepseek.com,.qq.com,.weixin.qq.com,.wechat.com,.wechatpay.com,.tencent.com,.tenpay.com,.baidu.com,.jd.com,.cn,.aliyun.com,.modelscope.cn,.hf-mirror.com', 'HTTPS_PROXY': 'http://192.168.1.210:7892', 'HTTP_PROXY': 'http://192.168.1.210:7892', 'http_proxy': 'http://192.168.1.210:7892'}
+======================================================================
+## A. 强制直连(禁代理)可达性
+  直连 Google geocode: status=None time=10.02s <urlopen error [Errno 101] Network is unreachable>
+  直连 Google JS: status=None time=10.01s <urlopen error [Errno 101] Network is unreachable>
+  直连 Google 瓦片: status=None time=80.32s <urlopen error [Errno 101] Network is unreachable>
+  直连 Azure atlas: status=None time=0.17s <urlopen error [Errno -2] Name or service not known>
+  直连 Photon: status=200 time=1.26s {"type":"FeatureCollection","features":[{"type":"Feature","properties":{"osm_typ
+  直连 Nominatim: status=None time=10.02s <urlopen error [Errno 101] Network is unreachable>
+  直连 OSM 瓦片: status=None time=10.02s <urlopen error [Errno 101] Network is unreachable>
+  直连 trip.com: status=200 time=1.57s <!DOCTYPE html><html lang="en-XX" data-idc="SGP-NOR" data-cargo="locale:en-XX,la
+  直连 Airbnb: status=200 time=1.37s <!doctype html> <html lang="en" dir="ltr" data-is-hyperloop="true" data-is-async
+  直连 Booking: status=200 time=1.02s <!doctype html> <html> <head> <meta name="referrer" content="origin-when-cross-o
+
+======================================================================
+## B. Nominatim 中文境外地名命中(accept-language=zh-CN)
+  [200 0.78s] q='因特拉肯'       -> 因特拉肯, Verwaltungskreis Interlaken-Oberhasli, Verwaltungsregi | 误差=0.3km
+  [200 0.76s] q='瑞士因特拉肯'     -> 因特拉肯, Verwaltungskreis Interlaken-Oberhasli, Verwaltungsregi | 误差=0.3km
+  [200 1.16s] q='皇后镇'        -> 皇后镇, Queenstown-Lakes District, Otago, 9348, 紐西蘭/新西兰 | 误差=0.2km
+  [200 0.52s] q='富良野'        -> 富良野, 東山富良野停車場線, 日の出町, 富良野市, 上川綜合振興局, 北海道, 北海道地方, 076-0025, 日 | 误差=0.9km
+  [200 0.61s] q='富士山'        -> 富士山, 小山町, 駿東郡, 静冈县/靜岡縣, 日本 | 误差=0.3km
+  [200 1.63s] q='巴黎'         -> 巴黎, 法兰西岛大区;法蘭西島大區, 法國本土;法国本土, 法国;法國 | 误差=2.4km
+  [200 0.48s] q='清迈'         -> 清迈, ฟ้าฮ่าม, อำเภอเมืองเชียงใหม่, 清迈府, 泰国;泰國 | 误差=0.1km
+  [200 0.58s] q='Interlaken' -> 因特拉肯, Verwaltungskreis Interlaken-Oberhasli, Verwaltungsregi | 误差=0.3km
+
+## B2. Nominatim 中文+国家限定(countrycodes)
+  [200 0.5s] q='因特拉肯'+cc=ch -> 因特拉肯, Verwaltungskreis Interlaken-Oberhasli, Verwaltungsregi 误差=0.3km
+  [200 0.76s] q='皇后镇'+cc=nz -> 皇后镇, Queenstown-Lakes District, Otago, 9348, 紐西蘭/新西兰 误差=0.2km
+  [200 0.49s] q='巴黎'+cc=fr -> 巴黎, 法兰西岛大区;法蘭西島大區, 法國本土;法国本土, 法国;法國 误差=2.4km
+
+======================================================================
+## C. trip.com 境外拼法实测
+  SEO 城市页 interlaken: status=404 time=0.82s title=404, Page not found!
+  SEO 城市页 中文?: status=404 time=1.11s title=404, Page not found!
+  搜索页 keyword: status=200 time=4.0s title=Trip.com – Book cheap flights, hotels &amp; train tickets
+  搜索页 city(苏黎世试探 id): status=200 time=2.93s title=Hotels - Where to stay in  | Trip.com

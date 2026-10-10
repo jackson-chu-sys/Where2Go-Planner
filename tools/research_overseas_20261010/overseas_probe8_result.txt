@@ -1,0 +1,15 @@
+高德无key栅格(webrd, style=8)境外瓦片 zoom 阶梯(因特拉肯):
+  z= 6 x=   33 y=   22: status=200 time=0.05s bytes=15657 
+  z= 8 x=  133 y=   90: status=200 time=0.07s bytes=7225 
+  z=10 x=  534 y=  361: status=200 time=0.05s bytes=179 (疑似空白)
+  z=12 x= 2137 y= 1445: status=200 time=0.07s bytes=179 (疑似空白)
+  z=14 x= 8549 y= 5783: status=200 time=0.07s bytes=179 (疑似空白)
+  z=16 x=34199 y=23134: status=200 time=0.04s bytes=179 (疑似空白)
+
+对照:境内(上海人民广场)同 zoom:
+  z=14: status=200 bytes=26909
+  z=16: status=200 bytes=21835
+
+OSM 官方瓦片直连复验(不同 IP 节点):
+  tile.openstreetmap.org: status=None time=8.02s bytes=50
+  a.tile.openstreetmap.org: status=None time=8.01s bytes=50

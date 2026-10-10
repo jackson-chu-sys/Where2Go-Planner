@@ -1,0 +1,17 @@
+## Azure Maps 中国区(21Vianet)端点直连:
+  atlas.azuremapscn.com: DNS FAIL [Errno -2] Name or service not known | HTTP status=None time=0.0s
+  search.azuremapscn.com: DNS FAIL [Errno -2] Name or service not known | HTTP status=None time=0.0s
+  route.azuremapscn.com: DNS FAIL [Errno -2] Name or service not known | HTTP status=None time=0.0s
+  account.azuremapscn.com: DNS FAIL [Errno -2] Name or service not known | HTTP status=None time=4.19s
+
+## DNS 污染证据(直连解析):
+  maps.googleapis.com -> 185.45.5.35
+  tile.openstreetmap.org -> 182.50.139.56
+  nominatim.openstreetmap.org -> 104.16.251.55
+  atlas.microsoft.com -> FAIL [Errno -5] No address associated with hostname
+  photon.komoot.io -> 116.202.51.114
+  overpass-api.de -> 162.55.144.139
+
+## 高德境外瓦片内容鉴别(4235 bytes 是否同一张图):
+  因特拉肯 style=6 z14: 4235B sha1=702b8fde236b png=False
+  皇后镇 style=6 z14: 4235B sha1=702b8fde236b png=False

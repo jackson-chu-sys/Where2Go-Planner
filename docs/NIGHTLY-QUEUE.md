@@ -955,7 +955,7 @@
 
 ## [TASK-19] 境外目的地支持:境内/境外双轨方案调研(神朱 2026-10-10 拍板入队,**纯调研出方案,不写码**)
 
-- 状态: pending
+- 状态: done
 - 背景(神朱 2026-10-10 三个反馈):
   ① 携程外链已好(TASK-17),但 **Booking / Airbnb 仍搜不到推荐的酒店**;
   ② 用中文名搜外国目的地**全部错误定位**(主会话 10/10 实测坐实:高德 geocode「瑞士因特拉肯」→成都双流某小区、「日本富良野」→香港北海街;境外 POI「皇后镇」「富士山」count=0——高德境外无数据,属数据源边界);
@@ -976,7 +976,11 @@
   4. **双轨架构草案**:data_sources 层按「境内=amap / 境外=选型结果」路由(参考 ADR-006 降级链的既有形状);前端地图按 ui 配置切换(高德 JS API vs 选型结果);LLM 简介/推荐链路境外可用(候选来自境外检索)。工作量按 P 系列拆条格式给出(每条 ≤1 晚)。
 - 涉及(只读):docs/research-ota-wechat-2026-10-09.md、backend/services/intro.py、backend/data_sources/(amap.py/photon.py/_common.py)、backend/app/static/index.html(bookLinksForStay)、docs/PUBLISH-PLAN.md
 - 验收:docs/OVERSEAS-PLAN.md 落盘——含 ①选型对比矩阵(每项带实测数字或引用 URL)②境内外判定设计 ③Booking/Airbnb 复核结论与修正拼法(真人浏览器实测截图 URL/结果佐证)④双轨架构草案+拆条清单;pytest 基线不动(零代码改动);队列回填结果摘要。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-10 夜班,执行器手写调研,commit 见 git log;**零代码改动**,pytest 基线 1409 passed 复跑确认)。产出 `docs/OVERSEAS-PLAN.md`(五章)。
+  - **①选型结论:境外走 OSM 系(Leaflet + osm.de/osm.fr 瓦片 + Nominatim/Photon + Overpass/OSRM),不采用 Google/Azure**——Google(maps.googleapis.com/khms/gstatic)与 Azure(atlas.microsoft.com)容器直连**双双不可达**(TCP 全超时 / DNS 无解析,DNS 污染证据已录),产品部署境内 NAS 是一票否决;OSM 镜像瓦片 tile.openstreetmap.de/.fr 与 basemaps.cartocdn.com **直连实测全通**(0.75~2s 真 PNG),Overpass 境外 POI(因特拉肯 30 条)、OSRM 境外驾车(19.7km/24min)直连可用;高德无 key 栅格境外 z≥10 全空白(179B)、卫星境外是占位假图(两地同 sha1)——高德只能服务境内坐实。
+  - **②中文境外地名 geocode**:Nominatim(accept-language=zh-CN)**8/8 全中**(因特拉肯 0.3km/皇后镇 0.2km/巴黎 2.4km);Photon 中文 4/8 不稳(因特拉肯→香港、皇后镇→北京),但**英文名+国家 7/7 全中 ≤0.4km**;判定开关=geocoder country 字段(Nominatim country_code=CN / Photon country 含中国),**不能用高德判定**(「因特拉肯」status=1 错误吸附成都,当晚复现)。
+  - **③Booking 复核(真机 headless)**:现状 `ss=酒店名,城市名` 与纯名/纯城市/英文名**全 0 家**;但先经 dest_id 搜索确认在架的 Pan Pacific Suzhou 用 ss= 同样 0 家,而 **dest_id=79514(苏州)/dest_id=-2552548(因特拉肯,当晚从城市页 HTML 实取)结构化参数正常出结果** → 结论:ss 文本路径对境内访客不可靠,修正=后端懒解析 dest_id 落 summary(照 TASK-17 携程 hotelId 模式)+ 前端优先 dest_id、兜底现状 ss。**Airbnb**:Kunshan--China 页 h1 虚标「Over 1,000 stays」但房源卡片 0 个,Interlaken--Switzerland 18 卡片正常 → 境内隐藏、境外启用(判定用 summary.region)。**携程境外**:suggest 对境外返回 type=IntlCity(因特拉肯 cityId=3167 瑞士)/Hotel(皇后镇诺富特 2196343),detail/list 页境外 200 标题正确,无需切 trip.com;现有 ctrip.py 只认 type=="Hotel",境外需纳入 IntlCity。
+  - **④双轨架构草案 + 拆条**:region_gate(P1)→ 境外 POI 检索链(P2)→ 境外路线+住宿(P3)→ 前端 Leaflet 双轨地图(P4,组件从 9/30 前 git 历史考古复用)→ OTA 外链修正(**P5 可独立先行**,建议下晚先修);存储零改表(osm_type 天然隔离、OriginCache 加 region 列);坐标系境外 WGS-84/境内 GCJ-02 不混用。开放问题 5 项(Overpass 冷抓慢回归、LLM 翻译腿、P5 先行、Google/Azure 出局确认、境内第三渠道)列 §4.3 待神朱拍板。
 
 ---
 

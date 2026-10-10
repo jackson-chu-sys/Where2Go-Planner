@@ -1,0 +1,7 @@
+  wikimedia maps: status=None time=8.28s bytes=62 图像=N
+  openstreetmap.de: status=200 time=0.78s bytes=28980 图像=Y
+  openstreetmap.fr: status=200 time=0.75s bytes=31584 图像=Y
+  cartocdn light: status=None time=1.23s bytes=52 图像=N
+  carto maps (basemaps.carto.com): status=200 time=1.98s bytes=2049 图像=Y
+  osm tile 官方(重测): status=None time=8.01s bytes=50 图像=N
+  高德矢量(对照,境内可用境外空白): status=200 time=0.05s bytes=179 图像=Y

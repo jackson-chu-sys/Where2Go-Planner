@@ -1,0 +1,10 @@
+## Photon reverse 境内坐标(上海人民广场 31.2304,121.4737):
+  [200 1.31s] name=西藏南路 country=中国 state=上海市 city=黄浦区
+
+## Photon reverse 边境/争议坐标(漠河 53.47,122.34 中国最北):
+  [200 1.41s] name=香圃街 country=中国
+
+## Photon 正向『中文境内城市』命中(判定另一路径:先 geocode 再看 country):
+  [200 2.33s] 上海 -> name=上海市 country=中国
+  [200 0.94s] 成都 -> name=成都市 country=中国
+  [200 1.18s] 昆山 -> name=昆山 country=中国

@@ -1,0 +1,20 @@
+## Booking searchresults 拼法对比(昆山柏轩酒店 / 上海皇冠假日)
+  [200 2.39s] 现状: ss=酒店名,城市名
+      title=需您同意 | cnt_hint= | 含目标酒店名=False
+  [200 0.76s] A: ss=纯酒店名
+      title=需您同意 | cnt_hint= | 含目标酒店名=False
+  [200 1.03s] B: ss=城市名(昆山)
+      title=需您同意 | cnt_hint= | 含目标酒店名=False
+  [200 1.04s] C: 英文酒店名
+      title=需您同意 | cnt_hint= | 含目标酒店名=True
+  [200 1.76s] D: 上海皇冠假日现状
+      title=需您同意 | cnt_hint= | 含目标酒店名=False
+  [200 1.28s] E: 上海皇冠假日纯名
+      title=需您同意 | cnt_hint= | 含目标酒店名=False
+
+## trip.com 境外城市 SEO 页拼法(酒店 deep-link 候选)
+  [404 0.89s] SEO interlaken 酒店列表: title=404, Page not found!
+  [404 1.39s] SEO interlaken trailing slash: title=404, Page not found!
+  [404 1.45s] SEO 苏黎世: title=404, Page not found!
+  [404 0.86s] SEO 苏黎世 slash: title=404, Page not found!
+  [200 1.37s] list city=1258(猜): title=Hotels - Where to stay in  | Trip.com

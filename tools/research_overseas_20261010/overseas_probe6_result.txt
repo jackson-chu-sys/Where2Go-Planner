@@ -1,0 +1,18 @@
+## A. 携程 suggest(既有 TASK-17 端点)对境外查询
+  [200 0.16s] '因特拉肯' -> [{'type': 'IntlCity', 'id': '3167', 'word': '因特拉肯', 'cityId': 3167, 'cityName': '因特拉肯', 'countryName': '瑞士'}, {'type': 'IntlCity', 'id': '313615', 'word': '因特拉肯区', 'cityId': 313615, 'cityName': '因特拉肯区', 'countryName': '瑞士'}, {'type': 'IntlCity', 'id': '345428', 'word': '因特拉肯', 'cityId': 345428, 'cityName': '因特拉肯', 'countryName': '美国'}, {'type': 'IntlCity', 'id': '332247', 'word': '因特拉肯', 'cityId': 332247, 'cityName': '因特拉肯', 'countryName': '澳大利亚'}]
+  [200 0.16s] 'Interlaken' -> [{'type': 'IntlCity', 'id': '3167', 'word': '因特拉肯', 'cityId': 3167, 'cityName': '因特拉肯', 'countryName': '瑞士'}, {'type': 'Markland', 'id': '4349212', 'word': '茵特拉根小镇', 'cityId': 30, 'cityName': '深圳', 'countryName': '中国'}, {'type': 'RailwayStation', 'id': '55855351', 'word': 'Interlaken (Heimwehfluhbahn)', 'cityId': 70251, 'cityName': '马腾贝因特拉肯', 'countryName': '瑞士'}, {'type': 'Hotel', 'id': '4224447', 'word': '因特拉肯酒店', 'cityId': 775, 'cityName': '尼斯', 'countryName': '法国'}]
+  [200 0.16s] '皇后镇' -> [{'type': 'IntlCity', 'id': '3860', 'word': '皇后镇', 'cityId': 3860, 'cityName': '皇后镇', 'countryName': '新西兰'}, {'type': 'RailwayStation', 'id': '4326879', 'word': '皇后镇机场', 'cityId': 3860, 'cityName': '皇后镇', 'countryName': '新西兰'}, {'type': 'Hotel', 'id': '2196343', 'word': '皇后镇湖畔诺富特酒店', 'cityId': 3860, 'cityName': '皇后镇', 'countryName': '新西兰'}, {'type': 'Hotel', 'id': '1565632', 'word': '卡马那湖屋酒店', 'cityId': 3860, 'cityName': '皇后镇', 'countryName': '新西兰'}]
+  [200 0.18s] '富士山 酒店' -> [{'type': 'IntlDistrict', 'id': '10746', 'word': '富士山', 'cityId': 0, 'cityName': '', 'countryName': '日本'}, {'type': 'Hotel', 'id': '1678838', 'word': '富士山酒店', 'cityId': 50166, 'cityName': '山中湖村', 'countryName': '日本'}, {'type': 'Hotel', 'id': '2550389', 'word': '富士山酒店', 'cityId': 304, 'cityName': '加德满都', 'countryName': '尼泊尔'}, {'type': 'Hotel', 'id': '5902965', 'word': '富士山酒店', 'cityId': 50166, 'cityName': '山中湖村', 'countryName': '日本'}]
+
+## B. hotels.ctrip.com detail 境外可用性(用一个境外 hotelId 试探)
+  境内样例(昆山柏轩): [200 0.37s] title=昆山柏轩酒店(亭林园玉山广场地铁站店)预订价格,联系电话位置地址【携程酒店】
+
+## C. trip.com SEO 页格式试探
+  [404 0.7s] https://www.trip.com/hotels/interlaken-hotel/detail/
+      title=404, Page not found!
+  [404 0.64s] https://www.trip.com/hotels/w/interlaken/
+      title=404, Page not found!
+  [200 0.94s] https://www.trip.com/hotels/list?cityName=Interlaken&city=2130
+      title=Hotels - Where to stay in  | Trip.com
+  [None 0.36s] https://cn.trip.com/hotels/interlaken-hotel/
+      title=<urlopen error [Errno -2] Name or service not known>

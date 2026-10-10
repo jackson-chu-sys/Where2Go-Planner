@@ -1,0 +1,51 @@
+key loaded: True
+======================================================================
+## A. 高德 geocode 境外中文(复现失败形态)
+  [200 0.05s] '因特拉肯'       status=1 count=1 -> 四川省成都市双流区因特拉肯(东北门) location=104.099913,30.482244 country=中国
+  [200 0.06s] '瑞士因特拉肯'     status=1 count=2 -> 四川省成都市双流区因特拉肯(东北门) location=104.099913,30.482244 country=中国
+  [200 0.05s] '富良野'        status=0 count=None ->  location= country=None
+  [200 0.05s] '皇后镇'        status=1 count=1 -> 河南省安阳市林州市皇后镇 location=113.724214,35.879968 country=中国
+  [200 0.06s] '巴黎'         status=0 count=None ->  location= country=None
+  [200 0.05s] 'Interlaken' status=0 count=None ->  location= country=None
+
+## B. 高德境外 POI 文本搜索(已知 count=0,复核)
+  [200 0.15s] '富士山' count=0 top3=[]
+  [200 0.1s] 'Interlaken' count=6 top3=['YEECE CANTEEN(野柿西餐厅)', '玉姿SPA美容会所(茵特拉根形象店)', '肌遇·美学中心']
+  [200 0.14s] '皇后镇' count=0 top3=[]
+
+======================================================================
+## C. Photon 英文名+国家限定命中率(模拟「LLM 翻译后查询」路径)
+  [200 1.19s] 'Interlaken Switzerland'   -> Interlaken country=Schweiz/Suisse/Svizzera/Svizra 误差=0.3km
+  [200 1.37s] 'Queenstown New Zealand'   -> Queenstown country=New Zealand / Aotearoa 误差=0.2km
+  [200 1.3s] 'Furano Japan'             -> 富良野市 country=日本 误差=0.1km
+  [200 0.89s] 'Paris France'             -> Paris country=France 误差=0.4km
+  [200 0.89s] 'Chiang Mai Thailand'      -> เชียงใหม่ country=ประเทศไทย 误差=0.1km
+  [200 0.8s] 'Zermatt Switzerland'      -> Zermatt country=Schweiz/Suisse/Svizzera/Svizra 误差=0.1km
+  [200 0.96s] 'Reykjavik Iceland'        -> Reykjavík country=Ísland 误差=0.0km
+
+======================================================================
+## D. trip.com 搜索建议接口(境外城市 id 解析)
+  [403 0.72s] 'Interlaken' -> <!DOCTYPE HTML>
+
+<html lang="en-XX">
+
+<head>
+	<meta charset="UTF-8">
+	<title>404, Page not found!</title>
+	<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0,mini
+  [403 0.87s] '因特拉肯' -> <!DOCTYPE HTML>
+
+<html lang="en-XX">
+
+<head>
+	<meta charset="UTF-8">
+	<title>404, Page not found!</title>
+	<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0,mini
+  [403 0.79s] 'Queenstown' -> <!DOCTYPE HTML>
+
+<html lang="en-XX">
+
+<head>
+	<meta charset="UTF-8">
+	<title>404, Page not found!</title>
+	<meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0,mini

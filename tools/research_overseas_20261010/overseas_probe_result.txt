@@ -1,0 +1,58 @@
+======================================================================
+## 1. Photon 境外地名命中(中文+英文)
+  [200 1.54s] q='因特拉肯'         -> 因特拉肯大道 Interlaken Avenue | city=None state=香港 Hong Kong country=中国 | (22.5025,114.1039) 误差=9361.6km
+  [200 1.04s] q='Interlaken'   -> Interlaken | city=None state=Bern/Berne country=Schweiz/Suisse/Svizzera/Svizra | (46.6855,7.8585) 误差=0.3km
+  [200 1.46s] q='瑞士因特拉肯'       -> 0 结果
+  [200 1.11s] q='皇后镇'          -> 皇后镇休闲度假村 | city=北京市 state=None country=中国 | (40.5328,116.5731) 误差=10836.5km
+  [200 1.17s] q='Queenstown'   -> Queenstown | city=None state=Otago country=New Zealand / Aotearoa | (-45.0322,168.661) 误差=0.2km
+  [200 1.15s] q='富良野'          -> 富良野 | city=富良野市 state=北海道 country=日本 | (43.3469,142.3917) 误差=0.9km
+  [200 1.04s] q='Furano'       -> Furano | city=富良野市 state=北海道 country=日本 | (43.3436,142.3641) 误差=1.5km
+  [200 1.06s] q='富士山'          -> 富士山 | city=小山町 state=静岡県 country=日本 | (35.3628,138.7308) 误差=0.3km
+  [200 0.87s] q='Mount Fuji'   -> Mount Fuji | city=Town of Colfax state=Wisconsin country=United States | (44.9456,-91.7708) 误差=9742.0km
+  [200 1.09s] q='巴黎'           -> 巴黎 | city=高雄市 state=None country=臺灣 | (22.6564,120.2964) 误差=9972.2km
+  [200 1.12s] q='Paris'        -> Paris | city=None state=Île-de-France country=France | (48.8535,2.3484) 误差=0.4km
+  [200 1.22s] q='清迈'           -> 清迈泰式汤粉馆 | city=珠海市 state=广东省 country=中国 | (22.2625,113.5474) 误差=1564.1km
+
+## 1b. Photon 境外逆地理(因特拉肯坐标 -> country 字段)
+  [200 1.16s] -> name=Klosterstrasse country=Schweiz/Suisse/Svizzera/Svizra state=Bern/Berne
+
+======================================================================
+## 2. Nominatim 直连复验(已知需代理)
+  nominatim direct: status=200 time=0.43s body=b'[{"place_id":416629168,"licence":"Data \xc2\xa9 OpenStreetMap contributors, ODbL 1.0. http://osm.org/copyr'
+
+======================================================================
+## 3. Google Maps 直连可达性(产品无代理环境)
+  maps.googleapis.com geocode(无key): status=200 time=0.51s body={    "error_message" : "You must use an API key to authenticate each request to Google Maps Platform APIs. For additional information, please refer to
+  maps.googleapis.com JS API: status=200 time=0.85s body=  window.google = window.google || {}; google.maps = google.maps || {}; (function() {      var modules = google.maps.modules = {};   google.maps.__gjs
+  maps.gstatic.com 静态资源: status=404 time=1.06s body=<!DOCTYPE html> <html lang=en>   <meta charset=utf-8>   <meta name=viewport content="initial-scale=1, minimum-scale=1, width=device-width">   <title>E
+  khms1.googleapis.com 瓦片: status=404 time=0.36s body={   "error": {     "code": 404,     "message": "Requested entity was not found.",     "status": "NOT_FOUND"   } } 
+
+## 3b. Google TCP 层探测
+  maps.googleapis.com: TCP FAIL TimeoutError 8.01s
+  maps.gstatic.com: TCP FAIL TimeoutError 8.01s
+  khms1.googleapis.com: TCP FAIL TimeoutError 8.24s
+  tile.googleapis.com: TCP FAIL TimeoutError 8.02s
+
+======================================================================
+## 4. Azure Maps 直连可达性(无 key,只看网络层)
+  atlas.microsoft.com 根: status=200 time=20.82s body=<!DOCTYPE HTML> <html lang="en-US" dir="ltr"> <head>        <meta charset="UTF-8"/> <meta name="viewport" content="width
+  示例账户 atlas 子域: status=None time=0.93s body=<urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid f
+  search.azuremapscn.com(中国区): status=None time=6.16s body=<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1029)>
+
+## 4b. Azure TCP 层探测
+  atlas.microsoft.com: TCP FAIL gaierror 0.09s
+  search.azuremapscn.com: TCP FAIL gaierror 0.19s
+  account.atlas.azure.com: TCP FAIL gaierror 0.09s
+
+======================================================================
+## 5. OSM 生态直连(底图瓦片候选)
+  tile.openstreetmap.org 瓦片: status=200 time=1.13s bytes=7884
+  webrd01.is.autonavi.com 高德无key栅格(备用): status=200 time=0.04s bytes=179
+
+======================================================================
+## 6. Airbnb / trip.com / Booking 直连(curl 层)
+  Airbnb 境外 slug: status=200 time=1.99s title/snippet=Airbnb | Interlaken - Vacation Rentals &amp; Places to Stay - Bern
+  trip.com 首页: status=200 time=2.46s title/snippet=Buche günstige Flüge, Hotels, Mietwagen, Zugtickets und mehr | Trip.com
+  trip.com 酒店搜索页(境外城市): status=200 time=2.1s title/snippet=Accra Hotels - Where to stay in Accra | Trip.com
+  Booking searchresults(无头预期被WAF): status=202 time=0.85s title/snippet=
+  Booking autocomplete(无aid): status=200 time=0.74s title/snippet={"results":[]}

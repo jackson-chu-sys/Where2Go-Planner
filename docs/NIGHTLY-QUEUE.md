@@ -953,6 +953,33 @@
 
 ---
 
+## [TASK-19] 境外目的地支持:境内/境外双轨方案调研(神朱 2026-10-10 拍板入队,**纯调研出方案,不写码**)
+
+- 状态: pending
+- 背景(神朱 2026-10-10 三个反馈):
+  ① 携程外链已好(TASK-17),但 **Booking / Airbnb 仍搜不到推荐的酒店**;
+  ② 用中文名搜外国目的地**全部错误定位**(主会话 10/10 实测坐实:高德 geocode「瑞士因特拉肯」→成都双流某小区、「日本富良野」→香港北海街;境外 POI「皇后镇」「富士山」count=0——高德境外无数据,属数据源边界);
+  ③ 神朱方向:**中国大陆境内 / 境外两套方案**——境内维持现状(高德),境外换 Google Maps 或 Azure Maps,并对 Booking/Airbnb 优化外链。
+- 目标:产出 `docs/OVERSEAS-PLAN.md` 方案文档(含推荐路线与工作量拆解),供神朱拍板后再拆实施 TASK。**本条不改任何代码**。
+- 调研清单(逐项给实测数据/引用):
+  1. **境外地图+地理编码选型对比**(重点):
+     - Google Maps JS API:大陆网络可达性实测(容器内 curl tiles/googleapis.com + 说明真实用户在墙内的后果)、计费(每月 $200 免费额度现状)、geocoding 中文地名支持;
+     - Azure Maps:微软 2024-05 宣布退役的是 Bing Maps for Enterprise(2028-06 止),Azure Maps 是继任战略平台(非退役;Gen1 定价层 2026-09-15 退役→用 Gen2);大陆可达性实测、免费额度、中文地名 geocode 实测;神朱手里或有一把 Azure Maps key(仓库根 AzureMapsKey.txt 已删,历史见 docs/PUBLISH-PLAN.md 1.3);
+     - **零成本备选**:OSM/Leaflet 底图(项目阶段1有现成经验)+ Photon/Nominatim 地理编码(已有降级链,Photon 可直连、境外 OSM 数据强)——实测 Photon 对「因特拉肯/皇后镇/富良野」中文与英文名命中率、返回坐标正确性;
+     - 结论矩阵:key 成本/大陆可达性/中文地名命中/与现有 GCJ-02 坐标体系的兼容(境外无偏移问题,WGS-84 直接用)。
+  2. **境内外判定开关设计**:起点 geocode 后按 country 字段/坐标落界判定(高德 geocode 境外会错误返回国内坐标→不能用高德判;应先用 Photon 或名称规则判「是否境外城市」);给出判定函数落点(geocode 服务层)与失败兜底。
+  3. **Booking/Airbnb 外链真机复核与修正**(问题①):
+     - 现状:`ss=酒店名,城市名`(Booking)、`/s/城市--China/homes`(Airbnb)。10/9 夜班 headless 被 AWS WAF 挡住未验成,神朱真人实测也搜不到;
+     - 复核:真人浏览器(browser_exec)实测 2-3 家收藏酒店的 Booking 链接,确认失败形态(ss 里逗号语法?酒店名含分店括号?);对照调研报告 §A2 修正拼法(试 `ss=酒店名` + `dest_id/dest_type` 从城市页取、或纯城市 ss);
+     - Airbnb:境内房源已停(2022-07)——**境内行隐藏 Airbnb 渠道、只在境外方案里启用**,给出前端判定改动点;
+     - 境外场景:Booking 是主力(dest_id 体系覆盖全球),Airbnb slug 境外可用;携程境外是否应跳 trip.com(国际站)而非 hotels.ctrip.com,给实测结论。
+  4. **双轨架构草案**:data_sources 层按「境内=amap / 境外=选型结果」路由(参考 ADR-006 降级链的既有形状);前端地图按 ui 配置切换(高德 JS API vs 选型结果);LLM 简介/推荐链路境外可用(候选来自境外检索)。工作量按 P 系列拆条格式给出(每条 ≤1 晚)。
+- 涉及(只读):docs/research-ota-wechat-2026-10-09.md、backend/services/intro.py、backend/data_sources/(amap.py/photon.py/_common.py)、backend/app/static/index.html(bookLinksForStay)、docs/PUBLISH-PLAN.md
+- 验收:docs/OVERSEAS-PLAN.md 落盘——含 ①选型对比矩阵(每项带实测数字或引用 URL)②境内外判定设计 ③Booking/Airbnb 复核结论与修正拼法(真人浏览器实测截图 URL/结果佐证)④双轨架构草案+拆条清单;pytest 基线不动(零代码改动);队列回填结果摘要。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

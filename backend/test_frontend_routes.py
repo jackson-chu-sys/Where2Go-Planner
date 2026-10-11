@@ -53,6 +53,7 @@ from db.base import init_db, make_engine, session_factory  # noqa: E402
 from services import assistant as assistant_service  # noqa: E402
 from services import place_loader  # noqa: E402
 from services import planner as planner_service  # noqa: E402
+from services import region_gate  # noqa: E402
 from services import routes as route_service  # noqa: E402
 from services import stays as stay_service  # noqa: E402
 from services import trips as trip_service  # noqa: E402
@@ -2867,3 +2868,100 @@ console.log(JSON.stringify(out));
         assert results[4] == "无前缀", f"无 emoji 前缀只剥后缀:{results[4]}"
     finally:
         os.unlink(path)
+
+
+# --------------------------------------------------------------------------- #
+# TASK-20:境外模式开关(境内外口径 override)
+#   顶栏 checkbox + 本机记住勾选 + searchCity 透传 region=overseas + 状态栏显示后端
+#   判定的「境内/境外」。本阶段只做开关与传参:地图层、/api/places 参数与分段口径一律
+#   不动(region 的真正消费在 TASK-21+);后端半边见 backend/test_region_gate.py。
+# --------------------------------------------------------------------------- #
+
+REGION_SECTION_START = "// 境外模式开关(TASK-20"
+REGION_STORE_KEY = "w2g_region_override"      # 只存 "1"/"0" 的 UI 偏好,不存任何 key/密钥
+# 既有 /api/geocode 的顶层键:TASK-20 只允许**多**一个 region,其余逐键零变化
+LEGACY_GEOCODE_KEYS = {"origin", "geocoder", "bands", "segments"}
+
+
+def region_section(html: str) -> str:
+    """切出「境外模式开关(TASK-20)」那一段 JS(既有绑定之后、AI 助手抽屉之前)。"""
+    start = html.index(REGION_SECTION_START)
+    return html[start:html.index(ASSIST_SECTION_START, start)]
+
+
+def test_region_override_checkbox_sits_next_to_city_search(html: str) -> None:
+    body = html[:html.index("<script>")]
+    assert '<input type="checkbox" id="regionOverride"' in body, "顶栏要有「境外模式」checkbox"
+    assert "境外模式</label>" in body, "开关要有中文文案(用户看得见它是什么)"
+    assert body.index('id="goCity"') < body.index('id="regionOverride"') < body.index('id="locate"'), \
+        "开关挂在城市搜索那一排(「搜索」与「📍 我的位置」之间)"
+    checkbox = body.index('id="regionOverride"')
+    label = body[checkbox - 500:checkbox]
+    assert "<label" in label, "checkbox 要有 <label>(点文案也能切换)"
+    assert "region=overseas" in label and "自动判定" in label, "title 要说清勾上/不勾各是什么口径"
+    assert "onclick=" not in body and "onchange=" not in body, "仍不许内联事件属性(走 addEventListener)"
+
+
+def test_region_override_remembers_choice_locally_without_any_key(html: str) -> None:
+    section = region_section(html)
+    assert js_string(html, "REGION_OVERRIDE_STORE") == REGION_STORE_KEY
+    assert 'window.localStorage[REGION_OVERRIDE_STORE]==="1"' in section, "启动读回上次的勾选"
+    assert 'window.localStorage[REGION_OVERRIDE_STORE]=on?"1":"0"' in section, "勾选变化即写回"
+    assert section.count("try{") >= 2 and section.count("catch(error)") >= 2, \
+        "读/写都要兜住隐私模式:读不到就当没勾,不抛 JS 错"
+    assert "regionOverride=readRegionOverride();" in section
+    assert '$("regionOverride").checked=regionOverride;' in section, "刷新后恢复勾选态"
+    assert '$("regionOverride").addEventListener("change",onRegionOverrideChange);' in section
+    # 只存一个 0/1 的 UI 偏好:地图 key / 安全密钥一个字节都不落本地
+    assert ENV_JS_KEY not in section and ENV_SECURITY_CODE not in section
+    assert "amap_js_key" not in section, "开关段不碰地图 key(不新增前端 key)"
+    assert not re.search(r"[a-f0-9]{32}", section), "不得出现 32 位 key 样态字符串"
+    # 本地存储的**调用点**(.getItem/.setItem)仍只有会话 key 那两处:开关走 [key] 读写
+    stored = re.findall(r"(?:localStorage|sessionStorage)\.\w+\(([^)]*)\)", html)
+    assert stored and all(any(name in args for name in SESSION_STORE_CONSTS) for args in stored), \
+        f"本地存储的调用点仍只用来存会话 session_key:{stored}"
+    assert REGION_STORE_KEY not in boot_section(html), "开关的读写不在 boot/地图 key 那一段里"
+
+
+def test_search_city_sends_region_override_only_when_checked(html: str) -> None:
+    section = region_section(html)
+    assert 'function regionQuery(){return regionOverride?"&region=overseas":"";}' in section, \
+        "勾了才追加 region=overseas;不勾 = 不带参数(交回后端自动判定)"
+    search = html[html.index("async function searchCity("):html.index("function applyOrigin(")]
+    assert '"/api/geocode?city="+encodeURIComponent(name)+regionQuery()' in search, \
+        "城市搜索要把开关透传给 /api/geocode"
+    # 其余接口口径不变:分段检索不带 region(本阶段只影响地理编码那一条)
+    params = html[html.index("function placesParams("):html.index("function geocoderNote(")]
+    assert "region" not in params, "/api/places 的分页参数不受开关影响"
+    assert "new AMap." not in section and "getJSON(" not in section, "开关自己不直接打接口/画地图"
+    assert "loadPlaces(" not in section and "searchCity(" not in section, \
+        "切开关不自动重搜(起点没变时重搜等于白打一次地理编码)"
+
+
+def test_status_bar_shows_region_from_geocode_response(html: str) -> None:
+    labels = js_map(html, "REGION_LABEL")
+    assert 'domestic:"境内"' in labels and 'overseas:"境外"' in labels, "两档 region 都要有中文文案"
+    origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
+    assert 'regionSeen=String(data.region||"");' in origin, \
+        "从 /api/geocode(与 /reverse)响应的 region 键取值"
+    section = region_section(html)
+    assert '" · 境内外:<b>"+esc(REGION_LABEL[key]||key)' in section, "状态栏小字显示境内/境外"
+    assert "(境外模式)" in section, "override 生效时要标明这是手动指定的口径"
+    assert "if(!key) return \"\";" in section, "后端没给 region 就不显示(不编口径)"
+    geocoder = more_section(html)
+    status = geocoder[geocoder.index("function geocoderNote"):geocoder.index("// 是否要现场扩抓")]
+    assert "+regionNote()" in status, "region 小字挂在既有「起点解析」后面(不另起一行)"
+    assert "起点解析" in status and "GEOCODER_LABEL[key]" in status, "既有 geocoder 文案不变"
+
+
+def test_region_switch_consumes_only_the_documented_response_key(
+    html: str, geocode_session
+) -> None:
+    """前后端对账:前端读的 ``data.region`` 必须是 /api/geocode 真会给的键与值域。"""
+    city = places_api.geocode_city(city="上海", session=geocode_session)
+    assert LEGACY_GEOCODE_KEYS | {"region"} <= set(city), "既有键零变化,只多 region 一个"
+    labels = js_map(html, "REGION_LABEL")
+    assert f'{city["region"]}:"' in labels, f"region={city['region']} 在状态栏没有对应文案"
+    reverse = places_api.reverse_geocode(lat=31.2304, lng=121.4737, zoom=None, session=geocode_session)
+    assert reverse["region"] in set(region_gate.REGIONS), "reverse 也走同一套 region 值域"
+    assert f'{reverse["region"]}:"' in labels, "两档取值都在 REGION_LABEL 里有中文文案"

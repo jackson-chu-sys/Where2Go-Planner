@@ -23,9 +23,16 @@
   TASK-7a 起这条路由带**地理编码持久缓存**(:class:`db.models.OriginCache`):城市中心坐标
   基本不变,所以命中缓存(TTL 缺省 7 天)直接返回、**零网络**(省下高德配额),
   响应形状与不走缓存时逐字段一致。
+  TASK-20 起响应多一个 ``region`` 键(``domestic`` / ``overseas``,境内外口径,由
+  :mod:`services.region_gate` 判、判不出按 ``domestic`` 且不落缓存):可选查询参数
+  ``region=domestic|overseas`` 是前端「境外模式」开关的 **override**(给了就不判定、
+  零额外网络),非法值按本仓库口径 **400 中文**(不是 pydantic 的 422);判定结果随
+  地理编码缓存一起落 ``OriginCache.region``,命中缓存且该列非空时**不再问判定源**。
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
   **逆**地理编码(同样高德主 + Photon/Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
+  TASK-20 起同样多一个 ``region`` 键:用 :func:`services.region_gate.detect_region_coords`
+  按 GPS 坐标判(Photon reverse 主 → Nominatim 兜底),这条路由本来就没有缓存,不新增。
 * ``GET /api/places/highlights?place_ids=1,2`` —— 详情弹窗的**类别专属要点**(TASK-8a2):
   LLM 按分类出固定字段表(``自然``→最佳季节/门票/开放信息/游玩建议 等),按 POI **永久缓存**
   在 ``PlaceHighlight``(读库优先,命中零 LLM);batch ≤ 10、超限 400 中文,
@@ -60,6 +67,7 @@ from services import intro as intro_service
 from services import place_loader
 from services import place_media as media_service
 from services import recommend as recommend_service
+from services import region_gate
 from services import seed_data
 from services.bands import DISTANCE_BANDS, band_keys, find_band
 from services.classify import (
@@ -110,6 +118,11 @@ ENV_AMAP_SECURITY_JS_CODE = "WHERE2GO_AMAP_SECURITY_JS_CODE"
 ORIGIN_CACHE_GEOCODERS = frozenset(
     {place_loader.GEOCODER_AMAP, place_loader.GEOCODER_PHOTON, place_loader.GEOCODER_NOMINATIM}
 )
+# 境内外口径(TASK-20):``region`` 查询参数只认这两个值(前端「境外模式」开关传 overseas)。
+# 刻意**不用** ``Query(pattern=...)`` —— 那样非法值会被 pydantic 拦成 422,而本仓库路由口径
+# 统一是 400 中文报错,所以在函数体里自己校验(见 :func:`_region_override`)。
+REGION_CHOICES = frozenset(region_gate.REGIONS)
+REGION_INVALID_MSG = "region 只支持 domestic 或 overseas"
 META_NOTE = (
     "分段:环形互斥,检索按 band 分组打高德 v3(下限 0 走 place/around 单圆,下限 > 0 走"
     "包围盒分格 place/polygon + 本地环带收敛;每组独立配额,selectors = 该组的 typecode 数 + 关键词组数);"
@@ -233,6 +246,40 @@ def origin_cache_age_s(row: Any) -> Optional[float]:
     if moment.tzinfo is None:  # SQLite 读回的是 naive 时间,按 UTC 处理
         moment = moment.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - moment).total_seconds()
+
+
+def _region_override(value: Any) -> Optional[str]:
+    """``region`` 查询参数归一:留空/空串 = 没给(``None`` → 自动判定);非法值 **400 中文**。
+
+    单测直接调路由函数时默认值是 ``FieldInfo``,:func:`_optional_text` 会把它归一成 ``None``。
+    """
+    cleaned = (_optional_text(value) or "").strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.lower()
+    if normalized not in REGION_CHOICES:
+        raise HTTPException(400, REGION_INVALID_MSG)
+    return normalized
+
+
+def _cached_region(row: Any) -> Optional[str]:
+    """缓存行里已判出的境内外口径:空串(没判过 / 旧库补列前的行)或垃圾值 → ``None``。"""
+    cleaned = str(getattr(row, "region", "") or "").strip().lower()
+    return cleaned if cleaned in REGION_CHOICES else None
+
+
+def _region_write_back(session: Session, row: Any, city: str, region: str) -> None:
+    """把现场判出的 ``region`` 补写回已有的地理编码缓存行(坐标/来源照原值,不动别的)。"""
+    repo.upsert_origin_cache(
+        session,
+        city=city,
+        name=row.name or city,
+        lat=row.lat,
+        lng=row.lng,
+        geocoder=row.geocoder or place_loader.GEOCODER_NONE,
+        region=region,
+    )
+    session.commit()
 
 
 def resolve_intro_limit(limit: Optional[int]) -> Optional[int]:
@@ -742,6 +789,13 @@ def places_highlights(
 @router.get("/geocode")
 def geocode_city(
     city: str = Query(..., min_length=1, description="城市名,如:北京"),
+    region: Optional[str] = Query(
+        None,
+        description=(
+            "境内外口径 override(前端「境外模式」开关):domestic / overseas;"
+            "留空 = 后端自动判定(Nominatim 主 → Photon 兜底,判不出按 domestic)"
+        ),
+    ),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
     """起点城市搜索(高德主 + Photon/Nominatim 降级),并回报该城市已入库的分段。
@@ -753,13 +807,21 @@ def geocode_city(
     地理编码结果按城市名落 :class:`db.models.OriginCache`(TASK-7a):TTL
     (``WHERE2GO_ORIGIN_CACHE_TTL_S``,缺省 7 天)内命中就直接拼响应、**零网络** ——
     既省下高德的 QPS/日配额(§1.1),也免掉降级到 Photon(在德国,实调 2.7~3.4s)的等待。
-    命中与否响应形状完全一致(``origin`` 四字段 + ``geocoder`` 原值 + ``bands`` + ``segments``);
-    未命中/过期才走 :func:`place_loader.resolve_origin_with_source`,并且只在
+    命中与否响应形状完全一致(``origin`` 四字段 + ``geocoder`` 原值 + ``bands`` + ``segments``
+    + ``region``);未命中/过期才走 :func:`place_loader.resolve_origin_with_source`,并且只在
     ``geocoder`` ∈ {amap, photon, nominatim} 时写缓存(给了坐标的 ``none`` 退化路径不写)。
+
+    ``region``(TASK-20)的取值优先级:**override 参数 > 缓存里已判出的值 > 现场判定**。
+    三条口径:① 给了 override 就**不调判定源**、也不写缓存(那是每次请求的临时口径,
+    写进 7 天缓存会污染别人的自动判定);② 命中缓存且 ``OriginCache.region`` 非空时
+    **零额外网络**(判定要问 Nominatim/Photon,比读一行贵得多);③ 现场判定只在
+    ``detector != none`` 时随 upsert 写回 —— 判不出(断网/限流)就按 ``domestic`` 回报但
+    **不落库**,下次搜索还能重试。既有键与取值逐键零变化。
     """
     cleaned = _clean(city)
     if not cleaned:
         raise HTTPException(400, "城市名不能为空")
+    override = _region_override(region)
     ttl = origin_cache_ttl_s()
     cached = repo.get_origin_cache(session, city=cleaned) if ttl > 0 else None
     age = origin_cache_age_s(cached) if cached is not None else None
@@ -771,6 +833,13 @@ def geocode_city(
             "lng": cached.lng,
         }
         geocoder = cached.geocoder or place_loader.GEOCODER_NONE
+        resolved_region = override if override is not None else _cached_region(cached)
+        if resolved_region is None:
+            # 缓存里没有判过的行(detector=none 或补列前的旧库):现场补判一次并写回。
+            detected = region_gate.detect_region(cleaned)
+            resolved_region = detected["region"]
+            if detected["detector"] != region_gate.DETECTOR_NONE:
+                _region_write_back(session, cached, cleaned, resolved_region)
     else:
         try:
             origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
@@ -778,6 +847,12 @@ def geocode_city(
             raise HTTPException(400, str(exc)) from exc
         except DataSourceError as exc:
             raise HTTPException(400, f"无法解析城市 '{cleaned}':{exc}") from exc
+        detected = None
+        if override is not None:
+            resolved_region = override
+        else:
+            detected = region_gate.detect_region(cleaned)
+            resolved_region = detected["region"]
         if geocoder in ORIGIN_CACHE_GEOCODERS:
             repo.upsert_origin_cache(
                 session,
@@ -786,11 +861,18 @@ def geocode_city(
                 lat=origin["lat"],
                 lng=origin["lng"],
                 geocoder=geocoder,
+                # 判不出(detector=none)不写 region:留空串,下次搜索还能重试
+                region=(
+                    None
+                    if detected is None or detected["detector"] == region_gate.DETECTOR_NONE
+                    else detected["region"]
+                ),
             )
             session.commit()
     return {
         "origin": origin,
         "geocoder": geocoder,
+        "region": resolved_region,
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=cleaned),
     }
@@ -811,6 +893,10 @@ def reverse_geocode(
     一律沿用传入的 GPS 坐标,范围圈要以用户真实位置为圆心。``resolved=false`` 时
     起点名降级为 ``我的位置(31.23,121.47)``,前端给个提示即可,不必当错误处理
     (所以这里**三腿全失败也不报 400**,只把 ``geocoder`` 标成 ``none``)。
+
+    ``region``(TASK-20)按 GPS 坐标判:**Photon reverse 主 → Nominatim 兜底**,两腿都失败
+    按 ``domestic`` 回报、绝不抛(判定失败不该连累"我的位置"这个 200 口径);
+    这条路由本来就没有缓存,这里也**不新增**缓存。
     """
     origin, geocoder = place_loader.resolve_reverse_origin_with_source(
         lat, lng, zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom))
@@ -819,6 +905,7 @@ def reverse_geocode(
         "origin": origin,
         "resolved": bool(origin.get("resolved")),
         "geocoder": geocoder,
+        "region": region_gate.detect_region_coords(lat, lng)["region"],
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=origin["city"]),
         "note": REVERSE_NOTE,

@@ -60,6 +60,7 @@ from .models import (
     OSM_SOURCE,
     POINT_NAME_LEN,
     REF_KEY_LEN,
+    REGION_LEN,
     SEED_SOURCE,
     SUMMARY_MODE_KEY,
     SUMMARY_NUMBER_KEYS,
@@ -1013,6 +1014,7 @@ def upsert_origin_cache(
     lat: Any,
     lng: Any,
     geocoder: Any,
+    region: Any = None,
 ) -> OriginCache:
     """写入/刷新一个城市的起点坐标(主键 = 城市名,重复写只更新坐标与时间戳)。
 
@@ -1020,6 +1022,10 @@ def upsert_origin_cache(
     口径);``name`` 是地理编码源给的展示名(如 ``北京市, 中国``),空值兜成城市名本身;
     ``geocoder`` 存 ``photon`` / ``nominatim`` 原值,命中时按原样回报给前端。
     只 ``flush`` 不 ``commit``:提交时机交给调用方(与 :func:`upsert_places` 一致)。
+
+    ``region``(TASK-20 境内外口径)是**可选**参数:``None`` = 这次没判定(或判定失败,
+    detector=none)→ **不改动**该行现值,免得把已判出的 ``overseas`` 冲成空串;给了值就
+    按 :data:`REGION_LEN` 截断写入(空串 = 回到"还没判出")。既有调用方零改动兼容。
     """
     cleaned = _clean_city(city)
     row = get_origin_cache(session, city=cleaned)
@@ -1030,6 +1036,8 @@ def upsert_origin_cache(
     row.lat = round(float(lat), COORD_PRECISION)
     row.lng = round(float(lng), COORD_PRECISION)
     row.geocoder = clean_text(geocoder, limit=GEOCODER_LEN) or ""
+    if region is not None:
+        row.region = clean_text(region, limit=REGION_LEN) or ""
     row.updated_at = utcnow()
     session.flush()
     return row

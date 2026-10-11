@@ -347,6 +347,12 @@
           <input id="city" value="上海" placeholder="如:北京、上海、崇礼" autocomplete="off" list="cityList">
           <datalist id="cityList"></datalist>
           <button id="goCity">搜索</button>
+          <!-- 境外模式(TASK-20):勾上 = 城市搜索显式带 region=overseas(后端不再自动判定);
+               不勾 = 后端按 Nominatim 主 → Photon 兜底自动判境内外。只存本机一个 0/1 开关,
+               不存任何 key/密钥;本阶段只影响传参,地图与检索行为不变(region 的消费在 TASK-21+)。 -->
+          <label style="display:flex;align-items:center;gap:4px;margin:0;font-weight:400;white-space:nowrap"
+                 title="起点在境外(因特拉肯、皇后镇…)时勾上:城市搜索会带 region=overseas,后端按境外口径处理、不再自动判定;不勾则由后端自动判定境内外(只在本机记住这个开关)">
+            <input type="checkbox" id="regionOverride" style="width:auto"> 境外模式</label>
           <button id="locate" class="secondary"
                   title="用浏览器定位(GPS)反查起点城市;不支持或被拒绝时只给提示,不影响城市搜索">📍 我的位置</button>
         </div>
@@ -1770,7 +1776,7 @@ async function searchCity(city){
   clearMessages();setBusy(true);
   setStatus('正在用高德地理编码定位「'+esc(name)+'」…');
   try{
-    applyOrigin(await getJSON("/api/geocode?city="+encodeURIComponent(name)));
+    applyOrigin(await getJSON("/api/geocode?city="+encodeURIComponent(name)+regionQuery()));
     await loadPlaces(false);
   }catch(error){
     const message=String(error.message||"");
@@ -1791,6 +1797,8 @@ function applyOrigin(data){
   state.origin=data.origin;
   // 起点地理编码来源(TASK-6a/6e):/api/geocode 与 /api/geocode/reverse 都会带 geocoder
   state.geocoder=String(data.geocoder||"");
+  // 境内外口径(TASK-20):两条地理编码路由都会带 region(domestic/overseas),状态栏照实显示
+  regionSeen=String(data.region||"");
   state.cached={};
   state.routeCache={};   // 起点变了 → 已缓存的路线全部作废
   closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉
@@ -1878,7 +1886,7 @@ function placesParams(refresh,offset,more){
 }
 function geocoderNote(){
   const key=String(state.geocoder||"");
-  return key?(" · 起点解析:<b>"+esc(GEOCODER_LABEL[key]||key)+"</b>"):"";
+  return (key?(" · 起点解析:<b>"+esc(GEOCODER_LABEL[key]||key)+"</b>"):"")+regionNote();
 }
 // 是否要现场扩抓:下一页起点已越过库内行数 → 后端得再抓一轮高德检索才有东西可给
 function pageNeedsExpand(){
@@ -4215,6 +4223,48 @@ $("placeModal").addEventListener("click",onPlaceModalClick);
 $("placeModalClose").addEventListener("click",closePlaceModal);
 document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);
+
+// --------------------------------------------------------------------------- //
+// 境外模式开关(TASK-20 境外双轨 P1):起点在境内还是境外,由后端 /api/geocode 判定
+// (Nominatim 主 → Photon 兜底)并在响应的 region 键里回报;判不出时后端按 domestic 处理、
+// 且不落缓存(下次重试)。但**中文境外地名偶尔会被判成境内**(实测「因特拉肯」被 Photon
+// 定到香港的「因特拉肯大道」),所以给一个显式 override:勾上就在城市搜索时带
+// region=overseas,后端直接用、不再判定(也零额外网络)。三条口径:
+//   ① 本机只存一个 "1"/"0" 的 UI 偏好(w2g_region_override),**不存任何 key/密钥** ——
+//      地图 key 仍只由 /api/map-config 运行时下发,一个字节都不落本地;
+//   ② 读/写不到本地存储(隐私模式、被清、禁用)就当"没勾过",不抛 JS 错;
+//   ③ 本阶段只做开关与传参:地图、检索、分段口径一律不变(region 的消费在 TASK-21+)。
+// --------------------------------------------------------------------------- //
+const REGION_OVERRIDE_STORE="w2g_region_override";   // 本机 localStorage 键(只存 0/1 偏好)
+const REGION_LABEL={domestic:"境内",overseas:"境外"};  // 状态栏文案(与后端 region 值域同口径)
+let regionOverride=false;   // 勾选态 = 事实源;本地存储只是刷新页面后的记忆
+let regionSeen="";          // 后端最近一次回报的 region(applyOrigin 落地),空 = 还不知道
+
+function readRegionOverride(){
+  try{return window.localStorage[REGION_OVERRIDE_STORE]==="1";}catch(error){return false;}
+}
+function rememberRegionOverride(on){
+  try{window.localStorage[REGION_OVERRIDE_STORE]=on?"1":"0";}catch(error){/* 存不下就算了 */}
+}
+// 城市搜索的 region 参数:勾了才追加(不勾 = 不带参数,交回后端自动判定)
+function regionQuery(){return regionOverride?"&region=overseas":"";}
+// 状态栏小字:后端判出的口径 + 是否被「境外模式」override 着
+function regionNote(){
+  const key=String(regionSeen||"");
+  if(!key) return "";
+  return " · 境内外:<b>"+esc(REGION_LABEL[key]||key)+"</b>"+(regionOverride?"(境外模式)":"");
+}
+function onRegionOverrideChange(event){
+  regionOverride=Boolean(event&&event.target&&event.target.checked);
+  rememberRegionOverride(regionOverride);
+  // 只给提示,不自动重搜:起点没变时重搜会白打一次地理编码(契约 §1.6「只做开关与传参」)
+  showNote(regionOverride
+    ? "已开启「境外模式」:之后的城市搜索会带 region=overseas(后端按境外口径处理,不再自动判定)。"
+    : "已关闭「境外模式」:之后的城市搜索由后端自动判定境内外。",false);
+}
+regionOverride=readRegionOverride();          // 刷新页面后恢复上次的勾选
+$("regionOverride").checked=regionOverride;
+$("regionOverride").addEventListener("change",onRegionOverrideChange);
 
 // --------------------------------------------------------------------------- //
 // 全局 AI 助手抽屉(TASK-11b):右侧可折叠抽屉 + 悬浮入口按钮,一个抽屉两个模式。

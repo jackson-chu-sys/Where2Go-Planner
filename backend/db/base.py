@@ -34,6 +34,8 @@ _engine: Optional[Engine] = None
 COLUMN_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("segment_fetch", "fetch_rounds", "INTEGER NOT NULL DEFAULT 0"),
     ("stays", "price_kind", "VARCHAR(16)"),
+    # TASK-20:境内外口径列,旧库补列后默认空串 = "还没判出"(下次 /api/geocode 会补判并写回)
+    ("origin_cache", "region", "VARCHAR(16) NOT NULL DEFAULT ''"),
 )
 
 

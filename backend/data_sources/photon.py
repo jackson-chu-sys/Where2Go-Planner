@@ -83,10 +83,29 @@ def build_display_name(properties: Any) -> str:
     return DISPLAY_NAME_SEP.join(parts)
 
 
-def parse_feature(raw: Any, *, action: str = "地理编码") -> dict[str, Any]:
+def country_fields(properties: Any) -> dict[str, str]:
+    """从 feature 的 ``properties`` 里取国家信息(TASK-20,**只在 opt-in 时追加**)。
+
+    ``country`` 是原样地名(``中国`` / ``Schweiz``,可为空串),``countrycode`` 是
+    ISO 3166-1 alpha-2 **大写**(``CN`` / ``CH``,缺失为 ``""``)—— 境内外判定
+    (:mod:`services.region_gate`)只看后者。
+    """
+    props = properties if isinstance(properties, dict) else {}
+    return {
+        "country": str(props.get("country") or ""),
+        "countrycode": str(props.get("countrycode") or "").strip().upper(),
+    }
+
+
+def parse_feature(
+    raw: Any, *, action: str = "地理编码", include_country: bool = False
+) -> dict[str, Any]:
     """把 Photon 的一个 GeoJSON feature 解析成 ``{"lat", "lng", "display_name"}``。
 
     注意 ``geometry.coordinates`` 是 **[lon, lat]**(经度在前),别抄成纬度在前。
+
+    ``include_country=True``(TASK-20 opt-in)时**追加** ``country`` / ``countrycode`` 两键;
+    默认 ``False`` 时输出与既有口径**逐键一致**(既有单测断言的就是那三个键)。
     """
     if not isinstance(raw, dict):
         raise DataSourceError(SOURCE_NAME, f"{action}响应格式异常(feature 应为 JSON 对象):{type(raw).__name__}")
@@ -104,21 +123,30 @@ def parse_feature(raw: Any, *, action: str = "地理编码") -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise DataSourceError(SOURCE_NAME, f"{action}响应的 coordinates 不是数字:{coordinates!r}") from exc
 
-    display_name = build_display_name(raw.get("properties"))
+    properties = raw.get("properties")
+    display_name = build_display_name(properties)
     if not display_name:
         raise DataSourceError(
             SOURCE_NAME, f"{action}结果的 properties 里没有任何地名(name/city/state/country 全为空)"
         )
 
-    return {
+    place: dict[str, Any] = {
         "lat": round(lat, COORD_PRECISION),
         "lng": round(lng, COORD_PRECISION),
         "display_name": display_name,
     }
+    if include_country:
+        place.update(country_fields(properties))
+    return place
 
 
-def parse_features(payload: Any, *, action: str = "地理编码") -> list[dict[str, Any]]:
-    """解析 FeatureCollection → ``[{"lat", "lng", "display_name"}, ...]``(保持原顺序)。"""
+def parse_features(
+    payload: Any, *, action: str = "地理编码", include_country: bool = False
+) -> list[dict[str, Any]]:
+    """解析 FeatureCollection → ``[{"lat", "lng", "display_name"}, ...]``(保持原顺序)。
+
+    ``include_country`` 透传给 :func:`parse_feature`(默认 False = 形状零变化)。
+    """
     if not isinstance(payload, dict):
         raise DataSourceError(
             SOURCE_NAME, f"{action}响应格式异常(应为 GeoJSON 对象):{type(payload).__name__}"
@@ -128,7 +156,10 @@ def parse_features(payload: Any, *, action: str = "地理编码") -> list[dict[s
         raise DataSourceError(
             SOURCE_NAME, f"{action}响应缺少 features 数组:{type(features).__name__}"
         )
-    return [parse_feature(feature, action=action) for feature in features]
+    return [
+        parse_feature(feature, action=action, include_country=include_country)
+        for feature in features
+    ]
 
 
 class PhotonClient:
@@ -179,23 +210,29 @@ class PhotonClient:
             headers={"User-Agent": self.user_agent} if self.user_agent else None,
         )
 
-    def geocode(self, query: str, *, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    def geocode(
+        self, query: str, *, limit: int = DEFAULT_LIMIT, include_country: bool = False
+    ) -> list[dict[str, Any]]:
         """正向地理编码:城市/地名 → ``[{"lat", "lng", "display_name"}, ...]``(按相关度)。
 
         与 Nominatim 的同名方法不同,这里返回**列表**(调用方自己挑第一条);
         检索不到时返回**空列表**而不是抛错,方便上层直接判定"该降级了"。
+        ``include_country=True`` 时每条追加 ``country``/``countrycode``(TASK-20 境内外判定用)。
         """
         text = (query or "").strip()
         if not text:
             raise ValueError("geocode 的 query 不能为空")
         payload = self._request(SEARCH_PATH, {"q": text, "limit": max(1, int(limit))})
-        return parse_features(payload, action=f"正向地理编码 {text!r}")
+        return parse_features(
+            payload, action=f"正向地理编码 {text!r}", include_country=include_country
+        )
 
-    def reverse(self, lat: float, lng: float) -> dict[str, Any]:
+    def reverse(self, lat: float, lng: float, *, include_country: bool = False) -> dict[str, Any]:
         """逆地理编码:坐标 → ``{"lat", "lng", "display_name"}``(用于"当前位置")。
 
         Photon 的 reverse 没有 Nominatim 的 ``zoom`` 概念(固定返回最近的地点),
-        所以这里也不收 zoom 参数。
+        所以这里也不收 zoom 参数。``include_country=True`` 时追加 ``country``/``countrycode``
+        (TASK-20:Photon reverse 的境外坐标判定实测 3/3 正确,是逆向判定的主腿)。
         """
         try:
             latitude = float(lat)
@@ -210,7 +247,11 @@ class PhotonClient:
         payload = self._request(
             REVERSE_PATH, {"lat": f"{latitude:.6f}", "lon": f"{longitude:.6f}"}
         )
-        places = parse_features(payload, action=f"逆地理编码 ({latitude:.6f},{longitude:.6f})")
+        places = parse_features(
+            payload,
+            action=f"逆地理编码 ({latitude:.6f},{longitude:.6f})",
+            include_country=include_country,
+        )
         if not places:
             raise DataSourceError(
                 SOURCE_NAME, f"逆地理编码未找到结果:({latitude:.6f},{longitude:.6f})"
@@ -237,10 +278,11 @@ def geocode(
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
     min_interval: float = MIN_REQUEST_INTERVAL_S,
+    include_country: bool = False,
 ) -> list[dict[str, Any]]:
-    """模块级便捷函数:正向地理编码。"""
+    """模块级便捷函数:正向地理编码(``include_country`` 透传给 :meth:`PhotonClient.geocode`)。"""
     client = _resolve_client(endpoint, timeout, session, min_interval)
-    return client.geocode(query, limit=limit)
+    return client.geocode(query, limit=limit, include_country=include_country)
 
 
 def reverse(
@@ -251,10 +293,11 @@ def reverse(
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
     min_interval: float = MIN_REQUEST_INTERVAL_S,
+    include_country: bool = False,
 ) -> dict[str, Any]:
-    """模块级便捷函数:逆地理编码。"""
+    """模块级便捷函数:逆地理编码(``include_country`` 透传给 :meth:`PhotonClient.reverse`)。"""
     client = _resolve_client(endpoint, timeout, session, min_interval)
-    return client.reverse(lat, lng)
+    return client.reverse(lat, lng, include_country=include_country)
 
 
 def _resolve_client(

@@ -582,7 +582,8 @@ def test_api_geocode_reports_amap_and_caches_it(session, monkeypatch: pytest.Mon
 
     first = places_api.geocode_city(city="北京", session=session)
     assert first["geocoder"] == "amap" and calls == ["北京"]
-    assert set(first) == {"origin", "geocoder", "bands", "segments"}, "响应键名与旧口径一致"
+    # TASK-20 起响应多一个 region 键(境内外口径),其余键名与旧口径逐键一致
+    assert set(first) == {"origin", "geocoder", "region", "bands", "segments"}, "响应键名与旧口径一致"
     row = repo.get_origin_cache(session, city="北京")
     assert row is not None and row.geocoder == "amap", "OriginCache 值域扩到 amap(§6.7)"
 

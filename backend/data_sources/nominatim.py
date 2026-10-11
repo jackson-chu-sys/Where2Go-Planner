@@ -42,8 +42,30 @@ ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9,en;q=0.8"
 COORD_PRECISION = 7
 
 
-def parse_place(raw: Any, *, action: str = "地理编码") -> dict[str, Any]:
-    """把 Nominatim 的单条结果解析成 ``{"lat", "lng", "display_name"}``。"""
+def country_fields(raw: Any) -> dict[str, str]:
+    """从结果的 ``address`` 里取国家信息(TASK-20,**只在 opt-in 时追加**)。
+
+    需要请求带 ``addressdetails=1`` 才有 ``address`` 段;``country_code`` 是 ISO
+    3166-1 alpha-2(Nominatim 原样是**小写** ``ch``),这里统一**大写**后交给
+    :func:`services.region_gate.classify_country_code`;``country`` 是原样国名。
+    缺失一律空串(判不出国家 = 上层视为该腿失败,降下一腿)。
+    """
+    address = raw.get("address") if isinstance(raw, dict) else None
+    details = address if isinstance(address, dict) else {}
+    return {
+        "country_code": str(details.get("country_code") or "").strip().upper(),
+        "country": str(details.get("country") or ""),
+    }
+
+
+def parse_place(
+    raw: Any, *, action: str = "地理编码", include_country: bool = False
+) -> dict[str, Any]:
+    """把 Nominatim 的单条结果解析成 ``{"lat", "lng", "display_name"}``。
+
+    ``include_country=True``(TASK-20 opt-in)时**追加** ``country_code`` / ``country`` 两键;
+    默认 ``False`` 时输出与既有口径**逐键一致**(既有单测断言的就是那三个键)。
+    """
     if not isinstance(raw, dict):
         raise DataSourceError(SOURCE_NAME, f"{action}响应格式异常(应为 JSON 对象):{type(raw).__name__}")
 
@@ -58,11 +80,14 @@ def parse_place(raw: Any, *, action: str = "地理编码") -> dict[str, Any]:
     if not display_name:
         raise DataSourceError(SOURCE_NAME, f"{action}结果没有 display_name,无法核对地名")
 
-    return {
+    place: dict[str, Any] = {
         "lat": round(lat, COORD_PRECISION),
         "lng": round(lng, COORD_PRECISION),
         "display_name": display_name,
     }
+    if include_country:
+        place.update(country_fields(raw))
+    return place
 
 
 class NominatimClient:
@@ -120,22 +145,39 @@ class NominatimClient:
             headers={"User-Agent": self.user_agent},
         )
 
-    def geocode(self, query: str, *, limit: int = 1) -> dict[str, Any]:
-        """正向地理编码:城市/地名 → ``{"lat", "lng", "display_name"}``(取最相关的一条)。"""
+    def geocode(
+        self, query: str, *, limit: int = 1, include_country: bool = False
+    ) -> dict[str, Any]:
+        """正向地理编码:城市/地名 → ``{"lat", "lng", "display_name"}``(取最相关的一条)。
+
+        ``include_country=True``(TASK-20)才带 ``addressdetails=1``,响应追加
+        ``country_code``/``country``;默认口径(addressdetails=0 + 三键)零变化。
+        """
         text = (query or "").strip()
         if not text:
             raise ValueError("geocode 的 query 不能为空")
-        payload = self._request("/search", {"q": text, "limit": max(1, int(limit))})
+        params: dict[str, Any] = {"q": text, "limit": max(1, int(limit))}
+        if include_country:
+            params["addressdetails"] = 1
+        payload = self._request("/search", params)
         if not isinstance(payload, list):
             raise DataSourceError(
                 SOURCE_NAME, f"正向地理编码响应格式异常(应为 JSON 数组):{type(payload).__name__}"
             )
         if not payload:
             raise DataSourceError(SOURCE_NAME, f"未找到与 {text!r} 匹配的地名(结果为空)")
-        return parse_place(payload[0], action=f"正向地理编码 {text!r}")
+        return parse_place(
+            payload[0], action=f"正向地理编码 {text!r}", include_country=include_country
+        )
 
-    def reverse(self, lat: float, lng: float, *, zoom: int = 10) -> dict[str, Any]:
-        """逆地理编码:坐标 → ``{"lat", "lng", "display_name"}``(用于"当前位置")。"""
+    def reverse(
+        self, lat: float, lng: float, *, zoom: int = 10, include_country: bool = False
+    ) -> dict[str, Any]:
+        """逆地理编码:坐标 → ``{"lat", "lng", "display_name"}``(用于"当前位置")。
+
+        ``include_country=True``(TASK-20)才带 ``addressdetails=1`` 并追加
+        ``country_code``/``country``;默认口径零变化。
+        """
         try:
             latitude = float(lat)
             longitude = float(lng)
@@ -146,15 +188,21 @@ class NominatimClient:
         if not -180.0 <= longitude <= 180.0:
             raise ValueError(f"经度超出 [-180, 180] 范围:{longitude}")
 
-        params = {
+        params: dict[str, Any] = {
             "lat": f"{latitude:.6f}",
             "lon": f"{longitude:.6f}",
             "zoom": int(zoom),
         }
+        if include_country:
+            params["addressdetails"] = 1
         payload = self._request("/reverse", params)
         if isinstance(payload, dict) and payload.get("error"):
             raise DataSourceError(SOURCE_NAME, f"逆地理编码失败:{payload['error']}")
-        return parse_place(payload, action=f"逆地理编码 ({latitude:.6f},{longitude:.6f})")
+        return parse_place(
+            payload,
+            action=f"逆地理编码 ({latitude:.6f},{longitude:.6f})",
+            include_country=include_country,
+        )
 
 
 _default_client: Optional[NominatimClient] = None
@@ -176,10 +224,11 @@ def geocode(
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
     min_interval: float = MIN_REQUEST_INTERVAL_S,
+    include_country: bool = False,
 ) -> dict[str, Any]:
-    """模块级便捷函数:正向地理编码。"""
+    """模块级便捷函数:正向地理编码(``include_country`` 透传给 :meth:`NominatimClient.geocode`)。"""
     client = _resolve_client(endpoint, timeout, session, min_interval)
-    return client.geocode(query, limit=limit)
+    return client.geocode(query, limit=limit, include_country=include_country)
 
 
 def reverse(
@@ -191,10 +240,11 @@ def reverse(
     timeout: Optional[float] = None,
     session: Optional[Any] = None,
     min_interval: float = MIN_REQUEST_INTERVAL_S,
+    include_country: bool = False,
 ) -> dict[str, Any]:
-    """模块级便捷函数:逆地理编码。"""
+    """模块级便捷函数:逆地理编码(``include_country`` 透传给 :meth:`NominatimClient.reverse`)。"""
     client = _resolve_client(endpoint, timeout, session, min_interval)
-    return client.reverse(lat, lng, zoom=zoom)
+    return client.reverse(lat, lng, zoom=zoom, include_country=include_country)
 
 
 def _resolve_client(

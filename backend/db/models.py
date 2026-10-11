@@ -726,6 +726,8 @@ class PlaceDetail(Base):
 # --------------------------------------------------------------------------- #
 
 GEOCODER_LEN = 16
+# 境内外口径(TASK-20):存 services.region_gate 的 "domestic" / "overseas";空串 = 还没判出
+REGION_LEN = 16
 
 
 class OriginCache(Base):
@@ -742,6 +744,11 @@ class OriginCache(Base):
     命中时按原值回报,响应形状与不走缓存时逐字段一致;**只缓存真的问到了地理编码源的
     结果** —— 调用方直接给坐标(``geocoder="none"``)的退化路径不写行。坐标按
     :data:`COORD_PRECISION` 定点入库,与其他表同一口径。
+
+    ``region``(TASK-20 境外双轨 P1)存这个起点的境内外口径:``domestic`` / ``overseas``,
+    **空串 = 还没判出**(:func:`services.region_gate.detect_region` 两腿都失败时 detector=none,
+    那一刻按境内回报但**不写这里**,下次搜索还能重试)。命中缓存且 ``region`` 非空时,
+    ``/api/geocode`` 直接用它、**零额外网络**;判定要问 Nominatim/Photon,比读一行贵得多。
     """
 
     __tablename__ = "origin_cache"
@@ -751,6 +758,7 @@ class OriginCache(Base):
     lat: Mapped[float] = mapped_column(Float, nullable=False)
     lng: Mapped[float] = mapped_column(Float, nullable=False)
     geocoder: Mapped[str] = mapped_column(String(GEOCODER_LEN), nullable=False, default="")
+    region: Mapped[str] = mapped_column(String(REGION_LEN), nullable=False, default="")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )

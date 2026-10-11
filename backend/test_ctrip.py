@@ -288,3 +288,127 @@ def test_ctrip_ids_two_level_keyword(monkeypatch) -> None:
     assert found2 is None and seen == ["昆山柏轩酒店"], \
         "名字自带城市前缀时不重复拼城市(fake 对该词返回 None,证明只发了一次)"
     ota_links._cache.clear()
+
+
+# --------------------------------------------------------------------------- #
+# TASK-24(境外双轨 P5):IntlCity 境外城市解析 + 懒补齐城市级兜底
+# --------------------------------------------------------------------------- #
+
+def intl_city_row(city_id="3167", city_name="因特拉肯", country="瑞士", word="因特拉肯"):
+    return {"id": city_id, "type": "IntlCity", "word": word, "cityId": int(city_id),
+            "cityName": city_name, "countryName": country}
+
+
+def test_parse_suggest_intl_cities() -> None:
+    payload = hotel_payload(
+        intl_city_row(),
+        intl_city_row(city_id="345428", city_name="因特拉肯", country="美国"),
+        hotel_row(),                                   # Hotel 类型不混入
+        {"id": "x", "type": "IntlCity", "cityId": 1},  # word/cityName 缺失不炸
+    )
+    rows = ctrip.parse_suggest_intl_cities(payload)
+    assert [r["city_id"] for r in rows] == [3167, 345428, 1]
+    assert rows[0]["country_name"] == "瑞士" and rows[0]["city_name"] == "因特拉肯"
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"Response": {"searchResults": "不是列表"}},
+                                     {"Response": {"searchResults": [{"type": "IntlCity"}]}},  # cityId 缺失
+                                     {"Response": {"searchResults": [{"type": "IntlCity", "cityId": "abc"}]}},  # 非数字
+                                     {"Response": {"searchResults": [{"type": "IntlCity", "cityId": 0}]}}])  # ≤0
+def test_parse_suggest_intl_cities_bad_shapes(payload) -> None:
+    assert ctrip.parse_suggest_intl_cities(payload) == []
+
+
+def test_parse_suggest_hotel_ignores_intl_city() -> None:
+    """既有 parse_suggest(只认 Hotel)口径零变化:IntlCity 不得混入。"""
+    rows = ctrip.parse_suggest(hotel_payload(intl_city_row(), hotel_row()))
+    assert [r["hotel_id"] for r in rows] == ["83790270"]
+
+
+def test_suggest_city_returns_first_and_keyword() -> None:
+    fake = FakeSession(hotel_payload(intl_city_row(),
+                                     intl_city_row(city_id="345428", country="美国")))
+    found = ctrip.suggest_city("因特拉肯", session=fake)
+    assert found == {"city_id": 3167, "city_name": "因特拉肯", "country_name": "瑞士",
+                     "word": "因特拉肯", "keyword": "因特拉肯"}, "同名多国取首条"
+    body = json.loads(fake.calls[0]["data"].decode("utf-8"))
+    assert body["searchType"] == "D", "城市查询用 searchType=D(调研 §A1)"
+
+
+@pytest.mark.parametrize("fake", [
+    FakeSession(None, status_code=500),
+    FakeSession(error=requests.ConnectionError("断网")),
+    FakeSession({"Response": {"searchResults": []}}),
+])
+def test_suggest_city_degrades_to_none(fake) -> None:
+    assert ctrip.suggest_city("某城", session=fake) is None
+
+
+def test_suggest_city_empty_keyword_skips_request() -> None:
+    fake = FakeSession(hotel_payload(intl_city_row()))
+    assert ctrip.suggest_city("  ", session=fake) is None
+    assert fake.calls == []
+
+
+def test_backfill_intl_city_fallback_when_hotel_missing(session, monkeypatch) -> None:
+    """TASK-24:境外酒店解析不到 Hotel → IntlCity 城市级兜底写回 summary。"""
+    from app.api import collections as collections_api
+    from services import ota_links
+    repo.upsert_collection(session, kind="place", to_lat=46.686, to_lng=7.863,
+                           to_name="🛏️ 某境外民宿 · 住宿",
+                           summary={"stay_kind": "guest_house", "city": "因特拉肯"})
+
+    monkeypatch.setattr(ota_links.ctrip, "suggest_hotel",
+                        lambda *a, **k: None)   # 境外小体量酒店:解析不到
+    monkeypatch.setattr(ota_links.ctrip, "suggest_city",
+                        lambda *a, **k: {"city_id": 3167, "city_name": "因特拉肯",
+                                         "country_name": "瑞士", "keyword": "因特拉肯"})
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    summary = payload["collections"][0]["summary"]
+    assert summary["ctrip_city_id"] == 3167 and summary["ctrip_city_fallback"] is True
+    assert summary["ctrip_city_name"] == "因特拉肯" and summary["country"] == "瑞士"
+    assert not summary.get("ctrip_hotel_id"), "酒店级没解析到就不写 hotel_id"
+    # 持久化后零网络
+    ota_links._cache.clear()
+    calls = []
+    monkeypatch.setattr(ota_links.ctrip, "suggest_hotel",
+                        lambda *a, **k: calls.append("hotel"))
+    monkeypatch.setattr(ota_links.ctrip, "suggest_city",
+                        lambda *a, **k: calls.append("city"))
+    payload2 = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    assert payload2["collections"][0]["summary"]["ctrip_city_id"] == 3167
+    assert calls == [], "城市兜底已落的行不再解析"
+
+
+def test_backfill_domestic_city_no_intl_fallback(session, monkeypatch) -> None:
+    """境内城市 suggest_city 返回 None(无 IntlCity 条目)→ 境内口径零变化,留空。"""
+    from app.api import collections as collections_api
+    from services import ota_links
+    repo.upsert_collection(session, **_stay_kwargs())   # 昆山柏轩,city=昆山
+    monkeypatch.setattr(ota_links.ctrip, "suggest_hotel", lambda *a, **k: None)
+    seen = []
+    monkeypatch.setattr(ota_links.ctrip, "suggest_city",
+                        lambda *a, **k: (seen.append(a[0] if a else k.get("keyword")), None)[1])
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    summary = payload["collections"][0]["summary"]
+    assert not summary.get("ctrip_hotel_id") and not summary.get("ctrip_city_id")
+    assert not summary.get("ctrip_city_fallback")
+
+
+def test_backfill_hotel_preferred_over_city_fallback(session, monkeypatch) -> None:
+    """酒店级解析成功时不触发城市兜底(境外大牌酒店有 Hotel 条目)。"""
+    from app.api import collections as collections_api
+    from services import ota_links
+    repo.upsert_collection(session, kind="place", to_lat=-45.031, to_lng=168.662,
+                           to_name="🛏️ 皇后镇湖畔诺富特酒店 · 住宿",
+                           summary={"stay_kind": "hotel", "city": "皇后镇"})
+    monkeypatch.setattr(ota_links.ctrip, "suggest_hotel",
+                        lambda *a, **k: {"hotel_id": "2196343", "city_id": 3860,
+                                         "city_name": "皇后镇", "word": "x",
+                                         "gd_lat": 0.0, "gd_lon": 0.0,
+                                         "keyword": "x", "matched": True})
+    monkeypatch.setattr(ota_links.ctrip, "suggest_city",
+                        lambda *a, **k: pytest.fail("酒店级成功不该触发城市兜底"))
+    payload = collections_api.list_collections(kind=None, cat=None, limit=None, session=session)
+    summary = payload["collections"][0]["summary"]
+    assert summary["ctrip_hotel_id"] == "2196343" and not summary.get("ctrip_city_fallback")

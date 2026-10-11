@@ -2816,7 +2816,12 @@ function placeActsHtml(item){
 }
 // TASK-15:路线/住宿子行的动作排 —— 「取消收藏」旁并排外链:
 // 路线子行=高德导航 + Google Maps(用该路线收藏自身 from/to 坐标,见 bookLinksForRoute);
-// 住宿子行=OTA 三渠道(携程/Booking/Airbnb,搜索词=城市+酒店纯名,见 bookLinksForStay)。
+// 住宿子行=OTA 渠道(见 bookLinksForStay)。
+// TASK-24(境外双轨 P5,神朱 2026-10-10 拍板):
+//   Booking 外链加 latitude/longitude(实测 ss= 文本路径对境内访客整体 0 结果,
+//   坐标参数 3/3 全命中,见 docs/OVERSEAS-PLAN.md §4.4);
+//   Airbnb 境内隐藏(2022-07 起境内房源已停,实测境内页 0 卡片),region=overseas 才出;
+//   携程境外城市兜底:summary.ctrip_city_id 由后端懒补齐(含 IntlCity 解析)。
 function childActsHtml(item){
   const group=favGroupOf(item);
   if(group==="place") return placeActsHtml(item);   // 未归类的裸目的地行:无外链,只取消收藏
@@ -3386,13 +3391,28 @@ function bookLinksForStay(item){
     const kw=encodeURIComponent(city?(name.startsWith(city)?name:(city+name)):name);
     ctripUrl="https://hotels.ctrip.com/hotels/list?keyword="+kw;
   }
+  // TASK-24:Booking 加坐标参数(收藏行自带 to_lat/to_lng)——实测 ss= 文本
+  // 对境内访客整体 0 结果,坐标圈选 3/3 命中(昆山 2156 家/上海 2179 家/因特拉肯 2874 家);
+  // 无坐标的库外收藏退回纯 ss 拼法(不丢链接,不比现状差)。
+  const hasStayCoord=isFinite(num(item.to_lat))&&isFinite(num(item.to_lng));
   const ss=encodeURIComponent(city?(name+","+city):name);
-  const ab=city?(encodeURIComponent(city)+"--China"):encodeURIComponent(name);
-  return [{label:"🏨 携程",cls:"",url:ctripUrl},
-    {label:"🏨 Booking",cls:"alt",
-     url:"https://www.booking.com/searchresults.zh-cn.html?ss="+ss+
-         "&group_adults=2&group_children=0&no_rooms=1"},
-    {label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+ab+"/homes"}];
+  let bookingUrl="https://www.booking.com/searchresults.zh-cn.html?ss="+ss+
+    "&group_adults=2&group_children=0&no_rooms=1";
+  if(hasStayCoord){
+    bookingUrl="https://www.booking.com/searchresults.zh-cn.html?ss="+
+      encodeURIComponent(name)+
+      "&latitude="+num(item.to_lat)+"&longitude="+num(item.to_lng)+
+      "&group_adults=2&group_children=0&no_rooms=1";
+  }
+  const links=[{label:"🏨 携程",cls:"",url:ctripUrl},
+    {label:"🏨 Booking",cls:"alt",url:bookingUrl}];
+  // TASK-24:Airbnb 仅境外出(境内房源 2022-07 起已停,实测境内 slug 页 0 卡片);
+  // region 来自收藏快照 summary.region(P1/TASK-20 落地后自动有值),缺省境内。
+  if(String(summary.region||"")==="overseas"){
+    const ab=city?(encodeURIComponent(city)+"--"+encodeURIComponent(summary.country||"China")):encodeURIComponent(name);
+    links.push({label:"🏡 Airbnb",cls:"alt",url:"https://www.airbnb.com/s/"+ab+"/homes"});
+  }
+  return links;
 }
 // TASK-14:收藏条目名去装饰前缀/后缀(「📍 松花湖滑雪场 · 目的地」→「松花湖滑雪场」),
 // 目的地行的路线/住宿外链按这个纯名 + 坐标生成。

@@ -120,6 +120,84 @@ def parse_suggest(payload: Any) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_suggest_intl_cities(payload: Any) -> list[dict[str, Any]]:
+    """解析 suggest 响应里的**境外城市**条目(``type == "IntlCity"``)。
+
+    TASK-24(境外双轨 P5,2026-10-10 实测):同一 suggest 接口对境外查询返回
+    ``{"type":"IntlCity","id":"3167","word":"因特拉肯","cityId":3167,
+    "cityName":"因特拉肯","countryName":"瑞士"}``。境外小体量酒店常解析不到
+    Hotel 条目,城市级 ``cityId`` 可让前端退到 list 页(``cityId+searchWord``)
+    不丢链接。既有 :func:`parse_suggest`(只认 Hotel)口径**零变化**。
+
+    返回 ``[{city_id, city_name, country_name, word}]``;坏结构返回 ``[]`` 不抛。
+    """
+    rows: list[dict[str, Any]] = []
+    if not isinstance(payload, Mapping):
+        return rows
+    response = payload.get("Response")
+    if not isinstance(response, Mapping):
+        return rows
+    results = response.get("searchResults")
+    if not isinstance(results, list):
+        return rows
+    for item in results:
+        if not isinstance(item, Mapping) or str(item.get("type") or "") != "IntlCity":
+            continue
+        raw_city = item.get("cityId") or item.get("id")
+        try:
+            city_id = int(raw_city)
+        except (TypeError, ValueError):
+            continue
+        if city_id <= 0:
+            continue
+        rows.append({
+            "city_id": city_id,
+            "city_name": str(item.get("cityName") or item.get("word") or "").strip(),
+            "country_name": str(item.get("countryName") or "").strip(),
+            "word": str(item.get("word") or "").strip(),
+        })
+    return rows
+
+
+def suggest_city(
+    keyword: str,
+    *,
+    timeout: Optional[float] = None,
+    session: Optional[Any] = None,
+) -> Optional[dict[str, Any]]:
+    """城市名(中文或英文)→ 携程境外城市 ``{city_id, city_name, country_name}``。
+
+    同名多国(实测「因特拉肯」→ 瑞士/美国/澳大利亚三条)取**首条**(携程按
+    热度排序,首条置信度最高);解析不到/出错返回 ``None`` 不抛(尽力而为口径,
+    与 :func:`suggest_hotel` 一致)。
+    """
+    text = str(keyword or "").strip()
+    if not text:
+        return None
+    http = session if session is not None else _get_session()
+    body = json.dumps(
+        {"searchType": "D", "keyword": text, "head": dict(_HEAD)}, ensure_ascii=False
+    ).encode("utf-8")
+    _throttle()
+    try:
+        response = http.request(
+            "POST", SUGGEST_URL, data=body,
+            timeout=normalize_timeout(timeout if timeout is not None else DEFAULT_TIMEOUT_S),
+            headers={"Content-Type": "application/json"},
+        )
+        status = getattr(response, "status_code", None)
+        if status != 200:
+            return None
+        rows = parse_suggest_intl_cities(json.loads(getattr(response, "text", "") or ""))
+    except DataSourceError:
+        return None
+    except Exception:  # noqa: BLE001 - 尽力而为的增强源:任何失败都降级为 None
+        return None
+    if not rows:
+        return None
+    return {**rows[0], "keyword": text}
+
+
 def suggest_hotel(
     keyword: str,
     *,

@@ -2739,6 +2739,85 @@ def test_task15_stay_links_keyword_has_city(html: str) -> None:
     assert "summary.city" in city_fn, "城市来自收藏快照 summary.city"
 
 
+# --------------------------------------------------------------------------- #
+# TASK-24(境外双轨 P5):Booking 坐标参数 + Airbnb 境内隐藏
+# --------------------------------------------------------------------------- #
+
+def test_task24_booking_url_has_coordinates(html: str) -> None:
+    """TASK-24:Booking URL 有坐标时追加 latitude/longitude(实测 ss 文本路径
+    对境内访客 0 结果、坐标圈选 3/3 命中,docs/OVERSEAS-PLAN.md §4.4)。"""
+    fn = html[html.index("function bookLinksForStay"):]
+    fn = fn[:fn.index("function plainFavName")]
+    assert "&latitude=" in fn and "&longitude=" in fn, "Booking URL 要带坐标参数"
+    assert "item.to_lat" in fn and "item.to_lng" in fn, "坐标取收藏行自身 to_lat/to_lng"
+    assert "isFinite(num(item.to_lat))" in fn, "无坐标要退化(不产出 NaN 参数)"
+
+
+def test_task24_booking_fallback_without_coords(html: str) -> None:
+    """无坐标的库外收藏:Booking 退回 ss=名,城市 拼法(不丢链接)。"""
+    fn = html[html.index("function bookLinksForStay"):]
+    fn = fn[:fn.index("function plainFavName")]
+    assert 'searchresults.zh-cn.html?ss="+ss+' in fn, "退化路径保留既有 ss 拼法"
+
+
+def test_task24_airbnb_only_overseas(html: str) -> None:
+    """TASK-24:Airbnb 仅 summary.region=overseas 出(境内房源 2022-07 已停,
+    实测境内 slug 页 0 卡片);缺省 domestic 不出。"""
+    fn = html[html.index("function bookLinksForStay"):]
+    fn = fn[:fn.index("function plainFavName")]
+    assert 'summary.region' in fn and '"overseas"' in fn, "region 判定分支在"
+    assert 'airbnb.com/s/' in fn, "境外仍给 Airbnb(渠道保留)"
+    # 携程+Booking 无条件出,只有 Airbnb 在 region 分支里
+    assert fn.index("携程") < fn.index("summary.region"), "携程不受 region 分支控制"
+    assert fn.index("Booking") < fn.index("summary.region"), "Booking 不受 region 分支控制"
+
+
+def test_task24_stay_links_node_run(html: str, tmp_path) -> None:
+    """node 真跑 bookLinksForStay:境内/境外/无坐标三形态 URL 断言(第三层验证)。"""
+    import subprocess, json as _json
+    start = html.index("function stayCityOf")
+    end = html.index("// TASK-14:收藏条目名去装饰前缀/后缀")
+    fns = html[start:end]
+    pf_start = html.index("function plainFavName")
+    pf_end = html.index("\n}\n", pf_start) + 3
+    fns += html[pf_start:pf_end]
+    fns += """
+function num(value){
+  return (value===null||value===undefined||value==="")?NaN:Number(value);
+}
+const domestic={id:1,name:"🛏️ 昆山柏轩酒店(亭林园店) · 住宿",to_lat:31.3847,to_lng:120.9813,
+  summary:{city:"昆山",stay_kind:"hotel",ctrip_hotel_id:"83790270"}};
+const overseas={id:2,name:"🛏️ Hotel Du Nord · 住宿",to_lat:46.686,to_lng:7.863,
+  summary:{city:"因特拉肯",region:"overseas",country:"瑞士",stay_kind:"hotel",ctrip_city_id:3167,ctrip_city_fallback:true}};
+const noCoord={id:3,name:"🛏️ 库外某民宿 · 住宿",to_lat:null,to_lng:null,summary:{city:"上海"}};
+const out={domestic:bookLinksForStay(domestic),overseas:bookLinksForStay(overseas),noCoord:bookLinksForStay(noCoord)};
+console.log(JSON.stringify(out));
+"""
+    script = tmp_path / "t24.js"
+    script.write_text(fns, encoding="utf-8")
+    r = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, f"node 执行失败:{r.stderr[:300]}"
+    out = _json.loads(r.stdout.strip())
+
+    dom = {x["label"].split()[-1]: x["url"] for x in out["domestic"]}
+    ovs = {x["label"].split()[-1]: x["url"] for x in out["overseas"]}
+    noc = {x["label"].split()[-1]: x["url"] for x in out["noCoord"]}
+
+    # 境内:携程 detail + Booking 带坐标 + 无 Airbnb
+    assert dom["携程"] == "https://hotels.ctrip.com/hotels/detail/?hotelId=83790270"
+    assert "latitude=31.3847" in dom["Booking"] and "longitude=120.9813" in dom["Booking"]
+    assert "Airbnb" not in dom, "境内不出 Airbnb"
+    # 境外:携程走 cityId 兜底(无 hotelId)+ Booking 坐标 + Airbnb slug
+    assert ovs["携程"] == ("https://hotels.ctrip.com/hotels/list?cityId=3167"
+                          "&searchWord=Hotel%20Du%20Nord&directSearch=1&old=1")
+    assert "latitude=46.686" in ovs["Booking"]
+    assert ovs["Airbnb"] == "https://www.airbnb.com/s/%E5%9B%A0%E7%89%B9%E6%8B%89%E8%82%AF--%E7%91%9E%E5%A3%AB/homes"
+    # 无坐标:Booking 退 ss=名,城市(不带 latitude)、无 Airbnb、携程 keyword 兜底
+    assert "latitude=" not in noc["Booking"] and "ss=" in noc["Booking"]
+    assert "%2C" in noc["Booking"] or "," in noc["Booking"], "ss=酒店名,城市 逗号语义保留"
+    assert "Airbnb" not in noc and noc["携程"].startswith("https://hotels.ctrip.com/hotels/list?keyword=")
+
+
 def test_task15_stay_fav_payload_carries_city(html: str) -> None:
     """TASK-15:收藏住宿时把 /api/stays 的 city 写进 summary.city(新收藏快照)。"""
     fn = html[html.index("async function addFavStay"):]

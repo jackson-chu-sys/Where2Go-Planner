@@ -984,6 +984,63 @@
 
 ---
 
+## [TASK-20] 境外双轨 P1:region_gate 境内外判定服务(神朱 2026-10-10 拍板「使用推荐选项」,方案见 docs/OVERSEAS-PLAN.md §2/§4.2)
+
+- 状态: pending
+- 目标: 新增 `services/region_gate.py`:起点解析后经 Photon/Nominatim 的 country 字段判定 domestic/overseas(Nominatim country_code=CN;Photon country 含「中国」);OriginCache 加 `region` 列(TTL 同 7 天);`/api/geocode` 响应**只加** `region` 键;双失败默认 domestic+note;前端加「境外模式」手动开关(localStorage 记忆,可覆盖自动判定)。
+- 涉及: backend/services/region_gate.py(新)、backend/db/models.py(OriginCache.region)、backend/app/api/places.py、index.html(开关)、backend/test_region_gate.py(≥15 用例全 mock)
+- 验收: pytest 零回归+≥15 新增;/api/geocode 既有键零变化;判定用例覆盖(中文境外名→overseas、境内→domestic、双失败→domestic 兜底、手动开关覆盖)。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-21] 境外双轨 P2:境外 POI 检索链(Overpass 复活,依赖 TASK-20)
+
+- 状态: pending
+- 目标: 新增 `data_sources/osm_overseas.py`(复活阶段1 Overpass 检索,四分类 SEARCH_GROUPS 口径从 git 历史 classify.py 考古);place_loader 按 region 分支(overseas → Overpass 环形/单圆 + 本地 haversine);入库身份 osm_type="osm_node/way/relation"、tags.source="OSM"、tags.coord_system="WGS-84";渐进配额口径(target_total/fetch_rounds)复用。
+- 涉及: backend/data_sources/osm_overseas.py(新)、backend/services/place_loader.py、classify.py、backend/test_osm_overseas.py(≥20 用例全 mock)
+- 验收: pytest 零回归+≥20 新增;境内链路(amap)零改动;二次查询读库零网络;真机冒烟一次境外城市(因特拉肯)冷抓。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-22] 境外双轨 P3:境外路线+住宿(OSRM 驾车复活 + OSM 住宿腿,依赖 TASK-21)
+
+- 状态: pending
+- 目标: routes.py 驾车按 region 分支走 OSRM(router.project-osrm.org,git 历史恢复 osrm.py,几何抽稀口径复用;过路费境外=里程×区域费率简化,无 toll_distance 数据源);铁路/飞机估算引擎沿用;stays.py 加 OSM 住宿腿(tourism=hotel 等阶段1 STAY_TAGS)、城市反查用 Nominatim(zh-CN);估价规则表境外品牌沿用。
+- 涉及: backend/data_sources/osrm.py(恢复)、backend/services/routes.py、stays.py、backend/test_routes_overseas.py/test_stays_overseas.py(≥15 用例)
+- 验收: pytest 零回归+≥15 新增;境内路线/住宿口径零变化;真机冒烟境外一次(因特拉肯→格林德瓦驾车、周边住宿)。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-23] 境外双轨 P4:前端双轨地图(Leaflet 境外轨,依赖 TASK-22)
+
+- 状态: pending
+- 目标: index.html 按 region 分支:domestic → 高德 JS API 2.0(零改动);overseas → Leaflet(从 9/30 前 git 历史考古复用 pin/环圈/InfoWindow 组件),瓦片三线轮换 tile.openstreetmap.de 主/osm.fr 备/basemaps.cartocdn.com 兜底(attribution 必带);坐标系境外 WGS-84 直用;降级条款:三瓦片线全挂→提示「境外地图暂不可用」不白屏不空过。
+- 涉及: 仅 backend/app/static/index.html + backend/test_frontend_routes.py(≥12 静态断言 + node --check)
+- 验收: pytest 零回归+≥12 断言;境内高德链路零回归;browser QA:境外城市搜索→Leaflet 渲染→pin→弹窗→0 JS error。
+- 结果: (待夜班回填)
+
+---
+
+## [TASK-24] 境外双轨 P5:OTA 外链修正(Booking 坐标参数 + Airbnb 境内隐藏 + ctrip IntlCity;不依赖 P1~P4)
+
+- 状态: done
+- 目标: ①**Booking 外链加坐标参数**(实测口径见 docs/OVERSEAS-PLAN.md §4.4,dest_id 路线已实测放弃):bookLinksForStay 的 Booking URL 在既有 ss 基础上追加 `&latitude=<to_lat>&longitude=<to_lng>`(收藏行自带坐标;无坐标的库外收藏退回现状 ss 拼法不丢链接);②**Airbnb 境内隐藏**:domestic(现状全部收藏)渠道=携程+Booking 两家,region=overseas 才出 Airbnb(/s/<slug>/homes);region 判定过渡期用 summary.region(P1 落地后自动有值)缺省 domestic;③**ctrip.py 纳入 IntlCity**:parse_suggest 增 type=="IntlCity" 解析(city_id 落 summary.ctrip_city_id,境外酒店 detail 解析不到时 list 页 cityId 兜底),既有 Hotel 口径零变化。
+- 只读清单: backend/app/static/index.html(bookLinksForStay 段 L3360~3403)、backend/data_sources/ctrip.py、backend/test_ctrip.py、backend/test_frontend_routes.py(TASK-15 段 L2683~2745)、docs/OVERSEAS-PLAN.md §3/§4.4。
+- 涉及: 仅前端 index.html + backend/data_sources/ctrip.py + 两个测试文件;**不动** ota_links.py 懒补齐结构、不动 collections API。
+- 验收: pytest 零回归(基线 1409)+≥10 新增(IntlCity 解析/既有 Hotel 零变化/Booking URL 含 latitude+longitude/无坐标退化/Airbnb domestic 分支不出/overseas 出);node --check;browser QA:收藏树住宿子行 Booking URL 带坐标、真开一次昆山柏轩 Booking 链接出结果列表(≥1 卡片)、Airbnb 按钮境内行消失、0 JS error;测试收藏清理。
+- 结果: **完成**(2026-10-10 当晚神朱拍板「使用推荐选项今晚开始」后执行器手写,commit 见 git log)。
+  - **实施前实测推翻 dest_id 懒解析方案**(调研 §3.1 原设想):①curl 直连城市页永远撞 cookie 墙(3 种 cookie 变体全「需您同意」);②autocomplete 裸调 3 个公开 aid 全空;③headless 批量采集不稳(20 城采到 14,西安/长沙抓到周边城市错误 id)。**替代=Booking URL 加 `latitude=&longitude=`**(坐标圈选实测 3/3 全命中:昆山 2156 家/上海 2179 家/因特拉肯 2874 家;收藏行自带 to_lat/to_lng,零映射表零后端),口径修正已落 docs/OVERSEAS-PLAN.md §4.4。
+  - 前端 index.html(bookLinksForStay):有坐标 → Booking `ss=<酒店纯名>&latitude=&longitude=`;无坐标库外收藏退既有 `ss=名,城市` 拼法不丢链接;Airbnb 仅 `summary.region==="overseas"` 出(缺省 domestic 隐藏;slug 用 summary.country,P1/TASK-20 落地后自动有值);携程三级口径不变。
+  - 后端:data_sources/ctrip.py 增 `parse_suggest_intl_cities`(只认 type=="IntlCity",既有 parse_suggest 零变化)+ `suggest_city`(searchType=D,同名多国取首条,失败 None 不抛);services/ota_links.py 增 `ctrip_city_for_stay`(TTL 缓存壳)+ backfill 接线(酒店级解析失败 → 城市级 IntlCity 兜底写 summary.ctrip_city_id/ctrip_city_fallback/country,已落行零网络;境内城市无 IntlCity 条目自然 None,境内口径零影响)。collections API 未动。
+  - 测试:test_ctrip.py +12(IntlCity 解析/坏形状 6 参数化/Hotel 口径零变化/suggest_city 首条+searchType=D/降级 3 参数化/懒补齐城市兜底+持久化零网络/境内不触发/酒店优先)+ test_frontend_routes.py +4(坐标参数断言/无坐标退化/Airbnb region 分支/**node 真跑 bookLinksForStay 三形态 URL 逐字断言**,含真实 num() 实现)。pytest backend/ = **1429 passed**(1409 基线零回归 + 20 新增);node --check 通过。
+  - browser QA(uvicorn 已重启,真机):收藏面板 3 条住宿子行 Booking URL 全带 latitude/longitude(真实收藏坐标)、Airbnb 0 个、携程 detail/list/keyword 三级正常 → **真开昆山柏轩 Booking 链接:h1「昆山柏轩酒店(亭林园玉山广场地铁站店):共2,153家住宿」+ 5 卡片正常渲染**(修复前同链接 0 家)→ window.__errs 0 条;未新增测试收藏(用库内既有 11 条验证),无需清理。
+  - 备注:吉林冬日光辉(万科松花湖店)在携程 suggest 无词条、城市「吉林」也无 IntlCity → 走 keyword 兜底+Booking 坐标圈选,均不丢链接。真机复现了神朱问题①的修复闭环。
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

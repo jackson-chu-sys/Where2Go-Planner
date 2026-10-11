@@ -77,6 +77,39 @@ def ctrip_ids_for_stay(name: str, city: str, lat: Any, lng: Any) -> Optional[dic
     return None
 
 
+def ctrip_city_for_stay(city: str) -> Optional[dict[str, Any]]:
+    """城市名 → 携程**境外城市** ``{city_id, city_name, country_name}``;失败 ``None`` 不抛。
+
+    TASK-24(境外双轨 P5):境外小体量酒店常解析不到 Hotel 条目,城市级 cityId 可让
+    前端退到 list 页(``cityId+searchWord``)不丢链接。**只认 IntlCity**——境内城市
+    自然返回 None,境内口径零影响。
+    """
+    text = str(city or "").strip()
+    if not text:
+        return None
+    now = time.time()
+    key = f"city:{text}"
+    with _cache_lock:
+        cached = _cache.get(key)
+        if cached is not None and cached[1] > now:
+            return cached[0]
+    result: Optional[dict[str, Any]] = None
+    try:
+        found = ctrip.suggest_city(text)
+        if found and found.get("city_id"):
+            result = {
+                "city_id": int(found["city_id"]),
+                "city_name": str(found.get("city_name") or ""),
+                "country_name": str(found.get("country_name") or ""),
+            }
+    except Exception:  # noqa: BLE001 - 尽力而为的增强源:任何失败只留空
+        result = None
+    ttl = _CACHE_TTL_S if result else _CACHE_NEG_TTL_S
+    with _cache_lock:
+        _cache[key] = (result, now + ttl)
+    return result
+
+
 def _suggest_cached(keyword: str, city: str, lat: Any, lng: Any) -> Optional[dict[str, Any]]:
     """suggest_hotel 的进程内 TTL 缓存壳(成功 7 天/失败 1h);失败 None 不抛。"""
     now = time.time()
@@ -125,11 +158,25 @@ def backfill_stay_ctrip_ids(session: Session) -> int:
             continue
         if str(summary.get("ctrip_hotel_id") or "").strip():
             continue  # 已解析过(永久缓存),零网络
+        if summary.get("ctrip_city_id") and summary.get("ctrip_city_fallback"):
+            continue  # TASK-24:城市级兜底已落(境外 IntlCity,永久缓存),零网络
         hotel = plain_stay_name(row.to_name or summary.get("name") or row.name)
         city = str(summary.get("city") or "").strip()
         found = ctrip_ids_for_stay(hotel, city, row.to_lat, row.to_lng)
         if not found:
-            continue  # 解析失败留空:负缓存 1h 内不重打,下次开面板再试
+            # TASK-24:酒店级解析不到 → 境外城市级兜底(IntlCity;境内城市自然
+            # 返回 None,境内口径零影响),前端可退 list 页 cityId+searchWord。
+            city_found = ctrip_city_for_stay(city) if city else None
+            if not city_found:
+                continue  # 都解析不到:负缓存 1h 内不重打,下次开面板再试
+            summary["ctrip_city_id"] = city_found["city_id"]
+            summary["ctrip_city_name"] = city_found.get("city_name") or city
+            summary["ctrip_city_fallback"] = True
+            if city_found.get("country_name"):
+                summary["country"] = city_found["country_name"]
+            row.summary = summary
+            updated += 1
+            continue
         summary["ctrip_hotel_id"] = found["hotel_id"]
         summary["ctrip_city_id"] = found["city_id"]
         if found.get("city_name"):

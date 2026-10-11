@@ -167,13 +167,22 @@ Airbnb: 境内隐藏(2022-07 起境内房源已停;真机实测对照坐实—�
 | **P4 前端双轨地图** | region=overseas 时 Leaflet 渲染(瓦片 osm.de 主/osm.fr 备/basemaps.cartocdn 三线轮换,attribution 必带);境内高德 JS API 零改动;pin/环圈/弹窗组件从 9/30 前 index.html 考古复用 | index.html、test_frontend_routes.py、browser QA | 中偏大(前端单晚,神朱 2026-10-01 已裁定的降级条款思路适用:Leaflet 不可用→高德境外空白瓦片+提示,不空过) |
 | **P5 OTA 外链修正** | §3.2/§3.3:Booking dest_id 懒解析+缓存(summary.booking_dest_id)、Airbnb 境内隐藏境外启用、ctrip.py 纳入 IntlCity/IntlDistrict | data_sources/ctrip.py、services/ota_links.py、index.html(bookLinksForStay)、≥10 测试 | 小~中(**可独立先行,不依赖 P1-P4**——境内 Booking 0 结果问题现在就存在) |
 
-### 4.3 风险与开放问题(报神朱拍板)
+### 4.3 风险与开放问题(神朱 2026-10-10 拍板:使用推荐选项,当晚开工 P5)
 
-1. **Overpass 冷抓慢回来**:境外轨冷抓一段 20~80s(公共实例),阶段1 老体验;渐进配额口径(TASK-6b)可复用缓解,但首次体感仍差。可接受?(境内高德 3~12s 的爽快感境外给不了)
-2. **LLM 翻译腿**:中文境外地名 → 英文名+国家 的 LLM 翻译是否启用(Nominatim zh-CN 已 8/8 全中,翻译腿只是 Photon 兜底的增强;不启用则链路更简单)。
-3. **P5 是否先行**:Booking 境内 0 结果问题不等境外轨,建议 P5 单独排下一晚先修(dest_id 懒解析 + Airbnb 境内隐藏)。
-4. **Google/Azure 彻底出局确认**:本调研在境内出口实测双双不可达;若神朱预期用户群「人人有代理」,可重评 Google(免费额度 10K/月对 DEMO 足够),但默认不推荐。
-5. **Airbnb 渠道**:境内隐藏后,境内住宿渠道=携程+Booking 两家;是否给境内补「美团/去哪儿」第三家?(未调研,如需另立条目)
+1. **Overpass 冷抓慢**:✅ 接受(渐进配额口径复用缓解);
+2. **LLM 翻译腿**:❌ 不启用(Nominatim zh-CN 8/8 已全中,链路更简单);
+3. **P5 先行**:✅ 当晚(2026-10-10)开工;
+4. **Google/Azure 出局**:✅ 确认;
+5. **境内第三渠道(美团/去哪儿)**:❌ 不补,维持携程+Booking。
+
+### 4.4 P5 实施口径修正(2026-10-10 当晚实施前实测,取代 §3.1 的 dest_id 懒解析方案)
+
+dest_id 路线实测**放弃**,理由三条:①curl 直连城市页永远撞 cookie 墙(「需您同意」,三种 cookie 变体全试过),服务端懒解析不可行;②autocomplete 裸调(3 个公开 aid)全返回空 results;③headless 批量采集不稳定(20 城采到 14 个,且西安/长沙抓到的是**周边城市**的错误 dest_id——正则取页面首个 dest_id 不可靠),长尾城市覆盖不全等于没修。
+
+**替代方案(实测 3/3 全命中):Booking URL 直接加 `latitude=&longitude=`**(收藏行自带 to_lat/to_lng):
+- `searchresults.zh-cn.html?ss=<酒店纯名>&latitude=31.3847&longitude=120.9813&group_adults=2&no_rooms=1` → 昆山柏轩坐标:h1「昆山柏轩酒店:共2,156家住宿」列表正常;
+- 上海人民广场坐标 → 2,179 家(JW万豪/国际饭店在列);因特拉肯坐标 → 2,874 家(Interlaken Chalet 等在列);
+- 境外通用、零映射表、零后端改动。无坐标的库外收藏退回现状 ss 拼法(不丢链接)。
 
 ## 5. 引用汇总
 

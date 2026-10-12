@@ -1018,11 +1018,18 @@
 
 ## [TASK-22] 境外双轨 P3:境外路线+住宿(OSRM 驾车复活 + OSM 住宿腿,依赖 TASK-21)
 
-- 状态: pending
+- 状态: done
 - 目标: routes.py 驾车按 region 分支走 OSRM(router.project-osrm.org,git 历史恢复 osrm.py,几何抽稀口径复用;过路费境外=里程×区域费率简化,无 toll_distance 数据源);铁路/飞机估算引擎沿用;stays.py 加 OSM 住宿腿(tourism=hotel 等阶段1 STAY_TAGS)、城市反查用 Nominatim(zh-CN);估价规则表境外品牌沿用。
 - 涉及: backend/data_sources/osrm.py(恢复)、backend/services/routes.py、stays.py、backend/test_routes_overseas.py/test_stays_overseas.py(≥15 用例)
 - 验收: pytest 零回归+≥15 新增;境内路线/住宿口径零变化;真机冒烟境外一次(因特拉肯→格林德瓦驾车、周边住宿)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-12 夜班,Codex 写码(42min 触 40min 止损线被 kill,**实现+测试已全部落盘**)+执行器复跑收口 commit,commit `8fda640`,按 `docs/TASK-22-CONTRACT.md` 逐字落地)。
+  - `data_sources/osrm.py`(11.5KB):`git show 2845eb1^:backend/data_sources/osrm.py` 零改动恢复;`_common.py` 代理表加 `"osrm": PROXY_OFF`;`__init__.py` 补导出。
+  - `routes.py`(+120):`osrm_leg`(OSRM 返回归一成 amap_leg 同形状,toll_distance_km 恒 None→费用自动退 heuristic)+ `default_router_osrm`;`driving_route` 增 region 参(overseas→OSRM 轨、source="osrm"、note 追加境外口径「境外费率按中国西部档估算,仅供参考」、router= 显式注入优先;domestic 现状零改动);`plan_routes` 增 region 透传(铁路/飞机估算腿不分轨,既有降级路径)。
+  - `stays.py`(+333):`fetch_stay_pois` 增 region 分支(overseas→osm_overseas 单圆检索 tourism in STAY_TAGS,行归一现版形状,kind 用现成 stay_kind OSM 分支,身份 node/way/relation+原生 id 不 crc32);`stay_city` 境外走 Nominatim reverse(include_country/include_address,TASK-20 扩展的 opt-in)取 city||town||village、失败 None 不阻塞;半径阶梯/负缓存(键不含 region)/批量 LLM 估价/price_kind 规则表全共用现状代码。`nominatim.py` +56 行(include_address opt-in)。
+  - API:`/api/routes` 与 `/api/stays` 各增可选 region 参(非法 400 中文)+响应**只加 region 键**,既有键逐键零变化。前端 index.html(+6/-0):loadRoutes/loadStays 在境外开关勾选时追加 region=overseas(§1.6 最小改动,住宿/路线卡片零改动)。
+  - 测试:`test_routes_overseas.py` 583 行 + `test_stays_overseas.py` 671 行(契约 §2 七组:osrm 恢复完整性/overseas 驾车分支+domestic 零变化/plan_routes 透传/API region 键/OSM 住宿腿+负缓存共用+stay_city/API stays region/前端接线)。执行器复跑 pytest backend/ = **1552 passed**(1512 基线零回归 + 40 新增,141s),超 ≥15 要求;node --check 通过。
+  - 真机冒烟(uvicorn 已重启到 8fda640,执行器实测):①境外驾车 `/api/routes?...46.686,7.863→46.624,8.036&region=overseas` → **kind=real、source=osrm、19.7km/24min**(与契约 §0 实测数字吻合)、geometry 1161 点、cost 17 元(toll 4 heuristic + fuel 13)、note 含境外西部档口径、region=overseas、铁路腿未出(<100km 阈值正确);首两次请求 OSRM 公共实例 SSL 握手超时→服务层降级 unavailable(降级语义正确、不 500),第三次成功——公共 demo 实例波动,非代码问题。②境外住宿 `/api/stays?lat=46.686&lng=7.863&region=overseas` → **count=106、source=osm**(Backpackers Villa Sonnenhof hostel 约¥45-135/晚 rule、Du Nord hotel 约¥405-810/晚 rule、city=因特拉肯/Interlaken,kind 归一与规则估价全生效)。③境内对照零回归:/api/routes 上海→杭州 kind=real source=amap 172.3km、/api/stays 上海 197 家 source=db region=domestic。
+  - **Codex 256K 统计**:总时长 **42min** 触 40min 止损线被 kill(kill 时实现+两测试文件已全部落盘,执行器复跑全绿后收口 commit),function_calls ~120,首轮写码启动后 **0.35min**(R8 12min 线内,历史最快),tokens 用量 ~12M total(含 cache 重放),零 compact。routes.py+stays.py 两个大文件(1400+1000 行)是本条贴线主因,与 6c/6d/6g/9b/9c 同形态;派单时已加「先实现后测试、全量 pytest 只跑一次」提醒,未见反复读大文件回圈。
 
 ---
 

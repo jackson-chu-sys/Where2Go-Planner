@@ -1341,9 +1341,9 @@ async function loadRoutes(place,token){
     to_lat:String(place.lat),to_lng:String(place.lng)});
   if(place.name) params.set("to_name",String(place.name));
   if(state.origin.name) params.set("from_name",String(state.origin.name));
-  // 境外模式(TASK-22):勾了才带 region=overseas,后端据此把驾车换成 OSRM 境外轨
-  // (过路费走启发式、note 自带境外口径);不勾 = 不带参数,境内高德轨零变化。
-  if(regionOverride) params.set("region","overseas");
+  // 境外轨(TASK-22/23 修正):手动开关或后端自动判定(regionSeen)任一为境外都带
+  // region=overseas —— routes/stays 后端不做自动判定,漏传会让境外驾车错走高德。
+  if(isOverseasTrack()) params.set("region","overseas");
   try{
     const data=await getJSON("/api/routes?"+params.toString());
     if(token!==state.routePanel.token) return;   // 已切到别的 pin 或已关面板:丢掉过期响应
@@ -1562,8 +1562,8 @@ function applyStayData(result,place){
 async function loadStays(place,token){
   const params=new URLSearchParams({lat:String(place.lat),lng:String(place.lng),
     radius_km:String(STAYS_RADIUS_KM)});
-  // 境外模式(TASK-22):同款开关透传给住宿 —— 境外走 OSM(Overpass tourism=*)住宿腿
-  if(regionOverride) params.set("region","overseas");
+  // 境外轨(TASK-22/23 修正):与 routes 同口径,开关或自动判定任一境外都带 region
+  if(isOverseasTrack()) params.set("region","overseas");
   try{
     const result=await getJSON("/api/stays?"+params.toString());
     if(token!==state.stays.token) return;   // 已换 pin / 已关面板:作废
@@ -4631,6 +4631,9 @@ function rememberRegionOverride(on){
 }
 // 城市搜索的 region 参数:勾了才追加(不勾 = 不带参数,交回后端自动判定)
 function regionQuery(){return regionOverride?"&region=overseas":"";}
+// routes/stays 后端不做自动判定(契约 TASK-22 §1.3/§1.5 只认显式参数),
+// 所以「开关勾了」或「后端已判定为境外(regionSeen)」任一成立都要显式带上。
+function isOverseasTrack(){return regionOverride||String(regionSeen||"").toLowerCase()==="overseas";}
 // 状态栏小字:后端判出的口径 + 是否被「境外模式」override 着
 function regionNote(){
   const key=String(regionSeen||"");

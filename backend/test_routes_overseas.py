@@ -563,14 +563,35 @@ def js_function(body: str, start_marker: str, end_marker: str) -> str:
 
 
 def test_frontend_route_url_carries_region_only_in_overseas_mode(html: str) -> None:
-    """``loadRoutes`` 的 URL 拼装:勾了「境外模式」才追加 ``region=overseas``。"""
+    """``loadRoutes`` 的 URL 拼装:境外轨(开关或后端自动判定)才追加 ``region=overseas``。
+
+    TASK-23 QA 修正:``/api/routes`` 后端**不做**自动判定(契约 §1.3 只认显式参数),
+    只认开关会让「搜索境外城市但没勾开关」的境外驾车错走高德(实测降级 unavailable)。
+    修正后口径 = ``isOverseasTrack()``(regionOverride || regionSeen==overseas)。
+    """
     section = js_function(html, "async function loadRoutes(", "async function openRoutePanel(")
-    assert 'if(regionOverride) params.set("region","overseas");' in section, \
-        "/api/routes 要透传境外开关(后端据此走 OSRM 境外轨)"
+    assert 'if(isOverseasTrack()) params.set("region","overseas");' in section, \
+        "/api/routes 要透传境外轨判定(后端据此走 OSRM 境外轨)"
     assert '"/api/routes?"+params.toString()' in section, "URL 仍由 URLSearchParams 拼(自动编码)"
-    assert '"domestic"' not in section, "不勾时不带 region(默认就是境内高德轨)"
+    assert '"domestic"' not in section, "境内不带 region(默认就是境内高德轨)"
     for field in ("from_lat", "from_lng", "to_lat", "to_lng"):
         assert field in section, f"既有坐标参数 {field} 照旧拼"
+
+
+def test_frontend_overseas_track_helper_reads_both_triggers(html: str) -> None:
+    """``isOverseasTrack``:手动开关或后端自动判定(regionSeen)任一为境外都算境外轨。
+
+    routes/stays 后端只认显式 region 参数(无 OriginCache 兜底),所以两个触发源
+    都必须让前端显式带上——这是 TASK-23 真机 QA 抓到并修掉的口径缺口。
+    """
+    helper = js_function(html, "function isOverseasTrack(", "\n")
+    assert "regionOverride" in helper and "regionSeen" in helper, "两个触发源都要认"
+    assert 'toLowerCase()==="overseas"' in helper, "regionSeen 判定大小写宽容"
+    # routes 与 stays 两条 URL 都走同一个 helper(口径唯一)
+    routes = js_function(html, "async function loadRoutes(", "async function openRoutePanel(")
+    stays = js_function(html, "async function loadStays(", "function openStaySection(")
+    assert 'isOverseasTrack()) params.set("region","overseas")' in routes
+    assert 'isOverseasTrack()) params.set("region","overseas")' in stays
 
 
 def test_frontend_route_card_note_is_backend_driven(html: str) -> None:

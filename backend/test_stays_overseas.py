@@ -648,12 +648,15 @@ def js_function(body: str, start_marker: str, end_marker: str) -> str:
 
 
 def test_frontend_stay_url_carries_region_only_in_overseas_mode(html: str) -> None:
-    """``loadStays`` 的 URL 拼装:勾了「境外模式」才追加 ``region=overseas``。"""
+    """``loadStays`` 的 URL 拼装:境外轨(开关或后端自动判定)才追加 ``region=overseas``。
+
+    TASK-23 QA 修正:与 routes 同口径(isOverseasTrack),``/api/stays`` 后端只认显式参数。
+    """
     section = js_function(html, "async function loadStays(", "function openStaySection(")
-    assert 'if(regionOverride) params.set("region","overseas");' in section, \
-        "/api/stays 要透传境外开关(后端据此走 OSM 住宿腿)"
+    assert 'if(isOverseasTrack()) params.set("region","overseas");' in section, \
+        "/api/stays 要透传境外轨判定(后端据此走 OSM 住宿腿)"
     assert '"/api/stays?"+params.toString()' in section, "URL 仍由 URLSearchParams 拼(自动编码)"
-    assert '"domestic"' not in section, "不勾时不带 region(默认就是境内高德轨)"
+    assert '"domestic"' not in section, "境内不带 region(默认就是境内高德轨)"
     for field in ("lat", "lng", "radius_km"):
         assert field in section, f"既有参数 {field} 照旧拼"
 

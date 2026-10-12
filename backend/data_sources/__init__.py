@@ -8,6 +8,10 @@
 
 Overpass 与 OSRM 已在 **TASK-9c 物理删除**(不留降级链、不留休眠文件);
 :func:`haversine_km` 随之搬到 :mod:`data_sources._common`,导入面不变。
+TASK-21(境外双轨 P2)起 Overpass 以 :mod:`data_sources.osm_overseas` 复活,但**只服务
+``region=overseas``** 的境外轨:它不在包导出面上(``__all__`` 与 TASK-9c 的退役断言都
+保持原样),由 :mod:`services.place_loader` 的境外分支直接 ``from data_sources import
+osm_overseas`` 使用;境内链路仍然一律走高德。
 
 用法::
 

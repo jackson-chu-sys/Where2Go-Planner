@@ -2930,9 +2930,14 @@ def test_search_city_sends_region_override_only_when_checked(html: str) -> None:
     search = html[html.index("async function searchCity("):html.index("function applyOrigin(")]
     assert '"/api/geocode?city="+encodeURIComponent(name)+regionQuery()' in search, \
         "城市搜索要把开关透传给 /api/geocode"
-    # 其余接口口径不变:分段检索不带 region(本阶段只影响地理编码那一条)
+    # TASK-20 当时"分段检索不带 region",TASK-21 起 /api/places 也吃这个开关:
+    # 勾了才追加 region=overseas(境外轨走 Overpass),不勾 = 不带参数交回后端自动判定。
     params = html[html.index("function placesParams("):html.index("function geocoderNote(")]
-    assert "region" not in params, "/api/places 的分页参数不受开关影响"
+    assert 'if(regionOverride) params.set("region","overseas");' in params, \
+        "/api/places 要透传境外开关(勾了才带 region=overseas)"
+    assert '"domestic"' not in params, "不勾时不带 region(交回后端按 OriginCache.region 判定)"
+    for field in ("page_size", "offset", "more"):
+        assert field in params, f"分页参数 {field} 照旧拼,不受开关影响"
     assert "new AMap." not in section and "getJSON(" not in section, "开关自己不直接打接口/画地图"
     assert "loadPlaces(" not in section and "searchCity(" not in section, \
         "切开关不自动重搜(起点没变时重搜等于白打一次地理编码)"
@@ -2965,3 +2970,89 @@ def test_region_switch_consumes_only_the_documented_response_key(
     reverse = places_api.reverse_geocode(lat=31.2304, lng=121.4737, zoom=None, session=geocode_session)
     assert reverse["region"] in set(region_gate.REGIONS), "reverse 也走同一套 region 值域"
     assert f'{reverse["region"]}:"' in labels, "两档取值都在 REGION_LABEL 里有中文文案"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-21:境外轨(P2)—— /api/places 透传境外开关 + 状态栏来源/坐标口径文案
+#   本条只做「传参 + 文案」:地图层仍是**一轨高德**(双轨瓦片是 TASK-23),所以境外 pin 会
+#   按 GCJ-02 画 WGS-84 坐标(偏移属预期过渡态,状态栏必须说清楚)。
+#   后端半边见 backend/test_osm_overseas.py。
+# --------------------------------------------------------------------------- #
+
+# 状态栏来源文案(TASK-21 新增 osm 键)与境外坐标提示(契约 §1.4 逐字)
+OVERSEAS_COORD_HINT = "境外数据(WGS-84),地图切换见后续版本"
+
+
+def places_params_section(html: str) -> str:
+    """切出 ``placesParams``(/api/places 的 URL 拼装,首屏与「加载更多」共用)。"""
+    section = more_section(html)
+    return section[section.index("function placesParams("):section.index("function geocoderNote(")]
+
+
+def places_status_section(html: str) -> str:
+    """切出 ``placesStatusHtml``(状态栏:来源 / 分页 / 起点解析 / 分段提示)。"""
+    section = more_section(html)
+    return section[section.index("function placesStatusHtml"):section.index("function applyPlacesPage")]
+
+
+def test_places_url_carries_region_only_in_overseas_mode(html: str) -> None:
+    """勾了「境外模式」才给 /api/places 追加 ``region=overseas``;不勾 = 不带参数。"""
+    params = places_params_section(html)
+    assert 'if(regionOverride) params.set("region","overseas");' in params, \
+        "境外开关要透传给分段检索(后端据此走 Overpass 境外轨)"
+    assert 'params.set("region","domestic")' not in params and '"domestic"' not in params, \
+        "不勾时不带 region:交回后端按 OriginCache.region 自动判定"
+    # 首屏与「加载更多」两条 URL 都由 placesParams 拼 → 开关一处生效、两处都带上
+    section = more_section(html)
+    first = section[section.index("async function loadPlaces("):section.index("async function loadMorePlaces(")]
+    more = section[section.index("async function loadMorePlaces("):]
+    for chunk, label in ((first, "loadPlaces"), (more, "loadMorePlaces")):
+        assert '"/api/places?"+placesParams(' in chunk, f"{label} 的 URL 必须走 placesParams"
+        assert "region=" not in chunk, f"{label} 不许自己硬拼 region(只认 placesParams 那一处)"
+    # 分页三参照旧,不因开关少拼/多拼
+    for field in ("page_size", "offset", "more"):
+        assert field in params, f"分页参数 {field} 照旧拼"
+
+
+def test_status_bar_source_label_covers_the_osm_track(html: str) -> None:
+    """来源文案按 ``source`` 分档,新增 ``osm`` 键 →「OSM 实时抓取」;读库文案两轨一致。"""
+    labels = js_map(html, "PLACES_SOURCE_LABEL")
+    assert f"{place_loader.SOURCE_AMAP}:" in labels and f"{place_loader.SOURCE_OSM}:" in labels, \
+        "两轨的抓取来源都要有文案(键名与后端 source 值逐字一致)"
+    assert "高德实时抓取" in labels and "OSM 实时抓取" in labels
+    status = places_status_section(html)
+    assert 'PLACES_SOURCE_LABEL[String(data.source||"")]' in status, "按 data.source 取文案"
+    assert "||PLACES_SOURCE_LABEL.amap" in status, "未知 source 仍回落高德文案(既有口径不变)"
+    assert '(data.source==="db")?"本地 SQLite 读库(未触网)"' in status, "读库分支不分轨"
+    assert '"高德实时抓取 → 已入库"' not in status, "旧的内联三元已换成映射(不许两份文案并存)"
+
+
+def test_overseas_coord_hint_lands_in_status_bar(html: str) -> None:
+    """region=overseas 时状态栏要说明坐标系与地图过渡态(契约 §1.4 逐字文案)。"""
+    assert js_string(html, "OVERSEAS_COORD_HINT") == OVERSEAS_COORD_HINT
+    status = places_status_section(html)
+    assert '(data.region==="overseas")?(" · "+OVERSEAS_COORD_HINT):""' in status, \
+        "只在境外轨追加提示,境内状态栏逐字不变"
+    assert "+overseas" in status, "提示挂在状态栏末尾(不另起一行)"
+    assert "WGS-84" in OVERSEAS_COORD_HINT and "后续版本" in OVERSEAS_COORD_HINT
+
+
+def test_overseas_track_does_not_touch_the_map_layer(html: str) -> None:
+    """本条**不动地图层**(双轨瓦片是 TASK-23):仍是一轨高德,Leaflet 保持退役。"""
+    assert html.count("new AMap.Map(") == 1, "地图初始化仍只有 TASK-9d 那一处"
+    for token in ("tile.openstreetmap.org", "L.tileLayer(", "leaflet@", "osm_overseas"):
+        assert token not in html, f"{token} 不该出现在前端(地图双轨是 TASK-23)"
+    section = places_status_section(html) + places_params_section(html)
+    assert "new AMap." not in section, "TASK-21 只改传参与文案,不碰地图对象"
+
+
+def test_places_status_reads_only_documented_response_keys(html: str, paging) -> None:
+    """前后端对账:状态栏读的 ``data.*`` 必须都是 /api/places 真会给的键。"""
+    body = paging(page_size="15", offset="0", more="false")
+    assert "region" in body and body["region"] in set(region_gate.REGIONS), \
+        "响应新增且只新增 region 一个键(值域与 region_gate 一致)"
+    used = referenced_fields(places_status_section(html), "data")
+    assert not (used - set(body)), f"状态栏读了 /api/places 没有的字段:{sorted(used - set(body))}"
+    assert {"region", "source"} <= used, "来源文案与境外提示都要消费后端给的 region/source"
+    labels = js_map(html, "PLACES_SOURCE_LABEL")
+    assert f'{place_loader.SOURCE_OSM}:' in labels, "境外轨的 source=osm 在文案表里有对应键"

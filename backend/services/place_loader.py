@@ -25,6 +25,13 @@
    "首查 30、显示 15、加载更多每次 +30"。轮数记在 ``SegmentFetch.fetch_rounds``,
    下一轮目标总量 = ``30 × (轮数 + 1)``(:func:`progressive_target_total`);
    分段下拉、四分类归类与读库口径全都不变,变的只是一轮抓多少。
+7. **境内外双轨**(TASK-21,境外双轨 P2):``region`` 决定这一段的 POI 从哪来 ——
+   ``domestic``(缺省)走上面的高德链,``overseas`` 走 :func:`default_fetcher_osm`
+   (:mod:`data_sources.osm_overseas`,Overpass 分组并集 / 环形差集,坐标 WGS-84、
+   身份是原生 ``(node|way|relation, id)``、归类退回 OSM tag 规则)。取值优先级
+   **显式 region > ``OriginCache.region``(TASK-20 判定结果,只读库不触网)> domestic**
+   (:func:`resolve_segment_region`);水位 ``source`` 记 ``"osm"``。渐进配额、环带复核、
+   去重、种子垫底、简介回填、读库秒回这些口径**两轨共用**,一行不分叉。
 
 起点除了城市名,还能来自浏览器定位:前端拿到 GPS 坐标后调 ``GET /api/geocode/reverse``,
 由 :func:`resolve_reverse_origin` 用**逆**地理编码反查城市;反查失败不报错,
@@ -58,6 +65,7 @@ from data_sources import DataSourceError
 from data_sources import amap
 from data_sources import geocode as ds_geocode
 from data_sources import haversine_km
+from data_sources import osm_overseas
 from data_sources import reverse as ds_reverse
 from data_sources.amap import SOURCE_NAME as AMAP_DS_SOURCE
 from data_sources.amap import geocode as ds_amap_geocode
@@ -90,11 +98,20 @@ from services.bands import (
     require_band,
 )
 from services.classify import classify_amap_places
+# 境内外口径(TASK-20 产物):本模块只**消费**判定结果,不自己判(判定在 services.region_gate)
+from services.region_gate import REGION_DOMESTIC, REGION_OVERSEAS
 
 # 四分类检索线索(TASK-9b 起走**高德** typecode/keywords 组,docs/TASK-9-CONTRACT.md §3):
 # 分组各带配额,避免餐饮这类高频大类把总量刷爆、滑雪场/古镇一条不剩;
 # 同一实体被多组命中时按高德 POI id 去重(:func:`services.classify.classify_amap_places`)后只归一类。
 SEARCH_GROUPS: list[dict[str, Any]] = classify.search_groups()
+# 境外轨的检索分组(TASK-21):OSM tag 组,六组 budget 合计**同样是 540**,
+# 所以 :func:`scale_search_groups` 的渐进缩放公式与 :data:`FULL_SEARCH_BUDGET` 分母一字不改。
+OSM_SEARCH_GROUPS: tuple[dict[str, Any], ...] = classify.OSM_SEARCH_GROUPS
+# 境外行入库时的坐标系标注:Overpass 给 WGS-84(高德轨是 GCJ-02),两者不可混用,
+# 写进 tags 供前端提示与 TASK-23 的地图双轨切换辨识。
+COORD_SYSTEM_TAG = "coord_system"
+COORD_SYSTEM_WGS84 = "WGS-84"
 # ``/api/places/meta`` 的 ``search_tags`` 键仍要有值(**响应键名零变化**):
 # 这里给的是遗留 OSM 选择器并集,只作口径展示,检索链路已不使用。
 SEARCH_TAGS: list[classify.TagSelector] = classify.search_tags()
@@ -130,6 +147,14 @@ INTRO_BATCH_LIMIT = 30
 SOURCE_AMAP = "amap"
 SOURCE_DB = "db"
 SOURCE_SEED = "seed"
+# 境外轨(TASK-21):``region=overseas`` 抓来的行水位记 "osm";API 的 ``source`` 同值,
+# 前端状态栏据此显示「OSM 实时抓取」而不是「高德实时抓取」。
+SOURCE_OSM = "osm"
+SOURCE_LABELS: dict[str, str] = {
+    SOURCE_DB: "数据库",
+    SOURCE_AMAP: "高德实时抓取",
+    SOURCE_OSM: "OSM 实时抓取(境外轨)",
+}
 FINGERPRINT_HEX_LEN = 12
 # 逆地理编码的 zoom:10 ≈ 区县级,反查出来的 display_name 里稳定带城市名
 REVERSE_ZOOM = 10
@@ -173,6 +198,8 @@ class SegmentOutcome:
     counts_by_source: dict[str, int] = field(default_factory=dict)
     segment: Optional[dict[str, Any]] = None
     intro_stats: Optional[dict[str, Any]] = None
+    #: 本次实际生效的境内外口径(TASK-21):override > ``OriginCache.region`` > domestic
+    region: str = REGION_DOMESTIC
 
 
 def _failure_text(exc: BaseException) -> str:
@@ -753,8 +780,82 @@ def default_fetcher(
     return merged
 
 
-def scale_search_groups(target_total: Optional[int]) -> Optional[list[dict[str, Any]]]:
-    """把 :data:`SEARCH_GROUPS` 各组配额按比例缩到总量 ≈ ``target_total``(渐进抓取用)。
+def osm_endpoint(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """境外轨 Overpass 用哪个端点:注入的 ``environ`` 说了算,否则交回模块默认解析。
+
+    ``environ=None`` → 返回 ``None``,:class:`data_sources.osm_overseas.OverpassClient`
+    自己按 ``WHERE2GO_OVERPASS_ENDPOINT`` → ``DEFAULT_ENDPOINT`` 解析(现状口径);
+    给了 ``environ``(单测替身)→ **只认它**:没有那个键就用默认端点,不再回落宿主
+    环境变量,免得单测被本机 env 干扰。
+    """
+    if environ is None:
+        return None
+    given = str(environ.get(osm_overseas.ENV_ENDPOINT) or "").strip()
+    return given or osm_overseas.DEFAULT_ENDPOINT
+
+
+def default_fetcher_osm(
+    lat: float,
+    lng: float,
+    band: Mapping[str, Any],
+    *,
+    groups: Optional[Iterable[Mapping[str, Any]]] = None,
+    fetch_rounds: Optional[int] = None,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+) -> list[dict[str, Any]]:
+    """境外轨真实抓取(TASK-21):Overpass 分组并集检索 → 带 OSM 身份的候选行。
+
+    与 :func:`default_fetcher`(境内高德轨)的分工由 :func:`resolve_segment_region` 定:
+    ``region=overseas`` 才走这里,境内一律走高德(**两轨不互为降级**,口径见 §1.2)。
+
+    * band 下限 ``== 0``(``0_50``)→ :meth:`osm_overseas.OverpassClient.nearby_places_grouped`
+      单圆并集:一次请求放六组 ``( 选择器并集 ); out center N;``,每组独立配额;
+    * band 下限 ``> 0`` → :meth:`osm_overseas.OverpassClient.nearby_places_ring` 环形差集
+      ``( 上限圆; - 下限圆; )``(阶段1 TASK-1d 口径):配额全部花在环内,组间并行、
+      单组 OOM 时按选择器再拆;
+    * 环内过滤在**服务端**完成,距离排序由 :func:`osm_overseas.parse_places` 完成,
+      所以这里**不做**本地 haversine 收敛(:func:`load_segment` 仍照共用口径用
+      :func:`services.bands.filter_to_band` 复核一次并补 ``distance_km``);
+    * ``groups`` 缺省 :data:`OSM_SEARCH_GROUPS`;渐进配额由调用方
+      (:func:`load_segment` → :func:`scale_search_groups`)缩放后传入,本函数不管
+      ``target_total``。``fetch_rounds`` 只是与 :func:`default_fetcher` 对齐的形参:
+      Overpass 有环形差集,用不上高德那套"分格 + 递增扩格";
+    * 返回行形状 = ``parse_places(with_id=True)`` 的
+      ``{name, lat, lng, tags, osm_type, osm_id}``,**不含 typecode** ——
+      归类走 :func:`services.classify.classify_places` 的 OSM tag 规则。
+
+    ``require_name=True``(阶段1 口径):无名地物在服务端就滤掉,比取回 400 条再本地过滤省。
+    ``environ`` / ``session`` 供单测注入(假 session 断言查询语句,全程不触网)。
+    """
+    wanted = list(groups) if groups is not None else list(OSM_SEARCH_GROUPS)
+    client = osm_overseas.OverpassClient(osm_endpoint(environ), session=session)
+    inner_radius_m = band_inner_radius_m(band)
+    if inner_radius_m <= 0:
+        return client.nearby_places_grouped(
+            lat, lng, band_radius_m(band), wanted, require_name=True, with_id=True
+        )
+    return client.nearby_places_ring(
+        lat,
+        lng,
+        band_radius_m(band),
+        inner_radius_m,
+        wanted,
+        require_name=True,
+        with_id=True,
+    )
+
+
+def scale_search_groups(
+    target_total: Optional[int],
+    groups: Optional[Iterable[Mapping[str, Any]]] = None,
+) -> Optional[list[dict[str, Any]]]:
+    """把检索分组各组配额按比例缩到总量 ≈ ``target_total``(渐进抓取用)。
+
+    ``groups``(TASK-21 境外轨)留空 = 缩 :data:`SEARCH_GROUPS`(高德,现状口径);
+    给了就缩**传入的组**(境外轨传 :data:`OSM_SEARCH_GROUPS`)。分母恒为
+    :data:`FULL_SEARCH_BUDGET`(540)—— OSM 六组的 budget 合计也是 540,所以两轨的
+    渐进配额逐字同口径。
 
     每组 ``max(MIN_GROUP_BUDGET, round(组配额 × target_total / 540))``:按比例缩放才保得住
     四分类的相对权重(自然风光 140 vs 古镇 40),下限 :data:`MIN_GROUP_BUDGET` 保证小分组
@@ -765,7 +866,7 @@ def scale_search_groups(target_total: Optional[int]) -> Optional[list[dict[str, 
         return None
     wanted = max(1, int(target_total))
     scaled: list[dict[str, Any]] = []
-    for group in SEARCH_GROUPS:
+    for group in (SEARCH_GROUPS if groups is None else list(groups)):
         row = dict(group)
         row["budget"] = max(
             MIN_GROUP_BUDGET, round(int(group["budget"]) * wanted / FULL_SEARCH_BUDGET)
@@ -819,6 +920,34 @@ def stored_fetch_rounds(recorded: Optional[SegmentFetch]) -> int:
     return int(getattr(recorded, "fetch_rounds", 0) or 0)
 
 
+def is_overseas_region(region: Any) -> bool:
+    """这次是不是**境外轨**:只认 ``"overseas"``(空白/大小写宽容),其余一律按境内。
+
+    与 :func:`services.region_gate.classify_country_code` 同一个"判不出就按境内"口径 ——
+    空串、``None``、垃圾值都走既有高德链,现状行为零影响。
+    """
+    return str(region or "").strip().lower() == REGION_OVERSEAS
+
+
+def resolve_segment_region(
+    session: Session, city: str, region: Optional[str] = None
+) -> str:
+    """本次抓取走哪一轨:**显式 ``region`` > ``OriginCache.region`` > domestic**(TASK-21)。
+
+    只读库、**不发任何网络**:境内外判定是 TASK-20 :mod:`services.region_gate` 的事,
+    判定结果由 ``/api/geocode`` 落进 :class:`db.models.OriginCache` 的 ``region`` 列,
+    这里在调用方没明说时把它读回来当兜底(前端不勾「境外模式」也能走对轨)。
+    缓存里没有行、``region`` 是空串(旧库补列前 / ``detector=none`` 没判出)或垃圾值,
+    一律 ``domestic`` —— 判不出就按境内,不猜。
+    """
+    cleaned = str(region or "").strip().lower()
+    if cleaned in (REGION_DOMESTIC, REGION_OVERSEAS):
+        return cleaned
+    row = repo.get_origin_cache(session, city=city)
+    cached = str(getattr(row, "region", "") or "").strip().lower() if row is not None else ""
+    return cached if cached in (REGION_DOMESTIC, REGION_OVERSEAS) else REGION_DOMESTIC
+
+
 def place_identity(place: Mapping[str, Any]) -> tuple[str, int]:
     """取 OSM 身份 ``(osm_type, osm_id)``;缺失时用"名字+坐标"指纹兜底(负数 id)。
 
@@ -851,7 +980,54 @@ def amap_tags(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def osm_tags(row: Mapping[str, Any]) -> dict[str, Any]:
+    """境外轨行的入库 ``tags``:OSM 原始 tag + 坐标系标注,**不写 ``source`` 键**。
+
+    不写 ``source`` 是刻意的::func:`db.models.place_source` 把"没有 source 键"的行派生成
+    「OSM」来源标注(存量 OSM 行同一口径),前端脚注因此显示 OSM 而不是高德。
+    ``coord_system="WGS-84"`` 标明坐标系(高德轨是 GCJ-02,两套坐标不可混用),给状态栏
+    提示与 TASK-23 的地图双轨切换用。
+    """
+    tags = dict(row.get("tags") or {})
+    tags[COORD_SYSTEM_TAG] = COORD_SYSTEM_WGS84
+    return tags
+
+
+def to_osm_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """境外候选(Overpass 行)→ 入库条目:OSM tag 归类 + **原生 OSM 身份**(不 crc32)。
+
+    与 :func:`to_place_items` 的境内高德分支三点不同(TASK-21 §1.2):
+
+    1. 去重 + 归类走 :func:`services.classify.classify_places`(OSM tag 规则,优先级
+       滑雪 > 运动 > 人文美食 > 自然,一地只入一类;去重键 ``(osm_type, osm_id)``);
+    2. 身份 = :func:`place_identity` 的 ``(node|way|relation, 原生 id)`` —— Overpass 的 id
+       本来就是整数,不需要高德那套 ``crc32`` 压缩,与存量 OSM 行、收藏 ``ref_key`` 同口径;
+    3. ``tags`` 见 :func:`osm_tags`(原始 tag + ``coord_system``,无 ``source`` 键)。
+
+    ``intro`` 同样不在此生成:入库后由 :mod:`services.intro` 按名字补(境外行天然可用)。
+    """
+    items: list[dict[str, Any]] = []
+    for row in classify.classify_places(candidates):
+        osm_type, osm_id = place_identity(row)
+        items.append(
+            {
+                "osm_type": osm_type,
+                "osm_id": osm_id,
+                "name": row.get("name") or "",
+                "lat": row["lat"],
+                "lng": row["lng"],
+                "category": row["category"],
+                "tags": osm_tags(row),
+            }
+        )
+    return items
+
+
+def to_place_items(
+    candidates: Iterable[Mapping[str, Any]],
+    *,
+    region: str = REGION_DOMESTIC,
+) -> list[dict[str, Any]]:
     """环内候选 → 入库条目:先按高德 POI id **去重**,再按优先级**归类**,最后派生入库身份。
 
     去重与归类由 :func:`services.classify.classify_amap_places` 完成(一地只入一类);
@@ -860,7 +1036,12 @@ def to_place_items(candidates: Iterable[Mapping[str, Any]]) -> list[dict[str, An
     原文进 ``tags["amap_id"]``(**表结构零改动**,唯一键与收藏 ref_key 口径原样保留)。
     没有高德身份的行(人工种子 / 存量 OSM 形状)退回 :func:`place_identity` 的旧口径。
     ``intro`` 不在此生成 —— 入库后由 :mod:`services.intro` 按 POI 缓存补。
+
+    ``region=overseas``(TASK-21 境外轨)整条改走 :func:`to_osm_place_items`(OSM tag 归类 +
+    原生 OSM 身份 + ``coord_system`` 标注);``domestic``(缺省)分支逐字未动。
     """
+    if is_overseas_region(region):
+        return to_osm_place_items(candidates)
     items: list[dict[str, Any]] = []
     for row in classify_amap_places(candidates):
         poi_id = classify.amap_poi_id(row)
@@ -976,6 +1157,7 @@ def load_segment(
     sync_intros: bool = False,
     intro_limit: Optional[int] = INTRO_BATCH_LIMIT,
     intro_workers: int = intro_service.DEFAULT_WORKERS,
+    region: Optional[str] = None,
 ) -> SegmentOutcome:
     """读取某 (城市, band) 的目的地;未入库才抓取并落库。
 
@@ -1001,12 +1183,24 @@ def load_segment(
 
     失败语义:分段/城市非法抛 :class:`ValueError`;数据源不可用抛
     :class:`data_sources.DataSourceError`(由 API 层翻成中文 HTTP 错误)。
+
+    ``region``(TASK-21 境内外双轨)决定这一段的 POI 从哪来,取值优先级
+    **显式 ``region`` > ``OriginCache.region`` > ``domestic``**
+    (:func:`resolve_segment_region`,只读库、不发额外网络)。``overseas`` 时:抓取换
+    :func:`default_fetcher_osm`(Overpass 单圆 / 环形差集)、渐进配额缩的是
+    :data:`OSM_SEARCH_GROUPS`、入库走 :func:`to_osm_place_items`(OSM tag 归类 + 原生
+    OSM 身份 + ``tags["coord_system"]="WGS-84"``)、水位与 ``outcome.source`` 记
+    :data:`SOURCE_OSM`。``fetcher=`` 显式注入**优先于** region 分支(既有单测口径不变);
+    环带复核、去重、种子垫底、简介回填、水位/渐进与读库秒回全部两轨共用。
     """
     band_def = require_band(band)
     city_clean = (city or "").strip()
     if not city_clean:
         raise ValueError("起点城市不能为空")
-    fetch_fn = fetcher or default_fetcher
+    track = resolve_segment_region(session, city_clean, region)
+    overseas = is_overseas_region(track)
+    fetch_fn = fetcher or (default_fetcher_osm if overseas else default_fetcher)
+    fetch_source = SOURCE_OSM if overseas else SOURCE_AMAP
     seed_rows = list(seeds) if seeds is not None else seed_data.load_seeds()
 
     recorded = repo.get_segment(session, origin_city=city_clean, band=band_def["key"])
@@ -1026,10 +1220,12 @@ def load_segment(
             network_used=False,
             segment=repo.segment_to_dict(recorded),
             seeded=seeded,
+            region=track,
         )
 
     origin = _reuse_origin(session, city_clean, recorded=recorded, lat=lat, lng=lng, geocoder=geocoder)
-    groups = scale_search_groups(target_total)
+    # 境外轨缩的是 OSM tag 组(合计同为 540),境内缩高德组:公式与分母完全一致
+    groups = scale_search_groups(target_total, OSM_SEARCH_GROUPS if overseas else None)
     # 扩格轮数跟着水位走:这一轮的分组配额与「抓几格」都由它推出来(递增扩格)
     payload = fetch_fn(
         origin["lat"],
@@ -1046,7 +1242,7 @@ def load_segment(
         session,
         origin_city=city_clean,
         band=band_def["key"],
-        items=to_place_items(candidates) + seeded_items,
+        items=to_place_items(candidates, region=track) + seeded_items,
     )
     record = repo.record_segment(
         session,
@@ -1061,7 +1257,7 @@ def load_segment(
             if target_total is not None
             else len(candidates) + len(seeded_items)
         ),
-        source=SOURCE_AMAP,
+        source=fetch_source,
     )
     repo.bump_fetch_rounds(session, record)
     session.commit()
@@ -1091,12 +1287,13 @@ def load_segment(
         origin=origin,
         band=band_def,
         category=category,
-        source=SOURCE_AMAP,
+        source=fetch_source,
         network_used=True,
         segment=repo.segment_to_dict(record),
         written=written,
         seeded=len(seeded_items),
         intro_stats=intro_stats,
+        region=track,
     )
 
 
@@ -1153,6 +1350,7 @@ def _read_from_db(
     written: int = 0,
     seeded: int = 0,
     intro_stats: Optional[dict[str, Any]] = None,
+    region: str = REGION_DOMESTIC,
 ) -> SegmentOutcome:
     """统一从库里取数,保证"读库"与"刚抓完"两条路径返回同一种形状。"""
     places = repo.list_places(
@@ -1179,6 +1377,7 @@ def _read_from_db(
         ),
         segment=segment,
         intro_stats=intro_stats,
+        region=region,
     )
 
 
@@ -1219,7 +1418,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(
         f"[完成] {outcome.origin['name']} · {outcome.band['label']} · "
-        f"{len(outcome.places)} 条 · 来源={'数据库' if outcome.source == SOURCE_DB else '高德实时抓取'} · "
+        f"{len(outcome.places)} 条 · 来源={SOURCE_LABELS.get(outcome.source, outcome.source)} · "
         f"本次写入 {outcome.written} 条"
     )
     print(f"[分类] {' · '.join(f'{name} {total}' for name, total in sorted(outcome.counts_by_category.items()))}")

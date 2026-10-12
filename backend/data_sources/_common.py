@@ -34,6 +34,8 @@ SNIPPET_LEN: int = 240
 #   * Nominatim:**直连连接失败**(15s),必须走代理(1.4s)
 #   * Photon(TASK-6a 新增,地理编码降级链):**直连 1.1s 正常**,走代理 5s 挂
 #     —— 产品环境没有 mihomo 代理,所以 Photon 必须 off;Nominatim 只作末腿降级
+#   * Overpass(TASK-21 境外轨 osm_overseas.py):**直连 8.5s 可用**(因特拉肯 5km 四分类并集),
+#     走代理反而 504 —— 与 Photon 同口径 off
 # 所以"一刀切走代理/一刀切不走代理"都不对。这里按**数据源**决定代理口径,可用
 # ``WHERE2GO_PROXY_<源>`` 覆盖(源名大写:AMAP / NOMINATIM / PHOTON / LLM):
 #   * ``off``  → 强制直连(忽略环境变量里的全局代理)
@@ -49,6 +51,7 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
     "wikimedia": PROXY_ENV,  # 维基/Commons(TASK-8a1 图片兜底):沿用环境变量代理口径
     "ctrip": PROXY_OFF,      # 携程 suggest(TASK-17 外链解析):国内站直连
+    "overpass": PROXY_OFF,   # 境外轨 POI 源(TASK-21 osm_overseas.py):10/10 实测直连 8.5s 可用、代理反而 504
 }
 
 

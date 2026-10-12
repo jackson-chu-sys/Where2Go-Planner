@@ -12,6 +12,12 @@
   ``more``(默认 false)—— 带任一参数即进分页模式,``places`` 只含本页并回报
   ``total_in_db``/``has_more``/``fetch_rounds``;``more=true`` 翻页越界且库内行数没到
   常规全量配额时自动再抓一轮(``target_total=30×(fetch_rounds+1)``)。三个都不带 = 旧口径返回全量。
+  境内外双轨(TASK-21):可选 ``region=domestic|overseas``(前端「境外模式」开关的
+  **override**,与 ``/api/geocode`` 同一个 :func:`_region_override` 校验:非法值 400 中文),
+  留空则由 :func:`services.place_loader.resolve_segment_region` 读 ``OriginCache.region``
+  兜底(TASK-20 判定结果,**不发额外网络**),再判不出按 ``domestic``。``overseas`` 时这一段的
+  POI 走 :mod:`data_sources.osm_overseas`(Overpass,WGS-84,身份 ``(node|way|relation, id)``),
+  ``source`` 记 ``osm``;响应**只多一个** ``region`` 键(本次实际生效值),其余键逐键零变化。
 * ``GET /api/places/meta`` —— 分段、四分类(含 pin 颜色/图标)、归类优先级、检索分组与
   LLM 简介配置的元信息(前端下拉/图例/状态栏的唯一出处,**不含任何 key**)。
 * ``GET /api/places/intros?origin=&band=`` —— 给已入库但还没有简介的 POI 补 LLM 一句话简介
@@ -467,6 +473,7 @@ def list_places(
     page_size: Optional[str] = None,
     offset: Optional[str] = None,
     more: Optional[str] = None,
+    region: Optional[str] = None,
     intros: bool = True,
     intro_limit: Optional[int] = None,
     session: Session = Depends(get_session),
@@ -479,6 +486,11 @@ def list_places(
     ``[offset, offset+page_size)`` 这一页,并额外回报 ``total_in_db`` / ``has_more`` /
     ``fetch_rounds``。``more=true`` 且这一页越界(``offset >= 库内行数``)、库内行数还没到
     常规全量配额时,自动再抓一轮(``target_total = 30 × (fetch_rounds + 1)``)后重新排序切片。
+
+    境内外双轨(TASK-21):``region`` 是前端「境外模式」开关的 override(留空 = 交给
+    :func:`place_loader.resolve_segment_region` 读 ``OriginCache.region`` 兜底,不发额外网络);
+    ``overseas`` 时这一段改走 Overpass(:mod:`data_sources.osm_overseas`)、``source="osm"``。
+    响应的 ``region`` 键回报**本次实际生效值**(override > 缓存 > domestic),其余键零变化。
     """
     city = _clean(origin)
     if not city:
@@ -488,6 +500,8 @@ def list_places(
         raise HTTPException(
             400, f"未知分类:{category}(可选:{'、'.join(category_keys())})"
         )
+    # region(TASK-21)与分页参数一样**先**校验:非法就快速失败,一次网都不触。
+    region_override = _region_override(region)
     # 分页参数**先**校验:非法就快速失败,一次网都不触(与城市/分类校验同一口径)。
     paging = page_size is not None or offset is not None or more is not None
     wanted_page_size = _page_int(
@@ -523,6 +537,7 @@ def list_places(
             target_total=target_total,
             intros=fill_intros,
             intro_limit=resolve_intro_limit(intro_limit),
+            region=region_override,
         )
 
     try:
@@ -583,6 +598,8 @@ def list_places(
         "fetch_rounds": rounds,
         "counts_by_category": outcome.counts_by_category,
         "source": outcome.source,
+        # 本次实际生效的境内外口径(TASK-21):override > OriginCache.region > domestic
+        "region": outcome.region,
         "network_used": outcome.network_used,
         "fetched_at": outcome.fetched_at,
         "written": outcome.written,

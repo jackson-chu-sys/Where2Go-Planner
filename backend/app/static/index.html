@@ -1882,6 +1882,9 @@ function placesParams(refresh,offset,more){
     more:(more?"true":"false")});
   if(state.category) params.set("category",String(state.category));
   if(refresh) params.set("refresh","true");
+  // 境外模式(TASK-21):勾了才带 region=overseas,后端据此走 Overpass 境外轨;
+  // 不勾 = 不带参数,交回后端按 OriginCache.region 自动判定(与 /api/geocode 同口径)。
+  if(regionOverride) params.set("region","overseas");
   return params;
 }
 function geocoderNote(){
@@ -1901,16 +1904,22 @@ function pagingNote(){
     : " · 没有更多了(has_more=false)");
 }
 // 状态栏:分页口径(已显示 / 库内 total_in_db / 抓取轮数)+ 来源 + 起点解析源 + 分段提示
+// 来源文案(TASK-21 新增 osm 键):境内轨抓的是高德、境外轨抓的是 OSM,读库两轨都一样
+const PLACES_SOURCE_LABEL={amap:"高德实时抓取 → 已入库",osm:"OSM 实时抓取 → 已入库"};
+// 境外轨的坐标是 WGS-84,高德地图按 GCJ-02 画 → pin 会偏移;地图双轨切换是后续版本(TASK-23)
+const OVERSEAS_COORD_HINT="境外数据(WGS-84),地图切换见后续版本";
 function placesStatusHtml(data){
   const bandTotal=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
-  const from=(data.source==="db")?"本地 SQLite 读库(未触网)":"高德实时抓取 → 已入库";
+  const from=(data.source==="db")?"本地 SQLite 读库(未触网)"
+    :(PLACES_SOURCE_LABEL[String(data.source||"")]||PLACES_SOURCE_LABEL.amap);
   const hint=bandHint(data.band);   // 功能1:含市区/近郊那一档给一句口径说明
   const fetched=data.fetched_at?(" · 抓取于 "+esc(String(data.fetched_at).replace("T"," ").replace("+00:00","Z"))):"";
+  const overseas=(data.region==="overseas")?(" · "+OVERSEAS_COORD_HINT):"";
   return '起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
     " · 分类 <b>"+esc(state.category||"全部")+"</b> · 已显示 <b>"+(state.places||[]).length+
     "</b> / 库内 <b>"+state.page.total+"</b> 条(本页 "+data.count+" 条 · 该分段合计 "+bandTotal+
     " 条)· 来源:"+from+sourceNote(data)+fetched+" · 耗时 "+data.elapsed_s+"s"+
-    introNote(data)+pagingNote()+geocoderNote()+(hint?(" · "+hint):"");
+    introNote(data)+pagingNote()+geocoderNote()+(hint?(" · "+hint):"")+overseas;
 }
 // 一页响应落地:append=false = 首屏/换段(整份替换),true = 加载更多(按 id 去重后追加)。
 // 只动 state 与状态栏,画针/渲染列表由调用方决定(加载更多不该重排地图视野)。

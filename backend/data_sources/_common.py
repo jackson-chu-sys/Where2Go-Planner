@@ -52,6 +52,7 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "wikimedia": PROXY_ENV,  # 维基/Commons(TASK-8a1 图片兜底):沿用环境变量代理口径
     "ctrip": PROXY_OFF,      # 携程 suggest(TASK-17 外链解析):国内站直连
     "overpass": PROXY_OFF,   # 境外轨 POI 源(TASK-21 osm_overseas.py):10/10 实测直连 8.5s 可用、代理反而 504
+    "osrm": PROXY_OFF,       # 境外轨驾车源(TASK-22 osrm.py):10/10 实测直连 1.3s 可用
 }
 
 

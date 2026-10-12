@@ -51,7 +51,8 @@ ORIGIN_LNG = 121.4737
 GOOD_COMPLETION = "价格: 约¥200-400/晚\n简介: 位于市中心的经济型酒店。"
 # 由近及远:老船长(0.8km) < 无名公寓(1.7km) < 华尔道夫(1.9km) < 衡山路小筑(4.1km)
 SAMPLE_ORDER = ["老船长青旅", "", "外滩华尔道夫酒店", "衡山路小筑"]
-TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "source", "note", "items"}
+# TASK-22 起顶层多一个 ``region`` 键(境内外口径,生效值);其余键逐键零变化
+TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "region", "source", "note", "items"}
 ITEM_KEYS = {
     "id", "osm_type", "osm_id", "name", "kind", "lat", "lng",
     "distance_km", "price_estimate", "price_kind", "currency", "intro", "estimated",
@@ -363,8 +364,8 @@ def test_radius_km_converted_to_meters_and_refresh_passed_through(http, session,
     """``radius_km`` → 服务层的**米**;``refresh`` 原样透传(路由不自己算距离)。"""
     seen: dict[str, Any] = {}
 
-    def fake_load(sess, lat, lng, *, radius_m, refresh=False):
-        seen.update(lat=lat, lng=lng, radius_m=radius_m, refresh=refresh)
+    def fake_load(sess, lat, lng, *, radius_m, refresh=False, region=None):
+        seen.update(lat=lat, lng=lng, radius_m=radius_m, refresh=refresh, region=region)
         return []
 
     monkeypatch.setattr(stay_service, "load_or_fetch_stays", fake_load)
@@ -374,6 +375,7 @@ def test_radius_km_converted_to_meters_and_refresh_passed_through(http, session,
     assert status == 200 and body["count"] == 0 and body["items"] == []
     assert seen["radius_m"] == 2500, "radius_km 必须换算成米再交给服务层"
     assert seen["refresh"] is True
+    assert seen["region"] is None, "没给 region → 服务层收到 None(按境内轨,现状零变化)"
     assert (seen["lat"], seen["lng"]) == (ORIGIN_LAT, ORIGIN_LNG)
 
 

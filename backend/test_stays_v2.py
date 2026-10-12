@@ -67,7 +67,8 @@ ORIGIN_LAT = 31.2304
 ORIGIN_LNG = 121.4737
 # haversine(R=6371) 下一度纬度约 111.195 km:用它把"距起点 N km"换成纬度偏移
 KM_PER_DEGREE = 111.195
-LEGACY_TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "source", "note", "items"}
+# TASK-22 起顶层多一个 ``region`` 键(境内外口径,生效值);其余键逐键零变化
+LEGACY_TOP_LEVEL_KEYS = {"lat", "lng", "radius_km", "count", "region", "source", "note", "items"}
 LLM_KEY_ENVS = (
     "WHERE2GO_LLM_API_KEY", "ALIBABA_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY",
     "QWEN_API_KEY", "DEEPSEEK_API_KEY",
@@ -1030,7 +1031,7 @@ def test_api_without_llm_key_returns_null_prices_without_backfill(session: Sessi
     body = call_api(session, monkeypatch, fetch_fn=client, radius_km=8)
     assert body["count"] == 7
     assert body.get("estimating", False) is False, "没配 key 就不排后台任务、不谎报「估价中」"
-    assert set(body) == LEGACY_TOP_LEVEL_KEYS, "有结果且未降级 → 顶层形状保持既有 7 个字段"
+    assert set(body) == LEGACY_TOP_LEVEL_KEYS, "有结果且未降级 → 顶层形状保持既有 8 个字段"
     assert all(item["price_estimate"] is None for item in body["items"])
     assert all(item["estimated"] == stays_api.ESTIMATED_LABEL for item in body["items"])
 

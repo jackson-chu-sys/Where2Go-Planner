@@ -12,6 +12,10 @@ TASK-21(境外双轨 P2)起 Overpass 以 :mod:`data_sources.osm_overseas` 复活
 ``region=overseas``** 的境外轨:它不在包导出面上(``__all__`` 与 TASK-9c 的退役断言都
 保持原样),由 :mod:`services.place_loader` 的境外分支直接 ``from data_sources import
 osm_overseas`` 使用;境内链路仍然一律走高德。
+TASK-22(境外双轨 P3)起 OSRM 以 :mod:`data_sources.osrm` 复活,口径与上面完全一致:
+**只服务 ``region=overseas`` 的境外驾车路线**,不进包导出面(``__all__`` 与 TASK-9c 的
+退役断言原样成立),由 :mod:`services.routes` 的境外分支直接 ``from data_sources import
+osrm`` 使用;境内驾车仍然一律走高德 ``direction/driving``。
 
 用法::
 

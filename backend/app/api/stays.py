@@ -16,6 +16,10 @@
 
 价格是 **AI 估算**,不是报价:每行带 ``estimated`` 标注,顶层 ``note`` 写明参考价口径
 (架构文档"AI 幻觉"对策:事实字段绑结构化来源,估算字段必须自带标注)。
+
+境外双轨(TASK-22):可选查询参数 ``region=domestic|overseas``(前端「境外模式」开关的
+override,非法值 **400 中文**);``overseas`` → 服务层把检索腿换成 Overpass 的 OSM 住宿行,
+响应**只多一个** ``region`` 键(本次生效值)+ note 追加境外口径一段,``items`` 既有键零变化。
 本模块自己不触网,触网的是服务层(**高德** ``place/around`` 检索 + LLM 估价,TASK-9b),
 测试里可整体替换。**响应键名与形状零变化**(``source`` 的值随数据源改成 ``amap``)。
 
@@ -47,9 +51,15 @@ from sqlalchemy.orm import Session
 
 from db import models
 from db.base import get_session
+from services import region_gate
 from services import stays as stay_service
 
 router = APIRouter()
+
+# 境内外口径(TASK-22):``region`` 查询参数只认这两个值(前端「境外模式」开关传 overseas),
+# 与 /api/geocode、/api/places、/api/routes 同一个 :func:`_region_override` 校验口径。
+REGION_CHOICES = frozenset(region_gate.REGIONS)
+REGION_INVALID_MSG = "region 只支持 domestic 或 overseas"
 
 DEFAULT_RADIUS_KM = 8.0  # 周末出行的落脚点半径:默认 8 km(与 services.stays 的 8000 m 同口径)
 MAX_RADIUS_KM = 30.0  # 上限:住宿是"到了目的地再找",超过 30 km 已经不是同一个落脚点市场
@@ -77,6 +87,15 @@ STAYS_NOTE = (
     "osm_type=amap、osm_id 为高德 POI id 的 crc32、原文在 tags.amap_id);"
     "refresh=true 强制重抓,但已有价格的行不会再调 LLM(不重复花 token)。"
 )
+# 境外轨(TASK-22)追加的口径说明:数据源、身份与城市线索都换了一套,note 必须照实说
+# (只在 region=overseas 时拼上,境内文案逐字不变)。
+STAYS_OVERSEAS_NOTE = (
+    "境外轨(region=overseas):住宿来自 OpenStreetMap(Overpass 按 "
+    "tourism=hotel/guest_house/hostel/apartment/chalet 单圆检索),source=osm、"
+    "osm_type=node/way/relation、osm_id 为 OSM 原生 id(不哈希);坐标是 WGS-84。"
+    "行里没有 addr:city 时城市线索按 Nominatim 逆地理编码懒补(补不出为 null,"
+    "只影响价格的城市线级修正,不影响列表);负缓存/半径阶梯/估价口径与境内一致。"
+)
 # 空结果/降级时追加的口径说明(TASK-6c):三档 reason 怎么读、nearest_km 是什么、
 # estimating 为什么要等一会儿。正常结果不带这段,免得卡片下方多一坨没人看的字。
 STAYS_DEGRADED_NOTE = (
@@ -97,6 +116,21 @@ def _optional_text(value: Any) -> Optional[str]:
     传进来是 ``FieldInfo`` 对象;这里统一把"没给"归一成 ``None``。
     """
     return value if isinstance(value, str) else None
+
+
+def _region_override(value: Any) -> Optional[str]:
+    """``region`` 查询参数归一:留空/空串 = 没给(``None`` → 按境内);非法值 **400 中文**。
+
+    与 :func:`app.api.places._region_override` 同口径。本路由**不做自动判定**
+    (判境内外要发一次网络,住宿查询是交互路径):不勾「境外模式」就是境内高德轨。
+    """
+    cleaned = (_optional_text(value) or "").strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.lower()
+    if normalized not in REGION_CHOICES:
+        raise HTTPException(400, REGION_INVALID_MSG)
+    return normalized
 
 
 def _optional_float(name: str, value: Any) -> Optional[float]:
@@ -215,9 +249,22 @@ def list_stays(
         ),
     ),
     refresh: Optional[str] = Query(None, description="true = 忽略库缓存强制重抓(会触网)"),
+    region: Optional[str] = Query(
+        None,
+        description="境内外口径:domestic(默认,高德住宿大类)| overseas(境外轨,OSM tourism=* 住宿)",
+    ),
     session: Session = Depends(get_session),
 ) -> dict[str, Any]:
-    """起点半径内的住宿列表(**由近及远**),含 AI 价格区间估算与一句话简介。"""
+    """起点半径内的住宿列表(**由近及远**),含 AI 价格区间估算与一句话简介。
+
+    ``region``(TASK-22)是前端「境外模式」开关的透传:``overseas`` → 检索腿换成
+    Overpass 的 OSM 住宿行(``source=osm``、原生 OSM 身份),负缓存/阶梯/估价口径不变;
+    留空/``domestic`` → 现状高德轨**零变化**。响应**只多一个** ``region`` 键(本次生效值),
+    ``items`` 既有键逐键零变化。
+    """
+    # region 与坐标一样**先**校验:非法就快速失败,一次网都不触(同 /api/places 口径)
+    region_override = _region_override(region)
+    resolved_region = stay_service.resolve_stay_region(region_override)
     origin_lat, origin_lng = _resolve_origin(
         session,
         lat=_optional_float("lat", lat),
@@ -235,6 +282,7 @@ def list_stays(
         origin_lng,
         radius_m=radius_m,
         refresh=force_refresh,
+        region=region_override,
     )
     items = [_item(row) for row in rows]
     # 空结果没有可归属的行,按 db 口径报(既没抓到也没读到,不谎报 amap)
@@ -243,18 +291,23 @@ def list_stays(
     nearest_km = getattr(rows, "nearest_km", None)
     estimating = bool(getattr(rows, "estimating", False))
     expanded = bool(getattr(rows, "expanded", False))
+    # 境外轨多拼一段口径说明(数据源/身份/城市线索都换了一套);境内文案逐字不变
+    base_note = STAYS_NOTE if resolved_region == region_gate.REGION_DOMESTIC else (
+        STAYS_NOTE + STAYS_OVERSEAS_NOTE
+    )
     body: dict[str, Any] = {
         "lat": origin_lat,
         "lng": origin_lng,
         "radius_km": echo_radius_km,
         "count": len(items),
+        "region": resolved_region,
         "source": source,
-        "note": STAYS_NOTE,
+        "note": base_note,
         "items": items,
     }
     # 三档空态/后台估价中/阶梯扩过档 → 多给三个判别字段(正常结果的顶层形状保持不变)
     if reason is not None or estimating or expanded or not items:
-        note = STAYS_NOTE + STAYS_DEGRADED_NOTE
+        note = base_note + STAYS_DEGRADED_NOTE
         effective_m = getattr(rows, "radius_m", None)
         if expanded and effective_m:
             note += f"本次未给半径,已按 5→10→30 km 阶梯自动扩到 {effective_m / METERS_PER_KM:g} km 检索。"

@@ -1312,6 +1312,9 @@ async function loadRoutes(place,token){
     to_lat:String(place.lat),to_lng:String(place.lng)});
   if(place.name) params.set("to_name",String(place.name));
   if(state.origin.name) params.set("from_name",String(state.origin.name));
+  // 境外模式(TASK-22):勾了才带 region=overseas,后端据此把驾车换成 OSRM 境外轨
+  // (过路费走启发式、note 自带境外口径);不勾 = 不带参数,境内高德轨零变化。
+  if(regionOverride) params.set("region","overseas");
   try{
     const data=await getJSON("/api/routes?"+params.toString());
     if(token!==state.routePanel.token) return;   // 已切到别的 pin 或已关面板:丢掉过期响应
@@ -1530,6 +1533,8 @@ function applyStayData(result,place){
 async function loadStays(place,token){
   const params=new URLSearchParams({lat:String(place.lat),lng:String(place.lng),
     radius_km:String(STAYS_RADIUS_KM)});
+  // 境外模式(TASK-22):同款开关透传给住宿 —— 境外走 OSM(Overpass tourism=*)住宿腿
+  if(regionOverride) params.set("region","overseas");
   try{
     const result=await getJSON("/api/stays?"+params.toString());
     if(token!==state.stays.token) return;   // 已换 pin / 已关面板:作废

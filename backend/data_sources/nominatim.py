@@ -58,13 +58,41 @@ def country_fields(raw: Any) -> dict[str, str]:
     }
 
 
+#: ``address`` 段里可能当"城市"用的键(TASK-22 境外住宿行的城市线索,按优先级取第一个非空)
+CITY_ADDRESS_KEYS: tuple[str, ...] = ("city", "town", "village", "municipality", "county")
+
+
+def address_fields(raw: Any) -> dict[str, str]:
+    """把结果的 ``address`` 段原样收进字典(TASK-22,**只在 opt-in 时追加**)。
+
+    与 :func:`country_fields` 同源:需要请求带 ``addressdetails=1`` 才有 ``address`` 段;
+    值统一转 ``str`` 并去空白,缺失的键**不补空串**(调用方按 ``CITY_ADDRESS_KEYS``
+    的优先级挑第一个非空值,补空串只会让"没有城市"和"城市叫空串"分不清)。
+    """
+    address = raw.get("address") if isinstance(raw, dict) else None
+    if not isinstance(address, dict):
+        return {}
+    fields: dict[str, str] = {}
+    for key, value in address.items():
+        text = str(value or "").strip()
+        if text:
+            fields[str(key)] = text
+    return fields
+
+
 def parse_place(
-    raw: Any, *, action: str = "地理编码", include_country: bool = False
+    raw: Any,
+    *,
+    action: str = "地理编码",
+    include_country: bool = False,
+    include_address: bool = False,
 ) -> dict[str, Any]:
     """把 Nominatim 的单条结果解析成 ``{"lat", "lng", "display_name"}``。
 
     ``include_country=True``(TASK-20 opt-in)时**追加** ``country_code`` / ``country`` 两键;
-    默认 ``False`` 时输出与既有口径**逐键一致**(既有单测断言的就是那三个键)。
+    ``include_address=True``(TASK-22 opt-in)时再**追加** ``address`` 一个键
+    (:func:`address_fields` 的结果,给境外住宿行取 ``city``/``town``/``village``);
+    两者都默认 ``False``,此时输出与既有口径**逐键一致**(既有单测断言的就是那三个键)。
     """
     if not isinstance(raw, dict):
         raise DataSourceError(SOURCE_NAME, f"{action}响应格式异常(应为 JSON 对象):{type(raw).__name__}")
@@ -87,6 +115,8 @@ def parse_place(
     }
     if include_country:
         place.update(country_fields(raw))
+    if include_address:
+        place["address"] = address_fields(raw)
     return place
 
 
@@ -171,12 +201,19 @@ class NominatimClient:
         )
 
     def reverse(
-        self, lat: float, lng: float, *, zoom: int = 10, include_country: bool = False
+        self,
+        lat: float,
+        lng: float,
+        *,
+        zoom: int = 10,
+        include_country: bool = False,
+        include_address: bool = False,
     ) -> dict[str, Any]:
         """逆地理编码:坐标 → ``{"lat", "lng", "display_name"}``(用于"当前位置")。
 
         ``include_country=True``(TASK-20)才带 ``addressdetails=1`` 并追加
-        ``country_code``/``country``;默认口径零变化。
+        ``country_code``/``country``;``include_address=True``(TASK-22)同样带
+        ``addressdetails=1`` 并追加 ``address`` 段(境外住宿行的城市线索);默认口径零变化。
         """
         try:
             latitude = float(lat)
@@ -193,7 +230,7 @@ class NominatimClient:
             "lon": f"{longitude:.6f}",
             "zoom": int(zoom),
         }
-        if include_country:
+        if include_country or include_address:
             params["addressdetails"] = 1
         payload = self._request("/reverse", params)
         if isinstance(payload, dict) and payload.get("error"):
@@ -202,6 +239,7 @@ class NominatimClient:
             payload,
             action=f"逆地理编码 ({latitude:.6f},{longitude:.6f})",
             include_country=include_country,
+            include_address=include_address,
         )
 
 
@@ -241,10 +279,14 @@ def reverse(
     session: Optional[Any] = None,
     min_interval: float = MIN_REQUEST_INTERVAL_S,
     include_country: bool = False,
+    include_address: bool = False,
 ) -> dict[str, Any]:
-    """模块级便捷函数:逆地理编码(``include_country`` 透传给 :meth:`NominatimClient.reverse`)。"""
+    """模块级便捷函数:逆地理编码(``include_country``/``include_address`` 透传给
+    :meth:`NominatimClient.reverse`)。"""
     client = _resolve_client(endpoint, timeout, session, min_interval)
-    return client.reverse(lat, lng, zoom=zoom, include_country=include_country)
+    return client.reverse(
+        lat, lng, zoom=zoom, include_country=include_country, include_address=include_address
+    )
 
 
 def _resolve_client(

@@ -15,6 +15,13 @@
   note 里写明。高德失败(没配 key、超配额、两点不连通)时**不抛错**:该条降级成
   ``kind="estimate"`` + ``degraded=True``、时长/费用/geometry 为 ``None``,
   note 说明原因,deep-link 照给(跳转导航不依赖路线接口)。
+* **境外轨(TASK-22)**:``region=overseas`` 时**只换驾车的数据源** —— OSRM 公共实例
+  (:func:`default_router_osrm`,WGS-84、无需 key),``source`` 照实报 ``osrm``;OSRM demo
+  服务器不给收费/分段数据 → ``toll_distance_km`` 恒 ``None`` → 过路费一律
+  ``toll_mode="heuristic"``(里程 × 0.55),费率表仍是中国东/中/西三档(不新造国别费率表),
+  note 里明示"境外费率按中国西部档估算,仅供参考"(:data:`OVERSEAS_DRIVING_NOTE`)。
+  铁路/飞机的估算腿**不分轨**(里程公式与国别无关;种子票价/机场表不命中就是既有的
+  费率估算 / 只留 deep-link 降级路径)。
 * **铁路 / 飞机**:耗时沿用 POC ``app/api/discover.py`` 的 ``_est_mode`` 口径
   (直线距离 × 绕行系数 / 均速 + 地面接驳),费用按里程 × 单价 → 全是估算,
   ``kind="estimate"``,note 一律带「估算·非实时·以官方为准」。
@@ -63,7 +70,9 @@ from urllib.parse import quote
 from data_sources import DataSourceError
 from data_sources import amap
 from data_sources import haversine_km
+from data_sources import osrm
 from db.models import iso_utc, utcnow
+from services.region_gate import REGION_DOMESTIC, REGION_OVERSEAS
 
 # --------------------------------------------------------------------------- #
 # 出行方式、出现阈值与耗时系数(沿用 POC app/api/discover.py 的 _est_mode 口径)
@@ -236,6 +245,8 @@ RAIL_SEED_INDEX: dict[frozenset[str], tuple[str, str, float]] = {
 KIND_REAL = "real"
 KIND_ESTIMATE = "estimate"
 SOURCE_AMAP = "amap"
+# 境外轨(TASK-22):region=overseas 的驾车走 OSRM 公共实例,``source`` 照实报 osrm
+SOURCE_OSRM = "osrm"
 SOURCE_ESTIMATE = "estimate"
 SOURCE_UNAVAILABLE = "unavailable"
 ESTIMATE_DISCLAIMER = "估算·非实时·以官方为准"
@@ -254,6 +265,19 @@ DRIVING_NOTE = (
 )
 DRIVING_DEGRADED_NOTE = (
     "高德驾车路线暂不可用(未配置 key、配额/限流,或两点不在同一路网/坐标离路网太远):"
+    f"时长与费用本次给不出,不做瞎估;可直接用下方导航链接跳转官方。{ESTIMATE_DISCLAIMER}"
+)
+# 境外轨的口径文案(TASK-22 契约 §0):OSRM demo 服务器**没有** tolls/steps 数据,过路费
+# 只能走启发式;费率表仍是中国境内东/中/西三档(不新造国别费率表),note 里必须说清楚。
+OVERSEAS_DRIVING_NOTE = (
+    f"境外轨:时长/里程来自 OSRM 公共实例(WGS-84 真实路网,不含实时路况);"
+    f"该实例不给收费里程与分段明细 → 过路费一律按 里程 × {HEURISTIC_HIGHWAY_RATIO:g} 启发式"
+    f"(cost_breakdown.mode={TOLL_MODE_HEURISTIC});费率表仍是中国境内东/中/西三档"
+    f"(境外坐标按中点经度落档,欧洲/大洋洲多半落到{REGION_LABELS[REGION_WEST]}档)——"
+    f"境外费率按中国西部档估算,仅供参考。{ESTIMATE_DISCLAIMER}"
+)
+OVERSEAS_DRIVING_DEGRADED_NOTE = (
+    "境外驾车路线暂不可用(OSRM 公共实例繁忙/限流,或两点不在同一路网、坐标离路网太远):"
     f"时长与费用本次给不出,不做瞎估;可直接用下方导航链接跳转官方。{ESTIMATE_DISCLAIMER}"
 )
 
@@ -338,6 +362,17 @@ def driving_region(*, from_name: Optional[str] = None, to_name: Optional[str] = 
         if resolved:
             return resolved
     return region_by_longitude(0.0 if mid_lng is None else mid_lng)
+
+
+def driving_track(region: Optional[str]) -> str:
+    """本次驾车走哪一轨:``region`` 只认 :data:`REGION_OVERSEAS`,其余(含 ``None``)按境内。
+
+    非法值在 API 层就 400 掉了(:mod:`app.api.routes`);服务层**不抛**,认不出就按
+    境内(现状高德轨零改动)—— 与 :func:`services.place_loader.resolve_segment_region`
+    的"判不出按境内、不猜"同口径。
+    """
+    cleaned = str(region or "").strip().lower()
+    return REGION_OVERSEAS if cleaned == REGION_OVERSEAS else REGION_DOMESTIC
 
 
 def resolve_toll_km(
@@ -1129,6 +1164,36 @@ def amap_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def osrm_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
+    """OSRM 驾车结果(:func:`data_sources.osrm.route`)→ 与 :func:`amap_leg` **同形状**的 leg。
+
+    下游(:func:`driving_route`)只认 ``amap_leg`` 那一种形状,所以境外轨在这里归一:
+
+    * ``distance_km`` / ``duration_min`` 直接用(:mod:`data_sources.osrm` 已把米/秒换好);
+      为兼容"给了原始米/秒"的调用方(契约 §1.2 的 ``distance_m``/``duration_s`` 口径),
+      这两个键缺失时才按 ``distance_m``/``duration_s`` 换算;
+    * ``toll_distance_km`` **恒 ``None``** —— OSRM demo 服务器没有收费数据(契约 §0),
+      费用引擎据此自动退化成 ``toll_mode="heuristic"``(该退化路径已有既有单测);
+    * ``traffic_lights`` 同样没有 → ``None``;``steps_n`` 取分段条数(``steps=false`` 时为
+      ``None``);``geometry`` 已是 ``[[lat, lng], …]``,照抄成 list。
+    """
+    distance_km = leg.get("distance_km")
+    if distance_km is None and leg.get("distance_m") is not None:
+        distance_km = float(leg["distance_m"]) / 1000.0
+    duration_min = leg.get("duration_min")
+    if duration_min is None and leg.get("duration_s") is not None:
+        duration_min = float(leg["duration_s"]) / 60.0
+    steps = leg.get("steps")
+    return {
+        "distance_km": float(distance_km),
+        "duration_min": float(duration_min),
+        "toll_distance_km": None,
+        "traffic_lights": None,
+        "steps_n": len(steps) if isinstance(steps, (list, tuple)) else None,
+        "geometry": [list(point) for point in (leg.get("geometry") or [])],
+    }
+
+
 def default_router(start_lnglat: Sequence[float], end_lnglat: Sequence[float]) -> Mapping[str, Any]:
     """默认取**高德**驾车路线(v3 ``direction/driving``,含 polyline 与 ``toll_distance``)。
 
@@ -1142,6 +1207,22 @@ def default_router(start_lnglat: Sequence[float], end_lnglat: Sequence[float]) -
     return amap_leg(amap.driving(start_lat, start_lng, end_lat, end_lng))
 
 
+def default_router_osrm(
+    start_lnglat: Sequence[float], end_lnglat: Sequence[float]
+) -> Mapping[str, Any]:
+    """境外轨默认路由(TASK-22):取 **OSRM** 公共实例的驾车路线(含折线)。
+
+    入参是 ``(lng, lat)`` 二元组(与 :data:`RouterFn` 口径一致),而 OSRM 要的正是
+    ``lng,lat``(WGS-84)—— **不换序、不做坐标系转换**(境外没有 GCJ-02 偏移问题)。
+    失败抛 :class:`data_sources.DataSourceError` / :class:`ValueError`,由
+    :func:`driving_route` 既有的降级分支兜成 ``degraded=true``(不 500)。
+    """
+    start_lng, start_lat = float(start_lnglat[0]), float(start_lnglat[1])
+    end_lng, end_lat = float(end_lnglat[0]), float(end_lnglat[1])
+    leg = osrm.route((start_lng, start_lat), (end_lng, end_lat), with_geometry=True)
+    return osrm_leg(leg)
+
+
 def driving_route(
     *,
     from_lat: float,
@@ -1153,19 +1234,30 @@ def driving_route(
     date: Optional[str] = None,
     router: Optional[RouterFn] = None,
     geometry_max_points: Optional[int] = GEOMETRY_MAX_POINTS,
+    region: Optional[str] = None,
 ) -> dict[str, Any]:
-    """驾车路线:高德真实时长/里程/折线 + 估算费用(构成明细 + 整车/人均双标)。
+    """驾车路线:真实时长/里程/折线 + 估算费用(构成明细 + 整车/人均双标)。
 
-    **高德失败只降级、不抛错**:降级时 ``duration_min``/``cost_cny``/``cost_breakdown``/
+    **境内(``region`` 缺省/``domestic``)= 现状零改动**:高德 ``direction/driving``
+    (:func:`default_router`),收费里程取 ``toll_distance`` 真实值。
+    **境外(``region=overseas``,TASK-22)**:默认路由换成 :func:`default_router_osrm`
+    (OSRM 公共实例,WGS-84),``source`` 报 ``osrm``;OSRM 不给收费数据 →
+    ``toll_distance_km=None`` → ``cost_breakdown.mode`` 恒 ``heuristic``,note 追加
+    :data:`OVERSEAS_DRIVING_NOTE` 说明"境外费率按中国西部档估算,仅供参考"。
+    ``router=`` 显式注入**优先于** region 分支(既有单测口径不变)。
+
+    **路由失败只降级、不抛错**:降级时 ``duration_min``/``cost_cny``/``cost_breakdown``/
     ``per_person_cny``/``geometry`` 全是 ``None``,deep-link 照给。
     """
+    overseas = driving_track(region) == REGION_OVERSEAS
     meta = MODE_META[MODE_DRIVING]
     links = route_links(
         MODE_DRIVING, from_lat=from_lat, from_lng=from_lng, to_lat=to_lat, to_lng=to_lng,
         to_name=to_name, from_name=from_name, date=date,
     )
     try:
-        leg = (router or default_router)((from_lng, from_lat), (to_lng, to_lat))
+        default = default_router_osrm if overseas else default_router
+        leg = (router or default)((from_lng, from_lat), (to_lng, to_lat))
     except (DataSourceError, ValueError):
         leg = None
 
@@ -1177,7 +1269,8 @@ def driving_route(
         distance_km: Optional[float] = None
         geometry: Optional[list[list[float]]] = None
         kind, degraded, source, note = (
-            KIND_ESTIMATE, True, SOURCE_UNAVAILABLE, DRIVING_DEGRADED_NOTE
+            KIND_ESTIMATE, True, SOURCE_UNAVAILABLE,
+            OVERSEAS_DRIVING_DEGRADED_NOTE if overseas else DRIVING_DEGRADED_NOTE,
         )
     else:
         distance_km = round(float(leg["distance_km"]), DISTANCE_PRECISION)
@@ -1193,7 +1286,11 @@ def driving_route(
         cost_breakdown = money["cost_breakdown"]
         per_person_cny = money["per_person_cny"]
         geometry = thin_geometry(leg.get("geometry"), geometry_max_points)
-        kind, degraded, source, note = KIND_REAL, False, SOURCE_AMAP, _driving_note(money)
+        source = SOURCE_OSRM if overseas else SOURCE_AMAP
+        note = _driving_note(money)
+        if overseas:
+            note = f"{note} {OVERSEAS_DRIVING_NOTE}"
+        kind, degraded = KIND_REAL, False
 
     return {
         "mode": MODE_DRIVING,
@@ -1297,10 +1394,17 @@ def plan_routes(
     date: Optional[str] = None,
     now: Optional[datetime] = None,
     geometry_max_points: Optional[int] = GEOMETRY_MAX_POINTS,
+    region: Optional[str] = None,
 ) -> RoutePlan:
-    """编排三种方式:驾车始终出现(高德),铁路 ≥100km、飞机 ≥600km 才出现(估算)。
+    """编排三种方式:驾车始终出现,铁路 ≥100km、飞机 ≥600km 才出现(估算)。
 
-    坐标非法抛 :class:`ValueError`(API 层转 400);高德失败**不抛**,驾车条目降级。
+    坐标非法抛 :class:`ValueError`(API 层转 400);驾车路由失败**不抛**,该条目降级。
+
+    ``region``(TASK-22)**只透传给驾车**:境内走高德、境外走 OSRM(见
+    :func:`driving_route`)。铁路/飞机的估算腿**不分轨** —— 里程公式与国别无关;
+    境外城市对命中不了 :data:`RAIL_SEED_FARES` 就自然走分档费率、命中不了
+    :data:`AIRPORT_CITIES` 就不出票价只留 deep-link,都是既有降级路径。
+
     铁路票价优先用 :data:`RAIL_SEED_FARES` 种子价;机票按民航公布价锚定区间,
     直线 <400km 或任一端没有民航机场时不给票价(条目仍带 deep-link)。
     """
@@ -1315,7 +1419,7 @@ def plan_routes(
         driving_route(
             from_lat=lat1, from_lng=lng1, to_lat=lat2, to_lng=lng2,
             to_name=destination_name, from_name=origin_name, date=date,
-            router=router, geometry_max_points=geometry_max_points,
+            router=router, geometry_max_points=geometry_max_points, region=region,
         )
     ]
     if straight_km >= RAIL_MIN_KM:

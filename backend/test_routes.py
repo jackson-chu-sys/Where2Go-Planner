@@ -530,10 +530,12 @@ def test_api_routes_payload_shape(stub_amap) -> None:
         to_lat=dest["lat"], to_lng=dest["lng"], to_name="北京", from_name="上海",
     )
 
+    # TASK-22 起顶层多一个 ``region`` 键(境内外口径,生效值);其余键逐键零变化
     assert set(payload) == {
-        "from", "to", "distance_km", "routes", "count",
+        "from", "to", "distance_km", "routes", "count", "region",
         "mode_rules", "cost_model", "generated_at", "elapsed_s", "note",
     }
+    assert payload["region"] == "domestic", "没给 region 就是境内轨(现状高德)"
     assert payload["from"] == {"lat": SHANGHAI["lat"], "lng": SHANGHAI["lng"], "name": "上海"}
     assert payload["to"]["name"] == "北京" and payload["to"]["lat"] == pytest.approx(dest["lat"])
     assert payload["distance_km"] == pytest.approx(1067.0, abs=0.05)

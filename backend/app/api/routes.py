@@ -34,9 +34,15 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from services import region_gate
 from services import routes as route_service
 
 router = APIRouter()
+
+# 境内外口径(TASK-22):``region`` 查询参数只认这两个值(前端「境外模式」开关传 overseas),
+# 与 /api/geocode、/api/places 同一个 :func:`_region_override` 校验口径(非法值 400 中文)。
+REGION_CHOICES = frozenset(region_gate.REGIONS)
+REGION_INVALID_MSG = "region 只支持 domestic 或 overseas"
 
 
 def _optional_text(value: Any) -> Optional[str]:
@@ -46,6 +52,22 @@ def _optional_text(value: Any) -> Optional[str]:
     传进服务层就是 ``FieldInfo`` 对象;这里统一把"没给"归一成 ``None``。
     """
     return value if isinstance(value, str) else None
+
+
+def _region_override(value: Any) -> Optional[str]:
+    """``region`` 查询参数归一:留空/空串 = 没给(``None`` → 按境内);非法值 **400 中文**。
+
+    与 :func:`app.api.places._region_override` 同口径。本路由**不做自动判定**
+    (判境内外要发一次网络,而路线查询是交互路径):不勾「境外模式」就是境内高德轨,
+    勾了才走 OSRM 境外轨(:func:`services.routes.driving_track`)。
+    """
+    cleaned = (_optional_text(value) or "").strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.lower()
+    if normalized not in REGION_CHOICES:
+        raise HTTPException(400, REGION_INVALID_MSG)
+    return normalized
 
 
 ROUTES_NOTE = (
@@ -76,9 +98,20 @@ def list_routes(
     to_lng: Optional[str] = Query(None, description="目的地经度(WGS84 数字,[-180, 180])"),
     to_name: Optional[str] = Query(None, description="目的地名称(deep-link 文案/URL 用,建议带上)"),
     from_name: Optional[str] = Query(None, description="起点地名(可选):12306/OTA 链接的出发地"),
+    region: Optional[str] = Query(
+        None, description="境内外口径:domestic(默认,高德驾车)| overseas(境外轨,OSRM 驾车)"
+    ),
 ) -> dict[str, Any]:
-    """返回起终点之间的多方式路线数组(驾车始终有,铁路/飞机按距离阈值出现)。"""
+    """返回起终点之间的多方式路线数组(驾车始终有,铁路/飞机按距离阈值出现)。
+
+    ``region``(TASK-22)是前端「境外模式」开关的透传:``overseas`` → 驾车改走 OSRM
+    (境外真实路网,WGS-84)、过路费只能启发式估算;留空/``domestic`` → 现状高德轨
+    **零变化**。铁路/飞机的估算腿不分轨。响应**只多一个** ``region`` 键(本次生效值),
+    其余键逐键零变化。
+    """
     started = time.monotonic()
+    # region 与坐标一样**先**校验:非法就快速失败,一次网都不触(同 /api/places 口径)
+    region_override = _region_override(region)
     try:
         plan = route_service.plan_routes(
             from_lat=from_lat,
@@ -87,6 +120,7 @@ def list_routes(
             to_lng=to_lng,
             to_name=_optional_text(to_name),
             from_name=_optional_text(from_name),
+            region=region_override,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -97,6 +131,7 @@ def list_routes(
         "distance_km": plan.distance_km,
         "routes": plan.routes,
         "count": len(plan.routes),
+        "region": route_service.driving_track(region_override),
         "mode_rules": route_service.mode_rules(),
         "cost_model": route_service.cost_coefficients(),
         "generated_at": plan.generated_at,

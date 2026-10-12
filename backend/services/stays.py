@@ -53,6 +53,18 @@ TASK-6g 在估价路径最前面又插了一层(**规则层,0 token**):
 * 规则产物与 LLM 产物同口径**永久缓存**:``Stay.price_estimate``/``price_kind`` 一旦写下,
   重抓不覆盖(规则表日后调价也不会重算已入库的行,与 ``Place.intro`` 一致)。
 
+境外双轨(TASK-22,P3):``region=overseas`` 时**只换数据源**,其余口径全共用 ——
+
+* 检索腿从"高德 ``place/around``"换成 **Overpass 单圆并集**
+  (:mod:`data_sources.osm_overseas`,``tourism ∈ STAY_TAGS``、``require_name=False``),
+  见 :func:`fetch_stay_pois_osm`;
+* 入库身份用**原生 OSM 身份**(``osm_type=node/way/relation`` + 原生 id,**不 crc32**),
+  与 TASK-21 的 ``Place`` 同口径;``source`` 照实报 ``"osm"``;
+* :func:`stay_city` 对境外行多一条腿:OSM 行常缺 ``addr:city`` → 用 Nominatim 逆地理编码
+  懒补一次(:func:`overseas_city`,进程内按 ≈1.1 km 网格 memo,失败 ``None`` 不阻塞);
+* **半径阶梯 / 负缓存 / 批量 LLM 估价 / 规则表 / ``price_kind`` 一律不分轨**
+  (:class:`StayQueryCache` 的键不含 region:同一坐标不会既是境内又是境外)。
+
 CLI(给夜间预抓/排查用,联网)::
 
     python -m services.stays 31.2304 121.4737 --radius 8000 --limit 10
@@ -77,6 +89,8 @@ from sqlalchemy.orm import Session
 from data_sources import DataSourceError
 from data_sources import amap
 from data_sources import haversine_km
+from data_sources import osm_overseas
+from data_sources.nominatim import reverse as ds_nominatim_reverse
 from db.models import (
     COORD_PRECISION,
     CURRENCY_LEN,
@@ -93,6 +107,8 @@ from db.models import (
     REASON_TIMEOUT,
     AMAP_OSM_TYPE,
     AMAP_SOURCE,
+    OSM_SOURCE,
+    SOURCE_TAG,
     STAY_CACHE_EMPTY,
     STAY_REASON_LEN,
     Stay,
@@ -116,6 +132,7 @@ from services.intro import (
 )
 from services import amap_categories
 from services.intro import default_client as default_llm_client
+from services.region_gate import REGION_DOMESTIC, REGION_OVERSEAS
 
 # 住宿类型(**值即 kind**):OSM 时代是 ``tourism=*`` 的取值,高德时代由
 # :func:`stay_kind` 从返回的中文 ``type``/``name`` 归一到同一批值(前端/规则表口径不变)
@@ -145,9 +162,23 @@ DISTANCE_PRECISION = 2
 MIN_CACHED_ROWS = 1
 SOURCE_DB = "db"
 SOURCE_FETCH = "amap"
+# 境外轨(TASK-22):Overpass 抓来的行,``source`` 照实报 "osm"(与 place_loader.SOURCE_OSM 同值)
+SOURCE_OSM = "osm"
 METERS_PER_DEGREE = 111_320.0
 # 高纬度兜底:cos(lat) 太小时经度包围盒会炸开,夹一个下限保证 SQL 粗筛仍收敛
 MIN_COS_LAT = 0.05
+
+# --- TASK-22:境外轨(OSM 住宿腿 + Nominatim 城市懒补) --- #
+# 境外行的 tags["source"] 标注:既是来源标注,也是 stay_city 认"这是境外行"的标记
+# (存量 OSM 行没有这个键 → 不会为它们白打 Nominatim)
+OSM_COORD_SYSTEM = "WGS-84"
+# 城市线索在 Nominatim ``address`` 段里的取值优先级(契约 §1.4:city||town||village)
+NOMINATIM_CITY_KEYS: tuple[str, ...] = ("city", "town", "village")
+# zoom=10 ≈ 区县级(与 services.region_gate.REVERSE_ZOOM 同口径)
+NOMINATIM_CITY_ZOOM = 10
+# 进程内 memo 的网格精度:2 位小数 ≈ 1.1 km —— 同一片区的住宿行共用一次逆地理编码
+# (Nominatim 官方限 1 req/s,一次几十行不 memo 会把交互请求拖成分钟级)
+CITY_LOOKUP_GRID_PRECISION = 2
 
 # --- TASK-6c:负缓存 / 半径阶梯 / 后台批量估价 --- #
 # 负缓存有效期:6 小时内同坐标同半径不再触网(空结果与失败都记)
@@ -435,6 +466,30 @@ def amap_stay_kind(tags: Mapping[str, Any]) -> str:
     return "hotel" if (typecode or type_text) else ""
 
 
+def osm_stay_kind(tags: Optional[Mapping[str, Any]]) -> str:
+    """OSM 行的 kind(:func:`stay_kind` 的 **OSM 分支**,TASK-22 抽出来给境外轨直接用)。
+
+    ``tourism`` 值命中 :data:`STAY_TAGS` 即为 kind;命中不了就退回 ``tourism`` 原值
+    (``motel``/``resort`` 这类同族写法照收,便于前端分组);连 ``tourism`` 都没有时看别的
+    tag 值里有没有住宿类型(``building=hotel`` 的少数写法),都没有 → 空串(不猜)。
+
+    单独成函数是因为境外行**不该**走高德那套中文关键词归一:OSM 关系元素的
+    ``type=multipolygon`` 会让 :func:`amap_stay_kind` 误判成 ``hotel`` 兜底,把
+    ``tourism=motel`` 吃掉。
+    """
+    normalized = {
+        str(key).strip().lower(): str(value).strip().lower()
+        for key, value in dict(tags or {}).items()
+    }
+    tourism = normalized.get("tourism", "")
+    if tourism in STAY_TAGS:
+        return tourism
+    for tag in STAY_TAGS:
+        if tag in normalized.values():
+            return tag
+    return tourism[:KIND_LEN]
+
+
 def stay_kind(tags: Optional[Mapping[str, Any]]) -> str:
     """住宿类型归一:高德行看中文 ``type``/``name``,OSM/存量行看 ``tourism`` 值。
 
@@ -451,13 +506,7 @@ def stay_kind(tags: Optional[Mapping[str, Any]]) -> str:
     amap_kind = amap_stay_kind(normalized)
     if amap_kind:
         return amap_kind[:KIND_LEN]
-    tourism = normalized.get("tourism", "")
-    if tourism in STAY_TAGS:
-        return tourism
-    for tag in STAY_TAGS:
-        if tag in normalized.values():
-            return tag
-    return tourism[:KIND_LEN]
+    return osm_stay_kind(normalized)
 
 
 def normalize_kind(row: Any) -> str:
@@ -636,11 +685,78 @@ def city_tier(city: Any) -> Optional[str]:
     return best or CITY_TIER_OTHER
 
 
+def is_osm_stay(stay: Any) -> bool:
+    """是否**境外轨**(TASK-22)抓来的行:``tags["source"] == "OSM"``(:func:`osm_stay_tags` 写)。
+
+    境内高德行写的是 ``"高德"``(:data:`~db.models.AMAP_SOURCE`),阶段1 的存量 OSM 行
+    根本没这个标注 → 都判 ``False``:免得 :func:`stay_city` 为老行白打一次 Nominatim。
+    ``osm_type`` 单独判不够用(``node/way/relation`` 三种存量行也长这样)。
+    """
+    tags = _get(stay, "tags")
+    if not isinstance(tags, Mapping):
+        return False
+    return str(tags.get(SOURCE_TAG) or "").strip() == OSM_SOURCE
+
+
+_city_lookup_lock = threading.Lock()
+_city_lookup_cache: dict[tuple[float, float], Optional[str]] = {}
+
+
+def reset_city_lookup_cache() -> None:
+    """清空 :func:`overseas_city` 的进程内 memo(单测隔离用;线上进程常驻,不必清)。"""
+    with _city_lookup_lock:
+        _city_lookup_cache.clear()
+
+
+def overseas_city(lat: Any, lng: Any) -> Optional[str]:
+    """境外行的城市线索:Nominatim 逆地理编码的 ``address.city||town||village``(失败 ``None``)。
+
+    * **懒补**:只有 :func:`stay_city` 前面三处线索(tag/显式 city/名称里的城市)都没有时
+      才打这一腿,而 OSM 住宿行大多自带 ``addr:city``,所以真实流量里它很少触发;
+    * **进程内 memo**:键是坐标四舍五入到 :data:`CITY_LOOKUP_GRID_PRECISION` 位(≈1.1 km),
+      同一片区几十行只打一次;``None`` 也记(失败不反复重试、不阻塞列表);
+    * **绝不抛**:端点挂 / 限流 / 查不到一律 ``None``(城市线索只影响线级系数与 OTA 搜索词);
+    * 单测把 :func:`ds_nominatim_reverse` 换成替身即可(:mod:`services.region_gate` 同套路)。
+    """
+    point = coordinate_pair(lat, lng)
+    if point is None:
+        return None
+    grid = (
+        round(point[0], CITY_LOOKUP_GRID_PRECISION),
+        round(point[1], CITY_LOOKUP_GRID_PRECISION),
+    )
+    with _city_lookup_lock:
+        if grid in _city_lookup_cache:
+            return _city_lookup_cache[grid]
+    city: Optional[str] = None
+    try:
+        place = ds_nominatim_reverse(
+            point[0], point[1],
+            zoom=NOMINATIM_CITY_ZOOM, include_country=True, include_address=True,
+        )
+        address = place.get("address") if isinstance(place, Mapping) else None
+        details: Mapping[str, Any] = address if isinstance(address, Mapping) else {}
+        for key in NOMINATIM_CITY_KEYS:
+            value = normalize_city_name(details.get(key))
+            if value:
+                city = value
+                break
+    except Exception:  # noqa: BLE001 - 城市线索是增强项:查不到就按中性系数,绝不阻塞列表
+        city = None
+    with _city_lookup_lock:
+        _city_lookup_cache[grid] = city
+    return city
+
+
 def stay_city(stay: Any) -> Optional[str]:
     """一行的城市线索:地址 tag(:data:`CITY_TAGS`)> 显式 ``city`` 字段 > **名称**里的城市。
 
     名称里只认 :data:`KNOWN_TIER_CITIES`(``上海虹桥康得思酒店`` 这类写法),免得把
     ``半岛``/``四季`` 这种词误当城市;三处都没有 → ``None``(按中性系数处理)。
+
+    TASK-22:**境外轨的行**(:func:`is_osm_stay`)在三处线索都空时再多一条腿 ——
+    :func:`overseas_city` 用 Nominatim 逆地理编码取 ``address.city||town||village``,
+    失败仍是 ``None``(不阻塞;境内高德行的判定路径逐字不变)。
     """
     tags = _get(stay, "tags")
     normalized = {
@@ -659,7 +775,11 @@ def stay_city(stay: Any) -> Optional[str]:
     for city in KNOWN_TIER_CITIES:
         if city in name and len(city) > len(best):
             best = city
-    return best or None
+    if best:
+        return best
+    if is_osm_stay(stay):
+        return overseas_city(_get(stay, "lat"), _get(stay, "lng"))
+    return None
 
 
 def city_price_factor(stay: Any) -> float:
@@ -753,7 +873,81 @@ def stay_page_limit(budget: int = GROUP_BUDGET) -> int:
     return max(1, min(amap.MAX_PAGE, math.ceil(max(1, int(budget)) / amap.PAGE_SIZE)))
 
 
-def fetch_stay_pois(
+def resolve_stay_region(region: Optional[str]) -> str:
+    """本次住宿检索走哪一轨:``region`` 只认 ``overseas``,其余(含 ``None``)按境内。
+
+    与 :func:`services.routes.driving_track` 同口径:非法值在 API 层已经 400 掉了,
+    服务层**不抛**、认不出按境内(现状高德轨零改动)。region **不进**
+    :class:`StayQueryCache` 的键(契约 §1.4):同一坐标不会既是境内又是境外,零冲突。
+    """
+    cleaned = str(region or "").strip().lower()
+    return REGION_OVERSEAS if cleaned == REGION_OVERSEAS else REGION_DOMESTIC
+
+
+def osm_endpoint(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """境外轨 Overpass 用哪个端点(与 :func:`services.place_loader.osm_endpoint` 同口径)。
+
+    服务层之间不横向依赖(见 :func:`normalize_city_name` 的注释),所以那 6 行在这里重写:
+    ``environ=None`` → 返回 ``None``,:class:`data_sources.osm_overseas.OverpassClient`
+    自己按 ``WHERE2GO_OVERPASS_ENDPOINT`` → 默认端点链解析;给了 ``environ``(单测替身)
+    → **只认它**,不回落宿主环境变量。
+    """
+    if environ is None:
+        return None
+    given = str(environ.get(osm_overseas.ENV_ENDPOINT) or "").strip()
+    return given or osm_overseas.DEFAULT_ENDPOINT
+
+
+def osm_stay_groups(*, budget: int = GROUP_BUDGET) -> list[dict[str, Any]]:
+    """境外轨住宿检索分组:**单组**,组内每个 ``{"tourism": tag}`` 一个选择器(并集、共用配额)。
+
+    住宿在一个 5~30 km 圆里密度低,不必像目的地那样按四分类拆组(阶段1 TASK-3a1 口径)。
+    """
+    return [
+        {
+            "tags": [{"tourism": tag} for tag in STAY_TAGS],
+            "element_types": "nwr",
+            "budget": max(1, int(budget)),
+        }
+    ]
+
+
+def osm_stay_tags(place: Mapping[str, Any]) -> dict[str, Any]:
+    """OSM 元素 → ``Stay.tags``:原样保留 OSM tag,再加**来源与坐标系标注**。
+
+    ``source="OSM"``(:data:`~db.models.OSM_SOURCE`)既是前端/排查用的来源标注,也是
+    :func:`is_osm_stay` 认境外行的标记;``coord_system`` 与 TASK-21 的境外 ``Place`` 同口径
+    (OSM 给的是 WGS-84,高德给的是 GCJ-02,不标出来前端画点会各猜一套)。
+    估价线索(``stars``/``rooms``/``brand``…)本来就在 OSM tag 里,
+    :data:`STAY_FACT_TAGS` 白名单照旧能取到。
+    """
+    tags = {str(key): value for key, value in dict(place.get("tags") or {}).items()}
+    tags[SOURCE_TAG] = OSM_SOURCE
+    tags["coord_system"] = OSM_COORD_SYSTEM
+    return tags
+
+
+def osm_stay_poi(place: Mapping[str, Any]) -> dict[str, Any]:
+    """``osm_overseas.parse_places`` 的一条结果 → **境外轨 fetch 行**。
+
+    形状 = 现版 fetch 行的口径(``osm_type``/``osm_id``/``name``/``kind``/``lat``/``lng``/
+    ``tags``),但身份是**原生 OSM 身份**(``node/way/relation`` + 原生 id,**不 crc32**);
+    ``kind`` 走 :func:`osm_stay_kind`(``tourism`` 值即 kind)。``distance_km`` 由
+    :func:`osm_stay_row` 按起点补(与 :func:`stay_row` 分工一致)。
+    """
+    tags = osm_stay_tags(place)
+    return {
+        "osm_type": str(place.get("osm_type") or "").strip().lower(),
+        "osm_id": place.get("osm_id"),
+        "name": str(place.get("name") or "").strip(),
+        "kind": osm_stay_kind(tags),
+        "lat": place.get("lat"),
+        "lng": place.get("lng"),
+        "tags": tags,
+    }
+
+
+def fetch_stay_pois_osm(
     lat: float,
     lng: float,
     radius_m: float = DEFAULT_RADIUS_M,
@@ -762,7 +956,62 @@ def fetch_stay_pois(
     environ: Optional[Mapping[str, str]] = None,
     session: Optional[Any] = None,
 ) -> list[dict[str, Any]]:
-    """高德 ``place/around`` 检索住宿:``types=100000``(住宿服务**大类**),由近及远翻页。
+    """境外轨住宿检索(TASK-22):Overpass **单圆**并集 ``tourism ∈ STAY_TAGS``,由近及远。
+
+    * ``require_name=False``(阶段1 口径):民宿/公寓/小屋经常没有 ``name`` tag,服务端加
+      ``["name"]`` 会把它们整片滤掉,宁可取回来在展示层兜底成"(无名)";
+    * 环内过滤与距离排序都由 :func:`data_sources.osm_overseas.parse_places` 完成,
+      这里不重排、也不做本地 haversine 复核(:func:`distance_km` 只是给前端显示);
+    * **交互路径**:HTTP 超时用 :data:`STAY_REQUEST_TIMEOUT_S`(不是冷启动那档 150s);
+    * 按 ``(osm_type, osm_id)`` 去重并截到 ``budget`` 条;
+    * 端点链全挂 / 限流 / 响应异常一律抛 :class:`data_sources.DataSourceError`,由
+      :func:`search_stays_detailed` 兜成三档 reason(**绝不抛给调用方**)。
+    """
+    client = osm_overseas.OverpassClient(osm_endpoint(environ), session=session)
+    places = client.nearby_places_grouped(
+        lat,
+        lng,
+        radius_m,
+        osm_stay_groups(budget=budget),
+        require_name=False,
+        request_timeout=STAY_REQUEST_TIMEOUT_S,
+        with_id=True,
+    )
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    limit = max(1, int(budget))
+    for place in places or []:
+        if not isinstance(place, Mapping):
+            continue
+        row = osm_stay_poi(place)
+        identity = stay_identity(row)
+        if identity is None or identity in seen:
+            continue
+        seen.add(identity)
+        rows.append(row)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def fetch_stay_pois(
+    lat: float,
+    lng: float,
+    radius_m: float = DEFAULT_RADIUS_M,
+    *,
+    budget: int = GROUP_BUDGET,
+    environ: Optional[Mapping[str, str]] = None,
+    session: Optional[Any] = None,
+    region: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """住宿检索的**数据源腿**:境内高德 ``place/around``,境外 Overpass(TASK-22)。
+
+    ``region=overseas`` → :func:`fetch_stay_pois_osm`(OSM 住宿腿,原生 OSM 身份);
+    其余(含 ``None``)→ 下面的高德现状实现,**逐字不变**。
+    阶梯 / 负缓存 / 估价都在编排层(:func:`load_stays`),这里只管"取回一批行"。
+
+    境内腿(高德 ``place/around``,现状实现**逐字不变**):``types=100000``
+    (住宿服务**大类**),由近及远翻页。
 
     * **只用大类码粗筛**(§1.4 实测锚点:``100104`` 三星级宾馆 / ``100105`` 经济型连锁酒店),
       具体 ``kind`` 在本地按返回的 ``type`` 中文串判(:func:`stay_kind`)—— 契约明令
@@ -774,6 +1023,10 @@ def fetch_stay_pois(
     * 无 key / 限流 / 响应异常一律抛 :class:`data_sources.DataSourceError`,
       由 :func:`search_stays_detailed` 兜成三档 reason(**绝不抛给调用方**)。
     """
+    if resolve_stay_region(region) == REGION_OVERSEAS:
+        return fetch_stay_pois_osm(
+            lat, lng, radius_m, budget=budget, environ=environ, session=session
+        )
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for page in range(1, stay_page_limit(budget) + 1):
@@ -845,20 +1098,43 @@ def stay_row(poi: Mapping[str, Any], origin_lat: float, origin_lng: float) -> di
     }
 
 
+def osm_stay_row(poi: Mapping[str, Any], origin_lat: float, origin_lng: float) -> dict[str, Any]:
+    """境外轨 fetch 行(:func:`osm_stay_poi` 的输出)→ 住宿行(补 ``distance_km``)。
+
+    与 :func:`stay_row`(高德腿)的唯一实质差别是**身份**:这里照抄原生
+    ``(osm_type, osm_id)``,不做 :func:`db.models.amap_osm_id` 的 crc32 ——
+    与 TASK-21 境外 ``Place`` 同口径;``kind`` 缺失时用 :func:`osm_stay_kind` 从 tags 兜。
+    """
+    tags = dict(poi.get("tags") or {})
+    kind = clean_text(_get(poi, "kind"), limit=KIND_LEN) or osm_stay_kind(tags)
+    return {
+        "osm_type": str(poi.get("osm_type") or "").strip().lower(),
+        "osm_id": poi.get("osm_id"),
+        "name": str(poi.get("name") or "").strip(),
+        "kind": kind.lower(),
+        "lat": poi.get("lat"),
+        "lng": poi.get("lng"),
+        "tags": tags,
+        "distance_km": distance_km(origin_lat, origin_lng, poi.get("lat"), poi.get("lng")),
+    }
+
+
 def search_stays(
     lat: float,
     lng: float,
     radius_m: int = DEFAULT_RADIUS_M,
     *,
     fetch_fn: Optional[StayFetchFn] = None,
+    region: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """检索起点半径内的住宿,按由近及远排序;**任何失败都返回空列表**(降级,不抛)。
 
-    ``fetch_fn`` 可注入(测试替身,签名 ``(lat, lng, radius_m) -> 归一化高德 POI 列表``);
-    缺省用 :func:`fetch_stay_pois`(高德 ``place/around`` + ``types=100000``)。
+    ``fetch_fn`` 可注入(测试替身,签名 ``(lat, lng, radius_m) -> 归一化 POI 列表``);
+    缺省用 :func:`fetch_stay_pois`(境内高德 ``place/around`` + ``types=100000``,
+    ``region=overseas`` 时 Overpass 的 OSM 住宿腿)。
     需要知道"为什么空"的调用方(编排层/负缓存)用 :func:`search_stays_detailed`。
     """
-    return search_stays_detailed(lat, lng, radius_m, fetch_fn=fetch_fn)[0]
+    return search_stays_detailed(lat, lng, radius_m, fetch_fn=fetch_fn, region=region)[0]
 
 
 def classify_failure(exc: BaseException) -> str:
@@ -884,25 +1160,35 @@ def search_stays_detailed(
     radius_m: int = DEFAULT_RADIUS_M,
     *,
     fetch_fn: Optional[StayFetchFn] = None,
+    region: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], Optional[str]]:
     """同 :func:`search_stays`,但额外报**为什么空**:返回 ``(rows, reason)``。
 
     ``reason`` 三档(TASK-6c):``None`` = 拿到结果;:data:`REASON_NO_DATA` = 检索成功但
     半径内真没有;:data:`REASON_DATASOURCE_ERROR` / :data:`REASON_TIMEOUT` = 检索失败
     (按 :func:`classify_failure` 分档)。仍然**绝不抛异常**。
+
+    ``region``(TASK-22)只决定**数据源腿与行归一**:``overseas`` → Overpass +
+    :func:`osm_stay_row`(原生 OSM 身份),其余 → 高德 + :func:`stay_row`(crc32 身份);
+    去重、降级、reason 三档口径两轨完全一致。``fetch_fn=`` 显式注入**优先于** region 分支
+    (既有单测口径不变),此时行归一仍按 region 选。
     """
     origin = coordinate_pair(lat, lng)
     if origin is None:
         return [], REASON_NO_DATA
     origin_lat, origin_lng = origin
-    fetch = fetch_fn if fetch_fn is not None else fetch_stay_pois
+    overseas = resolve_stay_region(region) == REGION_OVERSEAS
     try:
-        pois = fetch(origin_lat, origin_lng, radius_m)
+        if fetch_fn is not None:
+            pois = fetch_fn(origin_lat, origin_lng, radius_m)
+        else:
+            pois = fetch_stay_pois(origin_lat, origin_lng, radius_m, region=region)
     except DataSourceError as exc:
         return [], classify_failure(exc)
     except Exception as exc:  # noqa: BLE001 - 检索是增强项:参数非法/响应异常都当"没搜到"
         return [], classify_failure(exc)
 
+    build_row = osm_stay_row if overseas else stay_row
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, int]] = set()
     for poi in pois or []:
@@ -910,7 +1196,7 @@ def search_stays_detailed(
             # 脏行(注入的替身/上游解析异常)不能让整次检索抛出去:跳过即可,
             # 与 :func:`data_sources.amap.parse_poi` 丢弃非对象行的口径一致。
             continue
-        row = stay_row(poi, origin_lat, origin_lng)
+        row = build_row(poi, origin_lat, origin_lng)
         identity = stay_identity(row)
         if identity is None or identity in seen:
             continue
@@ -1921,6 +2207,7 @@ def load_stays(
     environ: Optional[Mapping[str, str]] = None,
     executor: Optional[Executor] = None,
     estimate: Optional[str] = None,
+    region: Optional[str] = None,
 ) -> StaySearchResult:
     """住宿检索的**主编排**(TASK-6c 口径),返回带判别信息的 :class:`StaySearchResult`。
 
@@ -1935,7 +2222,13 @@ def load_stays(
 
     ``refresh=True`` 跳过 1、2 两层缓存强制重查;``estimate`` 见 :func:`estimate_mode`;
     ``executor`` 可注入(测试/CLI 用 :data:`INLINE_EXECUTOR` 把后台回填变成同步)。
+
+    ``region``(TASK-22)只透传给检索腿(:func:`search_stays_detailed`)并决定抓到时
+    ``source`` 报 ``"amap"`` 还是 ``"osm"``;**正/负缓存、半径阶梯、估价三档全不分轨**
+    (:class:`StayQueryCache` 的键不含 region,同一坐标不会既是境内又是境外)。
     """
+    overseas = resolve_stay_region(region) == REGION_OVERSEAS
+    fetch_source = SOURCE_OSM if overseas else SOURCE_FETCH
     ladder = radius_ladder(radius_m)
     requested = None if radius_m is None else (ladder[0] if ladder else None)
     origin = coordinate_pair(lat, lng)
@@ -1968,7 +2261,9 @@ def load_stays(
                     from_cache=True,
                 )
 
-        rows, reason = search_stays_detailed(origin_lat, origin_lng, rung, fetch_fn=fetch_fn)
+        rows, reason = search_stays_detailed(
+            origin_lat, origin_lng, rung, fetch_fn=fetch_fn, region=region
+        )
         if reason in (REASON_DATASOURCE_ERROR, REASON_TIMEOUT):
             db_rows = select_stays(session, origin_lat, origin_lng, rung)
             nearest = (
@@ -1999,7 +2294,7 @@ def load_stays(
             session.commit()
             return _finish_rows(
                 session, db_rows, origin, rung,
-                source=SOURCE_FETCH, llm=llm, environ=environ, executor=executor,
+                source=fetch_source, llm=llm, environ=environ, executor=executor,
                 estimate=estimate, expanded=expanded, requested_radius_m=requested,
             )
 
@@ -2042,6 +2337,7 @@ def load_or_fetch_stays(
     environ: Optional[Mapping[str, str]] = None,
     executor: Optional[Executor] = None,
     estimate: Optional[str] = None,
+    region: Optional[str] = None,
 ) -> StayItems:
     """读库优先的住宿列表(**DB 即缓存**),每项带 ``distance_km``(haversine,2 位)。
 
@@ -2051,6 +2347,8 @@ def load_or_fetch_stays(
 
     ``radius_m=None``(调用方没给半径)走 :data:`STAY_RADIUS_LADDER_M` 阶梯;
     给了就只查那一档。起点非法或两边都拿不到数据 → 空列表(降级,不抛)。
+    ``region=overseas``(TASK-22)→ 检索腿换 Overpass 的 OSM 住宿行,其余口径见
+    :func:`load_stays`。
     """
     return StayItems.from_result(
         load_stays(
@@ -2064,6 +2362,7 @@ def load_or_fetch_stays(
             environ=environ,
             executor=executor,
             estimate=estimate,
+            region=region,
         )
     )
 

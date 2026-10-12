@@ -1001,11 +1001,18 @@
 
 ## [TASK-21] 境外双轨 P2:境外 POI 检索链(Overpass 复活,依赖 TASK-20)
 
-- 状态: pending
+- 状态: done
 - 目标: 新增 `data_sources/osm_overseas.py`(复活阶段1 Overpass 检索,四分类 SEARCH_GROUPS 口径从 git 历史 classify.py 考古);place_loader 按 region 分支(overseas → Overpass 环形/单圆 + 本地 haversine);入库身份 osm_type="osm_node/way/relation"、tags.source="OSM"、tags.coord_system="WGS-84";渐进配额口径(target_total/fetch_rounds)复用。
 - 涉及: backend/data_sources/osm_overseas.py(新)、backend/services/place_loader.py、classify.py、backend/test_osm_overseas.py(≥20 用例全 mock)
 - 验收: pytest 零回归+≥20 新增;境内链路(amap)零改动;二次查询读库零网络;真机冒烟一次境外城市(因特拉肯)冷抓。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-12 夜班,Codex 执行,commit `9892a52`,按 `docs/TASK-21-CONTRACT.md` 逐字落地)。**真机境外冷抓冒烟未验成——当夜 Overpass/Photon 网络面整体不可达(见备注),留白天主会话复验。**
+  - `data_sources/osm_overseas.py`(1093 行):`git show 2845eb1^:backend/data_sources/overpass.py` 完整恢复,仅改模块 docstring(境外轨定位),函数面零改动;`_common.py` DEFAULT_SOURCE_PROXY 加 `"overpass": PROXY_OFF`;`data_sources/__init__.py` 导出。
+  - `place_loader.py`(+219):`default_fetcher_osm`(low≤0 单圆 nearby_places_grouped / low>0 环形差集 nearby_places_ring,行形状=parse_places with_id,不含 typecode);`scale_search_groups` 加第二参(groups 给了对传入组缩放,公式与 FULL_SEARCH_BUDGET=540 不变);`to_place_items(region=overseas)` 走 classify_places OSM tag 归类 + place_identity 原生 (osm_type,osm_id) 不 crc32 + tags 加 coord_system=WGS-84(不写 source 键→place_source 派生「OSM」);`load_segment` 增 region 参(None→查 OriginCache 兜底不发网络;overseas→OSM 轨+水位 source="osm";fetcher= 显式注入优先);SegmentOutcome 增 region 字段;SOURCE_OSM/SOURCE_LABELS 常量。domestic 分支零改动。
+  - `app/api/places.py`(+17):list_places 增可选 region 参(裸 None+手工校验,非法值 400 中文「region 只支持 domestic 或 overseas」),响应**只加** region 键(override>OriginCache>domestic),既有键逐键零变化。
+  - index.html(+13/-2,契约 §1.4 最小改动):placesParams 在境外开关勾选时 `params.set("region","overseas")`、geocode URL 追加 regionQuery();状态栏 osm→「OSM 实时抓取(境外轨)」+境外 WGS-84 提示;地图层未动(切换属 TASK-23,过渡态 pin 偏移属预期)。
+  - 测试:`test_osm_overseas.py` 975 行 + test_frontend_routes.py 追加(含 TASK-20 时代「/api/places 不受开关影响」断言按 TASK-21 口径改写 1 处,Codex 已在 summary 中主动申报)。执行器复跑 pytest backend/ = **1512 passed**(1467 基线零回归 + 45 新增,136s),超契约 ≥20 要求;node --check 在 test_frontend_routes 内跑过。
+  - 真机冒烟(部分):uvicorn 已重启到 9892a52;`/api/geocode?city=Interlaken` → region=overseas 正确落缓存;`/api/places?origin=Interlaken&band=0_50&region=overseas` 冷抓 → **Overpass 三端点全挂**(直连+代理均 TCP 失败,60s 后复测仍挂;Photon 同期也超时)——返回中文降级报错、**库内无残缺水位/无 Interlaken 行**(失败语义正确);境内对照 `/api/places?origin=上海&band=0_50` → source=db region=domestic 秒回零影响。契约 §3 的境外冷抓成功样例待网络恢复后由主会话复验(代码路径已由 45 个 mock 用例全覆盖)。
+  - **Codex 256K 统计**:单次调用 **44.7min**(超 40min 止损线 ~5min——kill 前已进入最终测试+commit 阶段,产物完整故按惯例收口未重跑),function_calls **123**,首轮写码启动后 **1.74min**(R8 12min 线内,历史最快),tokens 用量 **315,298**(total 12.0M 含 cache 重放),零 compact。体量:恢复 1093 行历史文件+975 行测试是耗时主因。
 
 ---
 

@@ -1,8 +1,8 @@
 """TASK-2b 单测:前端路线面板(``app/static/index.html``)的轻量断言。
 
-页面是**原生 JS 单文件**(TASK-9d 起地图走高德 JS API 2.0,脚本运行时按
-``/api/map-config`` 下发的 key 动态注入,没有构建步骤),所以这里不跑浏览器,
-只做三类**离线**断言:
+页面是**原生 JS 单文件**(TASK-9d 起境内地图走高德 JS API 2.0,脚本运行时按
+``/api/map-config`` 下发的 key 动态注入;TASK-23 起境外另走 Leaflet 1.9.4 + OSM 三线瓦片,
+CDN 也是运行时懒注入,没有构建步骤),所以这里不跑浏览器,只做三类**离线**断言:
 
 1. **DOM / JS 面**:路线面板的容器与控件 id、卡片渲染与画线相关函数名都在;
    跳转链接是 ``<a target="_blank" rel="noopener">``;没有内联 ``onclick=``、
@@ -12,8 +12,9 @@
    逐个对回响应里的真实键 —— 后端改字段名而前端没跟上(或反过来)时,这里当场红。
    同时校验前端抽稀上限不比后端 ``GEOMETRY_MAX_POINTS`` 松。
 3. **零回退**:阶段1a/1b/1c 的分类 pin、popup 简介、band 切换、城市搜索、
-   「📍 我的位置」「补简介」相关 id 与函数一个不少;地图层已是高德
-   (``AMap.Map``/``Circle``/``Marker``/``InfoWindow``/``Polyline``),Leaflet 已退役,
+   「📍 我的位置」「补简介」相关 id 与函数一个不少;境内地图层仍是高德
+   (``AMap.Map``/``Circle``/``Marker``/``InfoWindow``/``Polyline``,TASK-23 一个字未删),
+   Leaflet 只在 TASK-23 的**境外轨**那一段里出现(境内轨与页面其余部分都不碰它),
    且**页面里不出现 32 位 key 样态字符串**(key 只由 ``/api/map-config`` 运行时下发)。
 
 若环境里装了 ``node``,再加一条 ``node --check`` 对内联脚本做**语法**校验
@@ -1382,12 +1383,24 @@ def boot_section(html: str) -> str:
     return html[html.index("(async function boot(){"):]
 
 
-def test_leaflet_is_fully_retired(html: str) -> None:
-    for token in ("leaflet@", "unpkg.com", "tile.openstreetmap.org", "L.map(", "L.tileLayer(",
-                  "L.marker(", "L.circle(", "L.circleMarker(", "L.polyline(", "L.divIcon(",
-                  "L.layerGroup(", "bindPopup(", "bindTooltip(", "fitBounds(", "window.L",
-                  "clearLayers(", ".addTo(map)"):
-        assert token not in html, f"Leaflet 应已退役,页面里还留着 {token}"
+def test_leaflet_is_scoped_to_the_overseas_track(html: str) -> None:
+    """TASK-9d 让 Leaflet 全面退役;TASK-23 把它请回来**只**服务境外轨(见文末 TASK-23 段)。
+
+    这里守住"境内轨零变化"的那半边:Leaflet 的调用面只许出现在 TASK-23 那一段里,
+    高德轨的代码、页面 DOM 与其余 JS 一个字都不碰它;CDN 也不落成静态标签(运行时懒注入)。
+    """
+    section = leaflet_section(html)
+    start = html.index(TASK23_SECTION_START)
+    outside = html[:start] + html[start + len(section):]
+    for token in LEAFLET_API_TOKENS:
+        assert token in section, f"境外轨缺少 Leaflet 调用面 {token}"
+        assert token not in outside, f"{token} 只许出现在 TASK-23 的境外轨那一段里"
+    # 境内轨仍是**一轨高德**:地图初始化只有 TASK-9d 那一处,静态标签一个不引
+    assert html.count("new AMap.Map(") == 1
+    assert "<script src=" not in html and "<link" not in html, "Leaflet 只能运行时懒注入 CDN"
+    assert inline_script(html), "页面仍只有一段内联脚本"
+    # OSM 官方主站(境内 DNS 污染不可用)与 wikimedia(超时)一个都不许当瓦片源
+    assert "tile.openstreetmap.org" not in html and "maps.wikimedia.org" not in html
 
 
 def test_amap_map_config_is_fetched_before_script(html: str) -> None:
@@ -1443,7 +1456,9 @@ def test_amap_pin_click_is_bound_on_marker(html: str) -> None:
     assert 'marker.on("click",()=>openPinPopup(place,index))' in pin, \
         "§1.7:自绘 content 的 pin,点击必须用 marker.on(\"click\") 绑在 Marker 上"
     assert "onclick" not in pin, "不要在自绘 div 上挂 onclick(高德不触发)"
-    assert "dispatchEvent" not in html, "合成事件也不触发,别用它兜底"
+    # TASK-23 起境外轨切换引擎要 window.dispatchEvent(new Event("resize")) 让 Leaflet
+    # 重算容器尺寸(合法用途);这条断言只管「pin 点击不许用合成事件兜底」,收窄到 pin 段。
+    assert "dispatchEvent" not in pin, "合成事件也不触发,别用它兜底"
     assert "content:pinHtml(meta,reco)" in pin and "categoryMeta(place.category)" in pin, \
         "pin 仍是分类色 + emoji 自绘 content"
     assert 'class="pin' in html and 'reco?" reco":""' in html, "沿用原来的 .pin / .pin.reco CSS"
@@ -2974,13 +2989,14 @@ def test_region_switch_consumes_only_the_documented_response_key(
 
 # --------------------------------------------------------------------------- #
 # TASK-21:境外轨(P2)—— /api/places 透传境外开关 + 状态栏来源/坐标口径文案
-#   本条只做「传参 + 文案」:地图层仍是**一轨高德**(双轨瓦片是 TASK-23),所以境外 pin 会
-#   按 GCJ-02 画 WGS-84 坐标(偏移属预期过渡态,状态栏必须说清楚)。
+#   本条只做「传参 + 文案」;地图层的双轨切换后来由 TASK-23 落地(见文末那一段),所以这里
+#   的境外提示文案已按 TASK-23 契约 §1.1 换成双轨口径(过渡提示「地图切换见后续版本」移除)。
 #   后端半边见 backend/test_osm_overseas.py。
 # --------------------------------------------------------------------------- #
 
-# 状态栏来源文案(TASK-21 新增 osm 键)与境外坐标提示(契约 §1.4 逐字)
-OVERSEAS_COORD_HINT = "境外数据(WGS-84),地图切换见后续版本"
+# 状态栏来源文案(TASK-21 新增 osm 键)与境外口径提示(TASK-23 §1.1 逐字:双轨落地后的文案)
+OVERSEAS_COORD_HINT = "境外模式 · OSM/Leaflet · WGS-84"
+OVERSEAS_TRANSITION_HINT = "地图切换见后续版本"     # TASK-21 的过渡文案,TASK-23 起必须消失
 
 
 def places_params_section(html: str) -> str:
@@ -3028,22 +3044,27 @@ def test_status_bar_source_label_covers_the_osm_track(html: str) -> None:
 
 
 def test_overseas_coord_hint_lands_in_status_bar(html: str) -> None:
-    """region=overseas 时状态栏要说明坐标系与地图过渡态(契约 §1.4 逐字文案)。"""
+    """region=overseas 时状态栏要说明双轨口径(TASK-23 §1.1 逐字文案),过渡提示已移除。"""
     assert js_string(html, "OVERSEAS_COORD_HINT") == OVERSEAS_COORD_HINT
     status = places_status_section(html)
     assert '(data.region==="overseas")?(" · "+OVERSEAS_COORD_HINT):""' in status, \
         "只在境外轨追加提示,境内状态栏逐字不变"
     assert "+overseas" in status, "提示挂在状态栏末尾(不另起一行)"
-    assert "WGS-84" in OVERSEAS_COORD_HINT and "后续版本" in OVERSEAS_COORD_HINT
+    # TASK-23:境外轨已经真切到 Leaflet,所以文案要说清"哪个引擎 + 哪个坐标系"
+    for token in ("境外模式", "OSM/Leaflet", "WGS-84"):
+        assert token in OVERSEAS_COORD_HINT, f"境外状态栏文案缺 {token}"
+    assert OVERSEAS_TRANSITION_HINT not in html, "TASK-21 的过渡提示必须随双轨落地一起移除"
 
 
-def test_overseas_track_does_not_touch_the_map_layer(html: str) -> None:
-    """本条**不动地图层**(双轨瓦片是 TASK-23):仍是一轨高德,Leaflet 保持退役。"""
-    assert html.count("new AMap.Map(") == 1, "地图初始化仍只有 TASK-9d 那一处"
-    for token in ("tile.openstreetmap.org", "L.tileLayer(", "leaflet@", "osm_overseas"):
-        assert token not in html, f"{token} 不该出现在前端(地图双轨是 TASK-23)"
+def test_places_track_is_map_engine_agnostic(html: str) -> None:
+    """TASK-21 的「传参 + 文案」那一段与地图引擎无关:双轨落地(TASK-23)后它仍不建任何地图对象。"""
+    assert html.count("new AMap.Map(") == 1, "高德地图初始化仍只有 TASK-9d 那一处"
+    assert html.count('L.map("mapLeaflet"') == 1, "Leaflet 地图初始化也只有境外轨那一处"
+    assert "osm_overseas" not in html, "后端模块名不该出现在前端"
     section = places_status_section(html) + places_params_section(html)
-    assert "new AMap." not in section, "TASK-21 只改传参与文案,不碰地图对象"
+    assert "new AMap." not in section and "L.tileLayer(" not in section, \
+        "分段检索/状态栏只改传参与文案:两轨的地图对象都不碰"
+    assert "state.mapEngine" not in section, "引擎切换只在 applyOrigin 与「境外模式」开关里发生"
 
 
 def test_places_status_reads_only_documented_response_keys(html: str, paging) -> None:
@@ -3056,3 +3077,388 @@ def test_places_status_reads_only_documented_response_keys(html: str, paging) ->
     assert {"region", "source"} <= used, "来源文案与境外提示都要消费后端给的 region/source"
     labels = js_map(html, "PLACES_SOURCE_LABEL")
     assert f'{place_loader.SOURCE_OSM}:' in labels, "境外轨的 source=osm 在文案表里有对应键"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-23:前端双轨地图(境外轨 = Leaflet 1.9.4 + OSM 三线瓦片;境内轨 = 高德零删改)
+#   契约 §2 的十组静态断言 + node --check。全部离线:CDN 只在浏览器里才会被注入,
+#   瓦片/库都不下载。交互面(瓦片真加载、pin popup、路线画线、切回境内)由执行器
+#   browser QA 覆盖;这里守的是"结构、口径、零回归"。
+# --------------------------------------------------------------------------- #
+
+TASK23_SECTION_START = "// 境外轨地图(TASK-23"
+LEAFLET_VERSION = "1.9.4"
+LEAFLET_CDN = "https://unpkg.com/leaflet@"
+# SRI 摘要照阶段1 考古版本(a352e1f^ 的静态标签)逐字抄;换 CDN 版本必须同时换这两串
+LEAFLET_CSS_SRI = "sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+LEAFLET_JS_SRI = "sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+LEAFLET_LOAD_FAIL_HINT = "地图组件加载失败,请检查网络"
+LEAFLET_STATUS_HINT = "境外模式 · OSM/Leaflet · WGS-84"
+# 瓦片三线(2026-10-10/11 境内出口实测:osm.de 0.78s / osm.fr 0.75s / CARTO 2.0s 全通;
+# OSM 官方主站 DNS 污染、wikimedia 超时 → 都不在候选里)
+TILE_PRIMARY = "https://{s}.tile.openstreetmap.de/{z}/{x}/{y}.png"
+TILE_BACKUP = "https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png"
+TILE_FALLBACK = "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+TILE_ATTRIBUTION = "OpenStreetMap</a> contributors"     # CC-BY-SA 义务:attribution 必带
+# Leaflet 的调用面:只许出现在境外轨那一段(境内轨与页面其余部分一个字都不碰)
+LEAFLET_API_TOKENS = ("leaflet@", "unpkg.com", "window.L", "L.map(", "L.tileLayer(", "L.circle(",
+                      "L.circleMarker(", "L.marker(", "L.divIcon(", "L.popup(", "L.polyline(",
+                      "L.layerGroup(", "L.featureGroup(", "bindTooltip(", "fitBounds(",
+                      "clearLayers(")
+# 境外轨必须有的函数:懒加载 / 三线瓦片 / 环圈·pin·popup·画线 / fitView / 引擎切换
+LEAFLET_FUNCTIONS = ["loadLeafletOnce", "addTileLine", "onTileError", "switchTileLine",
+                     "initLeafletMap", "leafletDrawRings", "leafletFitRings", "leafletDash",
+                     "leafletRouteTooltip", "leafletClearRouteLine", "leafletDrawRouteLine",
+                     "leafletFitRoute", "leafletPinIcon", "leafletMakePin", "leafletAddPin",
+                     "leafletClosePinPopup", "leafletOpenPinPopup", "leafletDrawPins",
+                     "leafletRenderPinsByScope", "leafletDrawMorePins", "showMapContainer",
+                     "redrawMapTrack", "setMapEngine", "syncMapEngine"]
+# 境内轨(高德)一个都不许少的调用面(TASK-23 零删改)
+AMAP_TOKENS = ('new AMap.Map("map"', "new AMap.Circle(", "new AMap.CircleMarker(",
+               "new AMap.Marker(", "new AMap.InfoWindow(", "new AMap.Polyline(",
+               "new AMap.Text(", "new AMap.Pixel(", "map.setFitView(", "infoWindow.setContent(",
+               "marker.setLabel(", "loadAMapScript(", "showMapFallback(")
+# 分轨跳转点:既有渲染入口只在**函数开头**加一行,境内轨那几行原样跟在后面
+ENGINE_SWITCH_POINTS = ["drawRings", "fitRings", "drawRouteLine", "addPin", "openPinPopup",
+                        "drawPins", "drawMorePins", "renderPinsByScope"]
+# 与地图引擎无关的函数(收藏 / 详情弹窗 / 外链 / 列表行 / 住宿卡片):不许被双轨波及
+ENGINE_AGNOSTIC_FUNCTIONS = ["bookLinksForStay", "bookLinksForRoute", "placeRowHtml",
+                             "stayCardHtml", "popupHtml", "identityHtml", "renderFavItems",
+                             "openPlaceModal", "pinHtml", "categoryMeta"]
+
+
+def leaflet_section(html: str) -> str:
+    """切出「境外轨地图(TASK-23)」那一段 JS(既有事件绑定之后、TASK-20 开关段之前)。"""
+    start = html.index(TASK23_SECTION_START)
+    return html[start:html.index(REGION_SECTION_START, start)]
+
+
+def leaflet_fn(html: str, name: str, end: str) -> str:
+    """在境外轨那一段里切出一个函数体(``async function`` 也能按名字切到)。"""
+    section = leaflet_section(html)
+    return section[section.index(f"function {name}("):section.index(end)]
+
+
+def tile_lines(html: str) -> str:
+    """切出瓦片三线常量 ``LEAFLET_TILE_LINES`` 的数组体。"""
+    match = re.search(r"const LEAFLET_TILE_LINES=\[(.*?)\];", html, re.S)
+    assert match, "index.html 里找不到瓦片三线常量 LEAFLET_TILE_LINES"
+    return match.group(1)
+
+
+def js_fn(html: str, name: str) -> str:
+    """按「函数头 → 下一个顶层 function」切出一个函数的完整体(引擎无关性断言用)。"""
+    start = html.index(f"function {name}(")
+    return html[start:html.index("\nfunction ", start + 1)]
+
+
+# --- ① Leaflet 懒加载:CDN URL + SRI + 只有境外分支会触发 ------------------------- #
+
+
+def test_task23_leaflet_is_lazy_loaded_from_cdn_with_sri(html: str) -> None:
+    section = leaflet_section(html)
+    assert f'const LEAFLET_VERSION="{LEAFLET_VERSION}"' in html, "锁 1.9.4(与阶段1 考古版本同版)"
+    assert LEAFLET_CDN in section, "走 unpkg CDN(照考古版本)"
+    assert '"/dist/leaflet.js"' in section and '"/dist/leaflet.css"' in section, "库与样式都要注入"
+    assert js_string(html, "LEAFLET_CSS_SRI") == LEAFLET_CSS_SRI
+    assert js_string(html, "LEAFLET_JS_SRI") == LEAFLET_JS_SRI
+    loader = leaflet_fn(html, "loadLeafletOnce", "// 铺一层瓦片")
+    assert 'document.createElement("link")' in loader and 'document.createElement("script")' in loader, \
+        "CDN 只能**运行时注入**(页面里不许出现静态 script/link 标签)"
+    assert "style.integrity=LEAFLET_CSS_SRI" in loader and "script.integrity=LEAFLET_JS_SRI" in loader, \
+        "两个标签都要带 SRI integrity"
+    assert 'script.crossOrigin="anonymous"' in loader, "带 SRI 就得 crossorigin,否则浏览器不校验"
+    assert "script.onerror" in loader and "LEAFLET_LOAD_TIMEOUT_MS" in loader, "失败/超时都要能降级"
+    assert "document.head.appendChild(script)" in loader
+    assert "<script src=" not in html and "<link" not in html, "页面源码里仍没有静态第三方标签"
+    assert inline_script(html), "页面仍只有一段内联脚本"
+
+
+def test_task23_lazy_load_is_guarded_and_only_triggered_by_overseas(html: str) -> None:
+    section = leaflet_section(html)
+    loader = leaflet_fn(html, "loadLeafletOnce", "// 铺一层瓦片")
+    assert "if(window.L) return Promise.resolve(true);" in loader, "库已在页面上就不重复注入"
+    assert "if(leafletLoading) return leafletLoading;" in loader, "in-flight 复用:反复切换只加载一次"
+    assert "leafletLoading=null" in loader, "失败后清掉 in-flight,下次进境外还能重试"
+    assert section.count("loadLeafletOnce(") == 2, \
+        "只有 setMapEngine 的境外分支会触发懒加载(一处定义 + 一处调用)"
+    switch = leaflet_fn(html, "setMapEngine", "// 该用哪一轨")
+    assert switch.index("loadLeafletOnce()") > switch.index('if(next==="leaflet")'), \
+        "首次进境外才加载:境内轨一个字节都不下载"
+    assert "AMAP_JS_URL" not in section and "loadAMapScript" not in section, "两轨的加载器互不掺和"
+    assert 'const AMAP_JS_URL="https://webapi.amap.com/maps"' in html, "高德轨的加载器原样保留"
+
+
+# --- ② 瓦片三线 + attribution + 错误率切换 --------------------------------------- #
+
+
+def test_task23_tile_three_lines_in_priority_order(html: str) -> None:
+    lines = tile_lines(html)
+    for url in (TILE_PRIMARY, TILE_BACKUP, TILE_FALLBACK):
+        assert url in lines, f"瓦片三线缺 {url}"
+    assert lines.index(TILE_PRIMARY) < lines.index(TILE_BACKUP) < lines.index(TILE_FALLBACK), \
+        "顺序 = 主(osm.de)→ 备(osm.fr)→ 兜底(CARTO)"
+    assert lines.count("url:") == 3, "就三线,不多不少"
+    assert "{s}.basemaps" not in lines and "a.basemaps" not in lines, \
+        "CARTO 兜底线不做子域展开(实测只有 basemaps.cartocdn.com 通)"
+    assert "subdomains:null" in lines, "兜底线显式声明不走 {s}"
+    assert js_constant(html, "LEAFLET_MAX_ZOOM") == 18
+    assert "maxZoom:LEAFLET_MAX_ZOOM" in leaflet_section(html)
+    # OSM 官方主站(境内 DNS 污染)与 wikimedia(超时)都不许当瓦片源
+    assert "tile.openstreetmap.org" not in html and "maps.wikimedia.org" not in html
+
+
+def test_task23_attribution_and_tile_error_failover(html: str) -> None:
+    section = leaflet_section(html)
+    assert "&copy;" in section and TILE_ATTRIBUTION in section, \
+        "CC-BY-SA 义务:attribution 必带 © OpenStreetMap contributors"
+    assert "attribution:LEAFLET_ATTRIBUTION" in section, "三线共用同一条 attribution"
+    assert 'layer.on("tileerror",onTileError)' in section, "瓦片错误率监听(切线的触发点)"
+    assert js_constant(html, "TILE_ERROR_THRESHOLD") >= 2, "阈值:偶发单块失败不该立刻换线"
+    assert "tileErrorCount<TILE_ERROR_THRESHOLD" in section
+    failover = leaflet_fn(html, "switchTileLine", "// 建 Leaflet 地图")
+    assert "lmap.removeLayer(tileLayer)" in failover and "addTileLine(tileLineIndex)" in failover, \
+        "换线 = 摘掉旧层再铺下一条"
+    assert "LEAFLET_TILE_LINES.length" in failover, "三线全废要收口(不越界、不抛错)"
+    assert failover.count("showNote(") == 2, "换线与三线全废都要给可见提示,绝不静默"
+    init = leaflet_fn(html, "initLeafletMap", "// 环圈:外圆实线")
+    assert 'L.map("mapLeaflet"' in init, "Leaflet 挂在自己的容器上(不动 #map)"
+    for token in ("lrings=L.layerGroup()", "lpins=L.layerGroup()", "lrouteLayer=L.layerGroup()"):
+        assert token in init, f"境外轨的三个图层缺 {token}"
+    assert "tileLineIndex=0" in init, "重建时从主线重新开始"
+
+
+# --- ③ state.mapEngine 双轨切换:region=overseas → leaflet / domestic → amap ------- #
+
+
+def test_task23_state_map_engine_defaults_to_amap(html: str) -> None:
+    state_row = html[html.index("const state={"):html.index("// 高德覆盖物句柄")]
+    assert 'mapEngine:"amap"' in state_row, "启动缺省境内高德轨(现状零变化)"
+    assert 'mapEngine:"leaflet"' not in html, "境外轨只能由 setMapEngine 在运行时置位"
+
+
+def test_task23_engine_switch_follows_region_and_override(html: str) -> None:
+    section = leaflet_section(html)
+    sync = section[section.index("function syncMapEngine("):]
+    assert 'const want=overseas?"leaflet":"amap";' in sync, \
+        "region=overseas(或勾了「境外模式」)→ leaflet,其余 → amap"
+    assert '"overseas"' in sync and "regionOverride" in sync, "两个触发源都认(契约 §1.1)"
+    assert "if(want===state.mapEngine" in sync, "已是目标轨且就绪 → 什么都不做(不重画、不闪屏)"
+    switch = leaflet_fn(html, "setMapEngine", "// 该用哪一轨")
+    assert 'state.mapEngine="leaflet";' in switch and 'state.mapEngine="amap";' in switch
+    assert switch.count("showMapContainer(") >= 3, "成功 / 失败 / 切回都要把两个容器摆正"
+    assert "redrawMapTrack()" in switch, "切轨后按当前 state 重画一遍(不重新拉接口)"
+    redraw = leaflet_fn(html, "redrawMapTrack", "// 引擎切换的唯一写入口")
+    assert "drawRings();" in redraw and "fitRings();" in redraw and "renderPinsByScope();" in redraw, \
+        "重画走的是既有入口(由它们自己分轨),不另写一套流程"
+    # 触发点①:起点落地(/api/geocode 与 /api/geocode/reverse 都会带 region)
+    origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
+    assert "syncMapEngine(regionSeen).catch(()=>{});" in origin, "起点落地即按 region 切轨"
+    assert "data.region" in origin, "只读后端真会给的 region 键"
+    # 触发点②:「境外模式」开关(TASK-20 那个 checkbox)
+    assert 'syncMapEngine(regionOverride?"overseas":regionSeen)' in region_section(html), \
+        "勾/取消开关也立刻切轨(不用等重搜)"
+
+
+def test_task23_map_containers_are_mutually_exclusive(html: str) -> None:
+    body = html[:html.index("<script>")]
+    assert '<div id="map"></div>' in body and '<div id="mapLeaflet"></div>' in body, \
+        "两轨各有容器(复用同一块地图区,不新占版面)"
+    assert body.index('<div id="map">') < body.index('<div id="mapLeaflet">') \
+        < body.index('<aside id="routePanel"'), "境外容器挂在地图区里、路线面板之前"
+    assert "#mapLeaflet{display:none" in html, "境外容器缺省隐藏 → 启动就是高德轨"
+    assert "62vh" in html[html.index("#mapLeaflet{"):html.index("#mapLeaflet{") + 240], \
+        "两轨容器同尺寸(切轨不跳版)"
+    show = leaflet_fn(html, "showMapContainer", "// 切轨后按当前 state 重画一遍")
+    assert 'amapBox.style.display=leaflet?"none":"block"' in show
+    assert 'leafletBox.style.display=leaflet?"block":"none"' in show, "同一时刻只渲染一个引擎"
+    assert 'fallback.style.display=(leaflet||map)?"none":"block"' in show, \
+        "#mapFallback 是高德轨专属降级层:切回境内且高德没建起来才重新盖上"
+    switch = leaflet_fn(html, "setMapEngine", "// 该用哪一轨")
+    assert "initLeafletMap();" in switch and "invalidateSize()" in switch, \
+        "容器先可见再建图,建完 invalidateSize(否则量不到宽高)"
+    assert 'typeof map.resize==="function"' in switch and 'new AMap.Map(' not in switch, \
+        "切回境内**不重建**高德实例(只 resize + 重画)→ TASK-9d 代码零改动"
+    assert 'state.mapEngine==="leaflet"' in html[html.index("function setStatus("):
+                                                html.index("function showErr(")], \
+        "境外轨不把「未配高德 key」的降级前缀挂到状态栏上(那条说的是高德轨)"
+
+
+# --- ④ 渲染双轨:L.circle / L.marker / L.popup / L.polyline / fitBounds ------------ #
+
+
+def test_task23_leaflet_render_surface(html: str) -> None:
+    section = leaflet_section(html)
+    for name in LEAFLET_FUNCTIONS:
+        assert re.search(rf"function\s+{re.escape(name)}\s*\(", section), f"境外轨缺少函数 {name}"
+    rings = leaflet_fn(html, "leafletDrawRings", "// fitView:L.featureGroup")
+    assert rings.count("L.circle(") == 2, "环圈 = 外圆(上限)+ 内圆(下限)"
+    assert 'dashArray:"6 6"' in rings and "fillOpacity:.06" in rings, "外实内虚 + 同样的填充口径"
+    assert "RING_COLOR" in rings and "band.high*1000" in rings and "band.low*1000" in rings, \
+        "半径(米)与颜色口径与高德轨一致"
+    assert "L.circleMarker(at,{radius:6" in rings, "起点圆心照旧"
+    assert "bindTooltip(" in rings, "环圈 hover 文案(等价高德轨的 AMap.Text 浮层)"
+    fit = leaflet_fn(html, "leafletFitRings", "// 线型:ROUTE_LINE_STYLE")
+    assert "L.featureGroup([louterRing]).getBounds()" in fit and "lmap.fitBounds(" in fit, \
+        "fitView = featureGroup.getBounds() → fitBounds"
+    assert "padding:[24,24]" in fit, "留白与高德 setFitView 的 RING_FIT_AVOID 同口径"
+    route_fit = leaflet_fn(html, "leafletFitRoute", "// pin:L.marker")
+    assert "L.featureGroup([lrouteLine]).getBounds()" in route_fit
+    assert "maxZoom:ROUTE_FIT_MAX_ZOOM" in route_fit, "画线 fit 的 zoom 上限沿用既有常量"
+
+
+def test_task23_pin_popup_route_reuse_engine_agnostic_helpers(html: str) -> None:
+    section = leaflet_section(html)
+    icon = leaflet_fn(html, "leafletPinIcon", "function leafletMakePin")
+    assert "L.divIcon(" in icon and "pinHtml(meta,reco)" in icon, "divIcon 自绘**复用**既有 pinHtml()"
+    assert "iconAnchor:[size/2,size]" in icon, "针尖对准坐标(与高德轨的 offset 同口径)"
+    assert "size=reco?34:26" in icon, "推荐 pin 34 / 普通 pin 26(与高德轨一致)"
+    pin = leaflet_fn(html, "leafletMakePin", "function leafletAddPin")
+    assert "L.marker([num(place.lat),num(place.lng)]" in pin, "Leaflet 是 [lat,lng](与高德相反)"
+    assert "categoryMeta(place.category)" in pin, "分类色/emoji 仍走 categoryMeta()"
+    assert 'marker.on("click",()=>leafletOpenPinPopup(place,index))' in pin
+    assert 'marker.bindTooltip("★ "' in pin and "fmtKm(place.distance_km)" in pin, \
+        "推荐 pin 的「★ 名称 · 距离」标签照旧"
+    popup = leaflet_fn(html, "leafletOpenPinPopup", "function leafletDrawPins")
+    assert "L.popup(" in popup and ".setContent(popupHtml(place,index))" in popup, \
+        "L.popup 承载**现有 popupHtml()**(按钮走 document 委托 → 照常生效)"
+    assert "openRoutePanel(place)" in popup, "点 pin 一样自动展开路线面板"
+    for token in ("js-place-fav", "js-routes", "js-detail-modal", "js-place-detail"):
+        assert token in html, f"popup 里的入口按钮 {token} 仍在(两轨共用同一份 HTML)"
+    line = leaflet_fn(html, "leafletDrawRouteLine", "function leafletFitRoute")
+    assert "L.polyline(points," in line
+    assert "thinPoints(route.geometry,ROUTE_MAX_POINTS)" in line, "抽稀口径与高德轨共用"
+    assert "arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW)" in line, "飞机弧线沿用 arcPoints"
+    assert "ROUTE_LINE_STYLE[route.mode]" in line and "leafletDash(style.dashArray)" in line, \
+        "驾车实线 / 铁路·飞机虚线(dashArray 数组 → Leaflet 字符串)"
+    assert "leafletClearRouteLine();" in line, "先清后画 → 同一时刻只有一条线"
+    assert "高德真实折线" not in section and "OSRM 真实折线" in section, \
+        "境外驾车腿走 OSRM(TASK-22):画线提示不许写「高德真实折线」"
+    scope = leaflet_fn(html, "leafletRenderPinsByScope", "// 「加载更多」只给")
+    assert 'if(state.pinScope==="all")' in scope and "recoRows()" in scope, \
+        "「地图显示范围」两档在境外轨同样生效"
+    assert "setListMsg(emptyPinHint(),\"warn\")" in scope, "没有可画的推荐点时给同一套说明"
+
+
+# --- ⑤ 不新增任何前端 key / 不引 Leaflet 之外的库 -------------------------------- #
+
+
+def test_task23_adds_no_frontend_key_or_extra_dependency(html: str) -> None:
+    section = leaflet_section(html)
+    assert not re.search(r"[a-f0-9]{32}", section), "境外轨不得出现 32 位 key 样态字符串"
+    assert not re.search(r"[a-f0-9]{32}", html), "整页仍然一个 key 样态字符串都没有"
+    assert AMAP_KEY_SAMPLE not in html, "key 只由 /api/map-config 运行时下发"
+    for token in ("amap_js_key", "amap_security_js_code", ENV_JS_KEY, ENV_SECURITY_CODE,
+                  "/api/map-config", "securityJsCode"):
+        assert token not in section, f"境外轨不碰地图 key({token})"
+    assert "localStorage" not in section and "sessionStorage" not in section, \
+        "CDN 地址与 SRI 都是写死的常量,一个字节都不落本地"
+    hosts = set(re.findall(r"https://([A-Za-z0-9.\-]+)/", section))
+    assert hosts <= {"unpkg.com", "basemaps.cartocdn.com", "www.openstreetmap.org"}, \
+        f"只许出现 Leaflet CDN + CARTO 兜底瓦片 + OSM 版权页:{sorted(hosts)}"
+    assert "{s}.tile.openstreetmap.de" in section and "{s}.tile.openstreetmap.fr" in section, \
+        "主/备瓦片走 {s} 子域展开(这两家实测支持 a/b/c)"
+
+
+# --- ⑥ 坐标口径:境外轨 WGS-84 直用,不做任何坐标系转换 --------------------------- #
+
+
+def test_task23_overseas_track_does_no_coord_conversion(html: str) -> None:
+    section = leaflet_section(html)
+    assert "lngLat(" not in section, "高德轨的 [lng,lat] 翻序 helper 不许出现在境外轨"
+    assert not re.search(r"\w*gcj\w*\s*\(", section, re.I), "境外轨不调用任何 GCJ-02 转换函数"
+    assert "AMap." not in section and "new AMap." not in section, "境外轨一个高德对象都不建"
+    assert "path:points.map" not in section, "交给 AMap.Polyline 前的那次翻序不属于境外轨"
+    assert section.count("[num(place.lat),num(place.lng)]") >= 2, "pin 与 popup 都是 [lat,lng] 直用"
+    assert "[num(state.origin.lat),num(state.origin.lng)]" in section, "环圈圆心同样 [lat,lng] 直用"
+    assert "WGS-84" in section and "禁止任何坐标系转换" in section, "硬约束要写在代码注释里"
+
+
+# --- ⑦ 状态栏文案 + 加载失败提示 ------------------------------------------------- #
+
+
+def test_task23_status_bar_wording_and_load_failure_hint(html: str) -> None:
+    assert js_string(html, "OVERSEAS_COORD_HINT") == LEAFLET_STATUS_HINT, \
+        "契约 §1.1 逐字:region=overseas 时状态栏显示「境外模式 · OSM/Leaflet · WGS-84」"
+    assert js_string(html, "LEAFLET_LOAD_FAIL_HINT") == LEAFLET_LOAD_FAIL_HINT
+    assert OVERSEAS_TRANSITION_HINT not in html, "TASK-21 的过渡提示随双轨落地一起下线"
+    switch = leaflet_fn(html, "setMapEngine", "// 该用哪一轨")
+    assert "showNote(LEAFLET_LOAD_FAIL_HINT+" in switch, "加载失败给可见提示(不静默)"
+    assert "setStatus(LEAFLET_LOAD_FAIL_HINT)" in switch, "同一句进状态栏"
+    assert switch.index('state.mapEngine="amap";') > switch.index("if(!ok){"), \
+        "CDN 不可达 → 回落高德轨"
+    assert "照常可用" in switch, "回落时要说清列表/收藏/路线/住宿不受影响"
+    assert "三线底图瓦片都加载不出来" in html, "三线全废也要有收口文案"
+    assert js_string(html, "LEAFLET_LOAD_FAIL_HINT") in html, "提示文案写死在页面里(不靠接口下发)"
+
+
+# --- ⑧ 高德轨零删改(境内现状零变化是硬验收) ------------------------------------ #
+
+
+def test_task23_amap_track_is_untouched(html: str) -> None:
+    for token in AMAP_TOKENS:
+        assert token in html, f"境内轨(高德)少了 {token}"
+    amap = amap_section(html)
+    assert "window._AMapSecurityConfig={securityJsCode:code}" in amap, "安全密钥仍先于脚本写好"
+    rings = html[html.index("function drawRings("):html.index("// 高德没有 fitBounds")]
+    assert rings.count("new AMap.Circle(") == 2 and 'strokeStyle:"solid"' in rings \
+        and 'strokeStyle:"dashed"' in rings, "高德环圈外实内虚原样保留"
+    pin = html[html.index("function makePin("):html.index("function addPin(")]
+    assert "new AMap.Marker(" in pin and "pinHtml(meta,reco)" in pin and "marker.setLabel(" in pin
+    popup = html[html.index("function openPinPopup("):html.index("function focusPlaceRow(")]
+    assert "infoWindow.setContent(popupHtml(place,index))" in popup, "InfoWindow 仍承载 popupHtml()"
+    assert "map.setFitView([outerRing],true,RING_FIT_AVOID)" in html
+    assert "map.setFitView([routeLine],true,ROUTE_FIT_AVOID,ROUTE_FIT_MAX_ZOOM)" in html
+    assert "function lngLat(lat,lng){return [num(lng),num(lat)];}" in html, "高德轨的翻序 helper 原样"
+    boot = boot_section(html)
+    assert "loadMapConfig()" in boot and "loadAMapScript(config)" in boot and "initMap();" in boot, \
+        "启动流程零改动:仍是先取 key 再注入高德 JS API"
+
+
+def test_task23_engine_dispatch_sits_at_function_head(html: str) -> None:
+    """分轨跳转只加在既有渲染入口的**第一行**:境内轨那几行原样跟在后面,一眼可比对。"""
+    for name in ENGINE_SWITCH_POINTS:
+        start = html.index(f"function {name}(")
+        head = html[start:html.index("\n", html.index("\n", start) + 1)]
+        assert 'state.mapEngine==="leaflet"' in head, f"{name}() 的分轨跳转应在函数开头"
+    assert html.count('if(state.mapEngine==="leaflet")') >= len(ENGINE_SWITCH_POINTS)
+    assert "leafletClearRouteLine();" in html[html.index("function clearRouteLine("):
+                                              html.index("function drawRouteLine(")], \
+        "关面板/换线时两轨的线都要清掉"
+
+
+# --- ⑨ node --check(双轨那一大段新代码之后仍要过语法) --------------------------- #
+
+
+@pytest.mark.skipif(NODE is None, reason="环境未安装 node,跳过内联脚本语法检查")
+def test_task23_inline_js_passes_node_check(html: str, tmp_path: Path) -> None:
+    script = tmp_path / "task23_inline.js"
+    script.write_text(inline_script(html), encoding="utf-8")
+    result = subprocess.run([NODE, "--check", str(script)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"内联脚本语法错误:\n{result.stderr}"
+    assert TASK23_SECTION_START in inline_script(html), "境外轨那段确实在这唯一的内联脚本里"
+
+
+# --- ⑩ 与引擎无关的功能零改动(收藏 / 详情弹窗 / 外链 / 住宿 / 定位) -------------- #
+
+
+def test_task23_engine_agnostic_functions_are_untouched(html: str) -> None:
+    for name in ENGINE_AGNOSTIC_FUNCTIONS:
+        body = js_fn(html, name)
+        assert "state.mapEngine" not in body, f"{name}() 与地图引擎无关,不该出现分轨判断"
+        assert "leaflet" not in body.lower(), f"{name}() 不该引用 Leaflet"
+        assert "L.map(" not in body and "L.marker(" not in body
+    for label, section in (("详情弹窗", modal_section(html)), ("行程方案", plan_section(html)),
+                           ("住宿区块", stay_section(html)), ("AI 助手抽屉", assist_section(html))):
+        assert "state.mapEngine" not in section, f"{label}那一段与引擎无关"
+        assert "leaflet" not in section.lower(), f"{label}那一段不该引用 Leaflet"
+
+
+def test_task23_locate_button_serves_both_tracks(html: str) -> None:
+    located = html[html.index("async function onLocated("):html.index("function onLocateFailed(")]
+    assert '"/api/geocode/reverse?lat="' in located, "逆地理仍走现状端点(后端已双轨)"
+    assert "applyOrigin(data)" in located, "落地起点 → 由 applyOrigin 统一切轨"
+    assert "state.mapEngine" not in located and "leaflet" not in located.lower(), \
+        "定位这段与引擎无关:GPS 的 WGS-84 坐标由境外轨直用"
+    assert 'params.set("region"' not in leaflet_section(html), \
+        "切轨只认后端回报的 region,不在前端硬拼检索参数"

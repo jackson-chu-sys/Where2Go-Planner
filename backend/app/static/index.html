@@ -21,6 +21,11 @@
   button.secondary{background:#e5e7eb;color:#1f2937}
   button:disabled{opacity:.5;cursor:wait}
   #map{height:62vh;min-height:420px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.08);background:#e8eef1}
+  /* 境外轨(TASK-23):Leaflet 容器与 #map 同尺寸同观感,两者**互斥显隐**(同一时刻只渲染一个引擎)。
+     leaflet.css 是首次进境外时才注入的(CDN 懒加载),所以这里的默认底色要能顶住"库还没到"的一瞬间。 */
+  #mapLeaflet{display:none;position:relative;height:62vh;min-height:420px;border-radius:12px;
+              box-shadow:0 1px 3px rgba(0,0,0,.08);background:#e8eef1}
+  .leaflet-popup-content{margin:12px 14px}   /* 与高德 InfoWindow 的 .amap-info-content 同口径 */
   /* 地图降级(TASK-9d):高德 JS key 未配置 / JS API 加载失败时盖在 #map 上的说明层,
      只降地图不降功能(列表、收藏、路线面板照常可用),文案里给下一步操作。 */
   #mapFallback{display:none;position:absolute;top:0;left:0;right:0;bottom:0;z-index:900;
@@ -389,6 +394,9 @@
   </div>
   <div id="mapWrap">
     <div id="map"></div>
+    <!-- 境外轨地图容器(TASK-23):region=overseas / 勾了「境外模式」时显示它并隐藏 #map,
+         Leaflet 1.9.4 + OSM 瓦片(坐标 WGS-84 直用,不做任何坐标系转换);切回境内则原样显示 #map。 -->
+    <div id="mapLeaflet"></div>
     <!-- 地图降级说明(TASK-9d):没配高德 JS key / JS API 加载失败时显示,由 showMapFallback() 填文案 -->
     <div id="mapFallback" role="note"></div>
     <!-- 路线面板(TASK-2b):点 pin 自动展开;✕ 关闭时清掉地图上的路线 -->
@@ -738,19 +746,34 @@ const state={meta:{bands:[],categories:[]},origin:null,band:"50_100",category:""
              // sessionKey/items/busy 只服务「💬 问答」;「🧳 行程」**不另立 state** —— 直接共用
              // 上面的 state.planner(同一份会话 key / 气泡 / 点名清单),两个入口才永远同步。
              assist:{open:false,mode:"chat",sessionKey:"",items:[],busy:false,lastFocus:null},
-             mapNote:""};   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
+             mapNote:"",   // 地图降级提示(高德 key 未配置 / JS API 加载失败):常驻状态栏前缀
+             // 地图引擎双轨(TASK-23):"amap" = 境内高德 JS API 2.0(**启动缺省**,现状零变化);
+             // "leaflet" = 境外 OSM/Leaflet(坐标 WGS-84 直用,不做任何坐标系转换)。
+             // 由 syncMapEngine()/setMapEngine() 按 /api/geocode 的 region 与「境外模式」开关切。
+             mapEngine:"amap"};
 // 高德覆盖物句柄:rings/pins/routeLayer 是**数组**(高德没有 Leaflet 的 layerGroup,
 // 清图层 = clearOverlays() 逐个 setMap(null));infoWindow 承载 popupHtml(),hoverTip 代替 bindTooltip。
 let map=null,rings=null,pins=null,outerRing=null,routeLayer=null,routeLine=null,
     infoWindow=null,hoverTip=null;
+// 境外轨(TASK-23)的 Leaflet 句柄:与上面那套高德句柄**完全分开**,互不掺和 ——
+// lmap 是地图实例、lrings/lpins/lrouteLayer 是三个图层组(清图层 = 清空图层组)、
+// louterRing/lrouteLine/lpopup 供视野 fit 与"同一时刻只留一条线/一个 popup"用;
+// tileLayer/tileLineIndex/tileErrorCount 管三线瓦片轮换;leafletLoading 是懒加载的在飞 promise。
+let lmap=null,lrings=null,lpins=null,lrouteLayer=null,louterRing=null,lrouteLine=null,lpopup=null,
+    tileLayer=null,tileLineIndex=0,tileErrorCount=0,leafletLoading=null;
 
 function esc(value){
   return String(value===null||value===undefined?"":value)
     .replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
 }
 // 状态栏:地图降级时把「地图未配置高德 JS key」常驻在最前面(后面的业务状态照常刷新,
-// 但降级文案不会被 loadMeta/searchCity 的 setStatus 冲掉)
-function setStatus(html){$("status").innerHTML=(state.mapNote||"")+html;}
+// 但降级文案不会被 loadMeta/searchCity 的 setStatus 冲掉)。
+// 境外轨(TASK-23)不挂这个前缀:那条降级说的是**高德** key,而境外底图走 OSM 瓦片、压根不需要
+// key,挂上去会让人以为地图画不出来(境外轨自己的降级由 setMapEngine 用 showNote/setStatus 现给)。
+function setStatus(html){
+  const note=(state.mapEngine==="leaflet")?"":(state.mapNote||"");
+  $("status").innerHTML=note+html;
+}
 function showErr(message){$("err").textContent=message||"";$("err").style.display=message?"block":"none";}
 // 轻提示(不是错误):定位被拒、城市没搜到、种子数据来源等。warn=true 用黄色表示"需要注意"
 function showNote(message,warn){
@@ -920,6 +943,7 @@ function seedLegend(){
 // 当前 band 的环形范围圈:外圆(上限半径,实线)+ 内圆(下限半径,虚线)= 环带示意。
 // 颜色/线宽沿用原来的 RING_COLOR 与 weight 口径;半径单位都是**米**(与 Leaflet 一致)。
 function drawRings(){
+  if(state.mapEngine==="leaflet"){leafletDrawRings();return;}   // 境外轨(TASK-23)
   if(!map||!rings||!state.origin) return;   // 高德 JS API 没加载成功时静默跳过(boot 里已给降级文案)
   clearOverlays(rings);
   hideHoverTip();
@@ -947,6 +971,7 @@ function drawRings(){
 
 // 高德没有 fitBounds:用 setFitView 把外圈圆 fit 进视野(四周留白沿用原来的 padding 24)
 function fitRings(){
+  if(state.mapEngine==="leaflet"){leafletFitRings();return;}   // 境外轨(TASK-23):fitBounds
   if(!map||!outerRing) return;
   map.setFitView([outerRing],true,RING_FIT_AVOID);
 }
@@ -1243,6 +1268,7 @@ function routeTooltip(route,schematic){
 
 function clearRouteLine(){
   clearOverlays(routeLayer);
+  leafletClearRouteLine();   // 境外轨(TASK-23):两轨都清 →「同一时刻只留一条线」不分引擎
   hideHoverTip();
   routeLine=null;
 }
@@ -1250,6 +1276,7 @@ function clearRouteLine(){
 // 画线:驾车有 geometry 就画真实折线(抽稀后),铁路/飞机(以及高德降级)画起终点示意线;
 // 先清后画 → 同一时刻地图上只有一条路线
 function drawRouteLine(route){
+  if(state.mapEngine==="leaflet"){leafletDrawRouteLine(route);return;}   // 境外轨(TASK-23)
   clearRouteLine();
   if(!map||!routeLayer||!route) return;
   const ends=routeEnds();
@@ -1283,6 +1310,8 @@ function selectRouteMode(mode,fit){
     card.setAttribute("aria-pressed",on?"true":"false");
   });
   drawRouteLine(currentRoute());
+  // 境外轨(TASK-23):Leaflet 用 fitBounds 把这条线框进视野(境内轨 lrouteLine 为 null → 无操作)
+  if(fit&&state.mapEngine==="leaflet") leafletFitRoute();
   // 高德没有 fitBounds:setFitView 只 fit 这一条线(留白 40、zoom 上限 12,与原口径一致)
   if(fit&&map&&routeLine) map.setFitView([routeLine],true,ROUTE_FIT_AVOID,ROUTE_FIT_MAX_ZOOM);
 }
@@ -1718,18 +1747,21 @@ function makePin(place,index,reco){
   return marker;
 }
 function addPin(place,index,reco){
+  if(state.mapEngine==="leaflet") return leafletAddPin(place,index,reco);   // 境外轨(TASK-23)
   const marker=makePin(place,index,reco);
   pins.push(marker);
   marker.setMap(map);
   return marker;
 }
 function closePinPopup(){
+  leafletClosePinPopup();   // 境外轨(TASK-23):两轨的 popup 一并收掉
   if(infoWindow&&infoWindow.close) infoWindow.close();
 }
 // 点 pin:高德 InfoWindow 承载**现有 popupHtml()**(⭐收藏 / 🚗路线对比 / 📄查看详情 都在里面,
 // 按钮事件走 document 委托,InfoWindow 内容在 DOM 里所以照常命中);同时展开路线面板
 // —— 等价于原来 Leaflet 的 bindPopup + marker.on("popupopen",…)。
 function openPinPopup(place,index){
+  if(state.mapEngine==="leaflet"){leafletOpenPinPopup(place,index);return;}   // 境外轨(TASK-23)
   if(!map||!infoWindow) return;
   infoWindow.setContent(popupHtml(place,index));
   infoWindow.open(map,lngLat(place.lat,place.lng));
@@ -1749,6 +1781,7 @@ function focusPlaceRow(placeId){
 }
 
 function drawPins(places){
+  if(state.mapEngine==="leaflet"){leafletDrawPins(places);return;}   // 境外轨(TASK-23)
   if(!pins) return;
   closeRoutePanel();   // 换 band/分类/起点或重抓:旧 pin 可能已不在图上,面板与画线一并清掉
   state.places=places||[];
@@ -1804,6 +1837,9 @@ function applyOrigin(data){
   state.geocoder=String(data.geocoder||"");
   // 境内外口径(TASK-20):两条地理编码路由都会带 region(domestic/overseas),状态栏照实显示
   regionSeen=String(data.region||"");
+  // 地图引擎双轨(TASK-23):境外 → 懒加载 Leaflet 后切轨(就绪前的 drawRings/drawPins 会静默跳过,
+  // 就绪时由 redrawMapTrack() 补画一遍);境内 → 高德轨照旧。勾着「境外模式」开关也算境外。
+  syncMapEngine(regionSeen).catch(()=>{});
   state.cached={};
   state.routeCache={};   // 起点变了 → 已缓存的路线全部作废
   closeRoutePanel();     // 面板标题/画线都以旧起点为前提,一并收掉
@@ -1911,8 +1947,9 @@ function pagingNote(){
 // 状态栏:分页口径(已显示 / 库内 total_in_db / 抓取轮数)+ 来源 + 起点解析源 + 分段提示
 // 来源文案(TASK-21 新增 osm 键):境内轨抓的是高德、境外轨抓的是 OSM,读库两轨都一样
 const PLACES_SOURCE_LABEL={amap:"高德实时抓取 → 已入库",osm:"OSM 实时抓取 → 已入库"};
-// 境外轨的坐标是 WGS-84,高德地图按 GCJ-02 画 → pin 会偏移;地图双轨切换是后续版本(TASK-23)
-const OVERSEAS_COORD_HINT="境外数据(WGS-84),地图切换见后续版本";
+// 境外轨状态栏文案(TASK-23 起地图已双轨):境外行走 OSM/Leaflet,坐标 WGS-84 直用、零转换。
+// (TASK-21 时这里挂的是"地图层稍后再切"的过渡提示,双轨落地后按契约 §1.1 正式下线。)
+const OVERSEAS_COORD_HINT="境外模式 · OSM/Leaflet · WGS-84";
 function placesStatusHtml(data){
   const bandTotal=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
   const from=(data.source==="db")?"本地 SQLite 读库(未触网)"
@@ -1986,6 +2023,7 @@ function syncMoreButton(){
 }
 // 加载更多只给**新行**补 pin:不清图层、不关已打开的路线面板(drawPins 两件事都会做)
 function drawMorePins(rows){
+  if(state.mapEngine==="leaflet"){leafletDrawMorePins(rows);return;}   // 境外轨(TASK-23)
   if(!pins||!map||state.pinScope!=="all") return;
   (rows||[]).forEach(place=>{
     if(!coordsReady(place)) return;
@@ -2271,6 +2309,7 @@ function ensurePlaceRow(place){
 // 功能2:按 state.pinScope 画针 —— "reco"(默认)只画 AI 推荐(大号带描边 pin + 名称 tooltip),
 // "all" 沿用既有 drawPins(全部分类配色)。切换只重画 pin,范围圈与列表都不动。
 function renderPinsByScope(){
+  if(state.mapEngine==="leaflet"){leafletRenderPinsByScope();return;}   // 境外轨(TASK-23)
   if(!pins||!map) return;
   if(state.pinScope==="all"){drawPins(state.places||[]);return;}
   closeRoutePanel();   // 换显示范围:旧 pin 可能已不在图上,面板与画线一并清掉
@@ -4239,6 +4278,336 @@ document.addEventListener("click",onDocumentClick);
 document.addEventListener("keydown",onDocumentKeydown);
 
 // --------------------------------------------------------------------------- //
+// 境外轨地图(TASK-23,境外双轨 P4):region=overseas(或勾了「境外模式」)时,把地图层
+// 从**高德 JS API 2.0** 切到 **Leaflet 1.9.4 + OSM 瓦片**。为什么必须切:高德底图在境外
+// z≥10 全是 179B 空白瓦片(2026-10-10/11 实测),而境外行(/api/places region=overseas)
+// 的坐标是 **WGS-84**(tags.coord_system 已标注),原样画到高德(GCJ-02 底图)上会偏几百米
+// —— Leaflet 拿 WGS-84 直接画,零偏移。
+// 七条口径(契约 §1.1):
+//   ① **懒加载**:首次进境外才注入 CDN 的 script/link 标签(1.9.4,带 SRI,照阶段1 考古版本);
+//      加载失败给状态栏与提示条「地图组件加载失败,请检查网络」并**回落高德轨** —— 列表、收藏、
+//      路线面板、住宿卡片、AI 行程一律照常可用(与 showMapFallback 同一套"只降地图"哲学);
+//   ② **同一时刻只渲染一个引擎**:#map(高德)与 #mapLeaflet 互斥显隐,两轨覆盖物句柄各自独立;
+//      切换成功后按当前 state 重画一遍(环圈 / pin / fitView),不重新拉任何接口;
+//   ③ **瓦片三线**(境内出口实测):osm.de 主 → osm.fr 备 → basemaps.cartocdn 兜底;tileerror
+//      累计到阈值就自动换下一条线并给可见提示;attribution 必带 © OpenStreetMap contributors
+//      (CC-BY-SA 义务),maxZoom=18;OSM 官方主站(境内 DNS 污染)与 wikimedia(超时)都不在候选里;
+//   ④ 渲染组件**复用**与引擎无关的既有函数:pinHtml() / categoryMeta() / popupHtml() /
+//      thinPoints() / arcPoints() / ROUTE_LINE_STYLE / fmtKm() —— 只有"画到哪个地图上"分轨;
+//   ⑤ **坐标口径(硬约束)**:境外轨一律 [lat,lng] 且是 WGS-84,**禁止任何坐标系转换**;
+//      高德轨那个 [lng,lat] 翻序 helper 在这一段里一次都不许出现;
+//   ⑥ 高德轨代码零删改:本段只新增 leaflet* 函数,既有函数仅在**开头**加一行分轨跳转;
+//   ⑦ 不新增任何 key:Leaflet 与 OSM 三线瓦片都是无需 key 的公共资源;地图 key 仍只由后端
+//      那个配置接口在运行时下发,本段一个字节都不碰它。
+// --------------------------------------------------------------------------- //
+const LEAFLET_VERSION="1.9.4";
+const LEAFLET_CSS_URL="https://unpkg.com/leaflet@"+LEAFLET_VERSION+"/dist/leaflet.css";
+const LEAFLET_JS_URL="https://unpkg.com/leaflet@"+LEAFLET_VERSION+"/dist/leaflet.js";
+// SRI 完整性校验值(1.9.4 官方公布摘要,照阶段1 的静态标签逐字抄):CDN 被换包浏览器就不执行
+const LEAFLET_CSS_SRI="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=";
+const LEAFLET_JS_SRI="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=";
+const LEAFLET_LOAD_TIMEOUT_MS=12000;   // 与 AMAP_LOAD_TIMEOUT_MS 同量级:超时即当加载失败
+const LEAFLET_LOAD_FAIL_HINT="地图组件加载失败,请检查网络";
+const LEAFLET_MAX_ZOOM=18;             // OSM 三线瓦片公共可用的层级上限
+const TILE_ERROR_THRESHOLD=6;          // 累计这么多块瓦片失败(错误率口径)→ 切下一条线
+// 瓦片三线:主(osm.de)→ 备(osm.fr)→ 兜底(CARTO)。⚠️ CARTO 的主机名是 basemaps.cartocdn.com,
+// a.basemaps.* 子域不通 → 兜底线不带 {s}、不做子域展开(实测口径,别"顺手"补成 {s}.basemaps)。
+const LEAFLET_TILE_LINES=[
+  {url:"https://{s}.tile.openstreetmap.de/{z}/{x}/{y}.png",subdomains:["a","b","c"],label:"OSM 德国镜像(主线)"},
+  {url:"https://{s}.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png",subdomains:["a","b","c"],label:"OSM 法国镜像(备线)"},
+  {url:"https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",subdomains:null,label:"CARTO 浅色(兜底)"}
+];
+const LEAFLET_ATTRIBUTION='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const LEAFLET_TILE_EXHAUSTED_HINT="三线底图瓦片都加载不出来(网络受限?):pin / 环圈 / 路线折线仍能画,"+
+  "列表、收藏、路线面板与住宿卡片照常可用。";
+
+// 懒加载守卫:**首次进境外**才注入 CDN;in-flight 复用同一个 promise(反复切换只加载一次)。
+// 成功 → resolve(true);onerror / 超时 / 加载完但没有 window.L → resolve(false),由调用方降级。
+function loadLeafletOnce(){
+  if(window.L) return Promise.resolve(true);
+  if(leafletLoading) return leafletLoading;
+  leafletLoading=new Promise(resolve=>{
+    let settled=false;
+    // 失败后把 in-flight 清掉:下次再进境外还能重试一次(CDN 抖动不至于一直黑屏)
+    const finish=ok=>{if(!settled){settled=true;leafletLoading=null;resolve(!!ok&&!!window.L);}};
+    const timer=setTimeout(()=>finish(false),LEAFLET_LOAD_TIMEOUT_MS);
+    const style=document.createElement("link");
+    style.rel="stylesheet";
+    style.href=LEAFLET_CSS_URL;
+    style.integrity=LEAFLET_CSS_SRI;      // SRI:与 CDN 上的 1.9.4 摘要不符就拒绝应用
+    style.crossOrigin="anonymous";
+    document.head.appendChild(style);
+    const script=document.createElement("script");
+    script.async=true;
+    script.src=LEAFLET_JS_URL;
+    script.integrity=LEAFLET_JS_SRI;
+    script.crossOrigin="anonymous";
+    script.onload=()=>{clearTimeout(timer);finish(true);};
+    script.onerror=()=>{clearTimeout(timer);finish(false);};
+    document.head.appendChild(script);
+  });
+  return leafletLoading;
+}
+
+// 铺一层瓦片:按 LEAFLET_TILE_LINES[index] 取 URL/子域。不设 crossOrigin —— 三线镜像的 CORS 头
+// 不齐,设了反而会让浏览器判失败;瓦片只显示、不做 canvas 读取,本来也不需要 CORS。
+function addTileLine(index){
+  const line=LEAFLET_TILE_LINES[index];
+  if(!lmap||!line||!window.L) return null;
+  const options={maxZoom:LEAFLET_MAX_ZOOM,attribution:LEAFLET_ATTRIBUTION};
+  if(line.subdomains) options.subdomains=line.subdomains;
+  const layer=L.tileLayer(line.url,options);
+  layer.on("tileerror",onTileError);      // 错误率监听:累计到阈值就换下一条线
+  layer.addTo(lmap);
+  return layer;
+}
+function onTileError(){
+  tileErrorCount+=1;
+  if(tileErrorCount<TILE_ERROR_THRESHOLD) return;
+  switchTileLine();
+}
+// 切下一条瓦片线(主 → 备 → 兜底);三线全废只给提示,不抛错、不影响其余功能
+function switchTileLine(){
+  const next=tileLineIndex+1;
+  tileErrorCount=0;
+  if(next>=LEAFLET_TILE_LINES.length){
+    showNote(LEAFLET_TILE_EXHAUSTED_HINT,true);
+    return false;
+  }
+  if(tileLayer&&lmap) lmap.removeLayer(tileLayer);
+  tileLineIndex=next;
+  tileLayer=addTileLine(tileLineIndex);
+  const line=LEAFLET_TILE_LINES[tileLineIndex]||{};
+  showNote("底图瓦片加载失败,已切到"+(line.label||"备用线")+"。",true);
+  return true;
+}
+
+// 建 Leaflet 地图(只建一次)。⚠️ #mapLeaflet 必须先可见再建(否则量不到宽高)→ 建完 invalidateSize
+function initLeafletMap(){
+  if(lmap) return lmap;
+  const center=coordsReady(state.origin)?[num(state.origin.lat),num(state.origin.lng)]:FALLBACK_CENTER;
+  lmap=L.map("mapLeaflet",{center:center,zoom:8,zoomControl:true,worldCopyJump:true});
+  tileLineIndex=0;tileErrorCount=0;
+  tileLayer=addTileLine(tileLineIndex);
+  lrings=L.layerGroup().addTo(lmap);
+  lpins=L.layerGroup().addTo(lmap);
+  lrouteLayer=L.layerGroup().addTo(lmap);   // 路线画线专用图层:同一时刻只留一条
+  return lmap;
+}
+
+// 环圈:外圆实线 + 内圆虚线 + 起点圆心(半径单位米、颜色 RING_COLOR,与高德轨口径一致)
+function leafletDrawRings(){
+  if(!lmap||!lrings||!state.origin) return;   // Leaflet 还没就绪(在飞 / 加载失败)→ 静默跳过
+  lrings.clearLayers();
+  louterRing=null;
+  const band=currentBand();
+  const at=[num(state.origin.lat),num(state.origin.lng)];   // WGS-84 直用,零转换
+  louterRing=L.circle(at,{radius:band.high*1000,color:RING_COLOR,weight:2,
+    fillColor:RING_COLOR,fillOpacity:.06});
+  louterRing.bindTooltip(band.label+" 外圈("+band.high+" km)");
+  lrings.addLayer(louterRing);
+  if(Number(band.low)>0){   // 下限 0 的那档(市区/近郊)没有内圈
+    const innerRing=L.circle(at,{radius:band.low*1000,color:RING_COLOR,weight:1.5,
+      dashArray:"6 6",fill:false});
+    innerRing.bindTooltip(band.label+" 内圈("+band.low+" km)");
+    lrings.addLayer(innerRing);
+  }
+  const center=L.circleMarker(at,{radius:6,color:"#fff",weight:2,fillColor:RING_COLOR,fillOpacity:1});
+  center.bindTooltip(state.origin.name+"(起点)",{direction:"top"});
+  lrings.addLayer(center);
+}
+// fitView:L.featureGroup(...).getBounds() → map.fitBounds(留白 24,与高德 setFitView 同口径)
+function leafletFitRings(){
+  if(!lmap||!louterRing||!louterRing.getBounds) return;
+  lmap.fitBounds(L.featureGroup([louterRing]).getBounds(),{padding:[24,24]});
+}
+
+// 线型:ROUTE_LINE_STYLE 的 dashArray 在高德轨是数组([10,8]),Leaflet 要字符串("10 8")
+function leafletDash(value){
+  if(!value) return null;
+  return Array.isArray(value)?value.join(" "):String(value);
+}
+// 画线提示:境外驾车腿走 OSRM(TASK-22),所以这句不能沿用高德轨的真实折线文案
+function leafletRouteTooltip(route,schematic){
+  const label=route.label||ROUTE_MODE_LABEL[route.mode]||route.mode||"路线";
+  const badge=(KIND_BADGE[route.kind]||KIND_BADGE.estimate).text;
+  const figs=[fmtDuration(route.duration_min),fmtCost(route.cost_cny),fmtKm(route.distance_km)].join(" · ");
+  return label+" "+figs+"("+badge+")"+(schematic?" · 示意线,非真实轨迹":" · OSRM 真实折线");
+}
+function leafletClearRouteLine(){
+  if(lrouteLayer) lrouteLayer.clearLayers();
+  lrouteLine=null;
+}
+// 画线:驾车有 geometry 就画真实折线(抽稀口径与高德轨共用 thinPoints),铁路/飞机画示意线;
+// 先清后画 → 同一时刻只有一条。⚠️ Leaflet 是 [lat,lng]、与高德相反:thinPoints/arcPoints 本来就
+//    吐 [lat,lng],所以这里**直接喂**、不翻序(翻序只属于高德轨)。
+function leafletDrawRouteLine(route){
+  leafletClearRouteLine();
+  if(!lmap||!lrouteLayer||!route) return;
+  const ends=routeEnds();
+  if(!ends) return;
+  let points=(Array.isArray(route.geometry)&&route.geometry.length>1)
+    ? thinPoints(route.geometry,ROUTE_MAX_POINTS):null;
+  const schematic=!points||points.length<2;
+  if(schematic) points=(route.mode==="flight")?arcPoints(ends.from,ends.to,ROUTE_FLIGHT_BOW):[ends.from,ends.to];
+  const style=ROUTE_LINE_STYLE[route.mode]||ROUTE_LINE_STYLE.rail;
+  lrouteLine=L.polyline(points,{color:style.color,weight:style.weight,opacity:style.opacity,
+    dashArray:leafletDash(style.dashArray)});   // 驾车实线 / 铁路·飞机虚线
+  lrouteLine.bindTooltip(leafletRouteTooltip(route,schematic),{sticky:true});
+  lrouteLayer.addLayer(lrouteLine);
+}
+function leafletFitRoute(){
+  if(!lmap||!lrouteLine||!lrouteLine.getBounds) return;
+  lmap.fitBounds(L.featureGroup([lrouteLine]).getBounds(),
+    {padding:[40,40],maxZoom:ROUTE_FIT_MAX_ZOOM});
+}
+
+// pin:L.marker + L.divIcon 自绘 —— HTML 由与引擎无关的 pinHtml()(分类色 + emoji)输出,沿用
+// 同一套 .pin / .pin.reco CSS;iconAnchor=[size/2,size] 让针尖正好落在坐标上(与高德轨同口径)。
+function leafletPinIcon(meta,reco){
+  const size=reco?34:26;
+  return L.divIcon({className:"",iconSize:[size,size],iconAnchor:[size/2,size],
+    popupAnchor:[0,-(size-2)],html:pinHtml(meta,reco)});
+}
+function leafletMakePin(place,index,reco){
+  const meta=categoryMeta(place.category);
+  const marker=L.marker([num(place.lat),num(place.lng)],
+    {icon:leafletPinIcon(meta,reco),title:reco?"":String(place.name||""),zIndexOffset:reco?600:0});
+  marker.on("click",()=>leafletOpenPinPopup(place,index));   // 点 pin → popup + 侧栏路线面板
+  if(reco){
+    marker.bindTooltip("★ "+(place.name||"(无名)")+" · "+fmtKm(place.distance_km),
+      {direction:"top",offset:[0,-30]});
+  }
+  return marker;
+}
+function leafletAddPin(place,index,reco){
+  if(!lpins) return null;
+  const marker=leafletMakePin(place,index,reco);
+  lpins.addLayer(marker);
+  return marker;
+}
+function leafletClosePinPopup(){
+  if(lpopup&&lmap&&lmap.closePopup) lmap.closePopup(lpopup);
+  lpopup=null;
+}
+// popup:L.popup 承载**现有 popupHtml()**(⭐收藏 / 🚗路线对比 / 📄查看详情 / 📍定位到列表行都在
+// 里面)—— popup 内容就在 DOM 里,所以那些按钮的 document 事件委托照常命中;点 pin 同时展开
+// 路线面板(等价高德轨的 openPinPopup:InfoWindow + openRoutePanel)。
+function leafletOpenPinPopup(place,index){
+  if(!lmap||!window.L||!coordsReady(place)) return;
+  leafletClosePinPopup();
+  lpopup=L.popup({maxWidth:340,minWidth:240,autoPan:true,offset:[0,-6]})
+    .setLatLng([num(place.lat),num(place.lng)])
+    .setContent(popupHtml(place,index))
+    .openOn(lmap);
+  openRoutePanel(place);
+}
+function leafletDrawPins(places){
+  if(!lpins) return;
+  closeRoutePanel();   // 换 band/分类/起点或重抓:旧 pin 可能已不在图上,面板与画线一并清掉
+  state.places=places||[];
+  lpins.clearLayers();
+  leafletClosePinPopup();
+  state.places.forEach((place,index)=>{
+    if(!coordsReady(place)) return;
+    leafletAddPin(place,index,false);
+  });
+}
+// 「地图显示范围」两档在境外轨的镜像实现(reco = 大号描边 pin + 名称 tooltip)
+function leafletRenderPinsByScope(){
+  if(!lpins||!lmap) return;
+  if(state.pinScope==="all"){leafletDrawPins(state.places||[]);return;}
+  closeRoutePanel();   // 换显示范围:旧 pin 可能已不在图上,面板与画线一并清掉
+  lpins.clearLayers();
+  leafletClosePinPopup();
+  const rows=recoRows().filter(place=>coordsReady(place));
+  rows.forEach(place=>{
+    const index=ensurePlaceRow(place);
+    leafletAddPin(place,index,true);   // 推荐 pin:大号描边 + 名称 tooltip
+  });
+  if(!rows.length) setListMsg(emptyPinHint(),"warn");
+}
+// 「加载更多」只给**新行**补 pin(不清图层、不关面板),与高德轨的 drawMorePins 同口径
+function leafletDrawMorePins(rows){
+  if(!lpins||!lmap||state.pinScope!=="all") return;
+  (rows||[]).forEach(place=>{
+    if(!coordsReady(place)) return;
+    const index=ensurePlaceRow(place);
+    leafletAddPin(place,index,false);
+  });
+}
+
+// 两轨容器互斥显隐;#mapFallback 是高德轨专属的降级层(境外轨自己用 showNote 给提示),
+// 所以只有"切回境内且高德没建起来"时才重新盖上它。
+function showMapContainer(which){
+  const leaflet=(which==="leaflet");
+  const amapBox=$("map"),leafletBox=$("mapLeaflet"),fallback=$("mapFallback");
+  if(amapBox) amapBox.style.display=leaflet?"none":"block";
+  if(leafletBox) leafletBox.style.display=leaflet?"block":"none";
+  if(fallback) fallback.style.display=(leaflet||map)?"none":"block";
+}
+// 切轨后按当前 state 重画一遍(不重新拉接口):环圈 → fitView → 按显示范围画 pin。
+// renderPinsByScope 内部会 closeRoutePanel(),旧线/旧面板自然被清掉,不会串轨。
+function redrawMapTrack(){
+  drawRings();
+  fitRings();
+  renderPinsByScope();
+}
+// 引擎切换的唯一写入口:want="leaflet" 时先置位再懒加载,加载/初始化失败一律**回落高德轨**并给
+// 可见提示(境外 pin 在高德上会偏几百米,但列表 / 收藏 / 路线 / 住宿 / AI 行程全都不受影响)。
+async function setMapEngine(next){
+  if(next==="leaflet"){
+    state.mapEngine="leaflet";   // 立刻置位:切换期间的 drawRings/drawPins 走境外轨(未就绪则静默跳过)
+    const ok=await loadLeafletOnce();
+    if(!ok){
+      state.mapEngine="amap";
+      showMapContainer("amap");
+      showNote(LEAFLET_LOAD_FAIL_HINT+"(境外底图暂不可用,已回落高德地图:境外 pin 位置可能偏移数百米;"
+        +"列表、收藏、路线面板与住宿卡片照常可用)。",true);
+      setStatus(LEAFLET_LOAD_FAIL_HINT);
+      redrawMapTrack();
+      return false;
+    }
+    showMapContainer("leaflet");   // 先让容器可见:L.map 初始化要量得到宽高
+    try{
+      initLeafletMap();
+    }catch(error){
+      state.mapEngine="amap";
+      showMapContainer("amap");
+      showNote("境外地图初始化失败:"+((error&&error.message)||error)+"(已回落高德地图)",true);
+      redrawMapTrack();
+      return false;
+    }
+    if(lmap.invalidateSize) lmap.invalidateSize();   // 容器刚从 display:none 变可见 → 重算尺寸
+    redrawMapTrack();
+    return true;
+  }
+  state.mapEngine="amap";
+  showMapContainer("amap");
+  leafletClosePinPopup();
+  if(map){
+    // #map 刚从 display:none 变回来 → 高德要重新量一次尺寸:有 resize() 就直接调,
+    // 没有就补发一次 window resize(resizeEnable:true 时高德自己会重算)
+    if(typeof map.resize==="function"){
+      try{map.resize();}catch(error){/* 失败也无妨:下面 redrawMapTrack 会重画并 fit */}
+    }else{
+      try{window.dispatchEvent(new Event("resize"));}catch(error){/* 老浏览器没有 Event 构造器 */}
+    }
+  }
+  redrawMapTrack();
+  return !!map;
+}
+// 该用哪一轨:/api/geocode(与 /api/geocode/reverse)回报的 region=overseas、或用户勾了「境外模式」
+// → leaflet;其余(含 region 判不出来的空值)→ amap。已经是目标轨且地图就绪时**什么都不做**
+// (不重画、不闪屏),所以每次落地起点/翻分段都可以放心调。
+function syncMapEngine(region){
+  const overseas=(String(region||"").toLowerCase()==="overseas")||regionOverride;
+  const want=overseas?"leaflet":"amap";
+  if(want===state.mapEngine&&(want!=="leaflet"||lmap)) return Promise.resolve(true);
+  return setMapEngine(want);
+}
+
+// --------------------------------------------------------------------------- //
 // 境外模式开关(TASK-20 境外双轨 P1):起点在境内还是境外,由后端 /api/geocode 判定
 // (Nominatim 主 → Photon 兜底)并在响应的 region 键里回报;判不出时后端按 domestic 处理、
 // 且不落缓存(下次重试)。但**中文境外地名偶尔会被判成境内**(实测「因特拉肯」被 Photon
@@ -4275,6 +4644,9 @@ function onRegionOverrideChange(event){
   showNote(regionOverride
     ? "已开启「境外模式」:之后的城市搜索会带 region=overseas(后端按境外口径处理,不再自动判定)。"
     : "已关闭「境外模式」:之后的城市搜索由后端自动判定境内外。",false);
+  // 地图轨跟着开关走(TASK-23):勾上 = 立刻切 Leaflet(境外 WGS-84 直用),取消 = 切回高德。
+  // 起点没变时不重搜(上面那条提示照旧),但地图层要立刻换成对应轨道,别让人看着偏移的 pin。
+  syncMapEngine(regionOverride?"overseas":regionSeen).catch(()=>{});
 }
 regionOverride=readRegionOverride();          // 刷新页面后恢复上次的勾选
 $("regionOverride").checked=regionOverride;

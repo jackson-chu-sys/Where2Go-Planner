@@ -986,11 +986,16 @@
 
 ## [TASK-20] 境外双轨 P1:region_gate 境内外判定服务(神朱 2026-10-10 拍板「使用推荐选项」,方案见 docs/OVERSEAS-PLAN.md §2/§4.2)
 
-- 状态: pending
+- 状态: done
 - 目标: 新增 `services/region_gate.py`:起点解析后经 Photon/Nominatim 的 country 字段判定 domestic/overseas(Nominatim country_code=CN;Photon country 含「中国」);OriginCache 加 `region` 列(TTL 同 7 天);`/api/geocode` 响应**只加** `region` 键;双失败默认 domestic+note;前端加「境外模式」手动开关(localStorage 记忆,可覆盖自动判定)。
 - 涉及: backend/services/region_gate.py(新)、backend/db/models.py(OriginCache.region)、backend/app/api/places.py、index.html(开关)、backend/test_region_gate.py(≥15 用例全 mock)
 - 验收: pytest 零回归+≥15 新增;/api/geocode 既有键零变化;判定用例覆盖(中文境外名→overseas、境内→domestic、双失败→domestic 兜底、手动开关覆盖)。
-- 结果: (待夜班回填)
+- 结果: **完成**(2026-10-12 00:04 CST,commit `7148151`,按 `docs/TASK-20-CONTRACT.md` §1/§2 逐字落地)。
+  - `services/region_gate.py`(150 行):classify_country_code(CN→domestic、其他非空→overseas、空/None→domestic 不猜)+ detect_region(**Nominatim 主→Photon 兜底**——Photon 正向会把中文境外地名错定国内,「因特拉肯」→香港 countrycode=CN,实测坑已避)+ detect_region_coords(Photon reverse 主→Nominatim 兜底);双失败一律 domestic/detector=none 绝不抛。
+  - photon.py/nominatim.py 国家信息走 **opt-in** include_country 参数,默认输出逐键与既有断言一致;OriginCache 增列 region(ALTER TABLE 迁移);`/api/geocode` 与 `/reverse` **只多 region 一个键**(优先级 override>缓存>现场判定;override 不写共享缓存;detector=none 不写缓存下次重试;命中缓存零额外网络)。
+  - 前端「境外模式」开关 #regionOverride(localStorage w2g_region_override,字面写法避开既有 .xxx() 断言口径)。
+  - 测试 test_region_gate.py + test_frontend_routes.py 新增(≥15 要求);执行器复跑 pytest backend/ = **1467 passed**(1429 基线零回归,135s——region_gate 判定链沿用共享 client 节流,4 个测试文件 +11.5s 属契约备注预期)。
+  - 执行器真机冒烟(uvicorn 已重启到 7148151):`/api/geocode?city=上海` → geocoder=amap/**region=domestic**;`/api/geocode?city=Interlaken` → geocoder=photon/**region=overseas**(46.6855,7.8585 正确落因特拉肯)。
 
 ---
 

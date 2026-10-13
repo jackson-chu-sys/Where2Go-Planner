@@ -34,11 +34,21 @@
   ``region=domestic|overseas`` 是前端「境外模式」开关的 **override**(给了就不判定、
   零额外网络),非法值按本仓库口径 **400 中文**(不是 pydantic 的 422);判定结果随
   地理编码缓存一起落 ``OriginCache.region``,命中缓存且该列非空时**不再问判定源**。
+  TASK-25 起 ``region`` 不只是标签,它**真正驱动地理编码链**:生效值是 ``overseas`` 时改走
+  :func:`services.place_loader.geocode_overseas`(Nominatim 主 → Photon 兜底 + 国家码守卫,
+  **不打高德**),修掉「勾了境外模式搜因特拉肯却定位到成都双流」这类同名 POI 错配;
+  override 情形**也写缓存**(``region=`` 写生效值,二次查询零网络且坐标仍正确),
+  并给缓存命中加两道**一致性闸**(:func:`_cache_row_is_consistent`):行里 region 与本次
+  生效值不一致、或行里是 ``amap`` 而本次生效 ``overseas`` → 视为未命中、重解析并覆盖写回
+  (存量脏行的自愈路径,不需要一次性清库脚本)。响应键与形状**逐键零变化**。
 * ``GET /api/geocode/reverse?lat=&lng=`` —— 浏览器"我的位置"(TASK-1c):GPS 坐标 →
   **逆**地理编码(同样高德主 + Photon/Nominatim 降级)反查城市起点。反查失败**不报错**,
   降级成坐标起点(``resolved=false``、``geocoder=none``),前端照样能画环、能查库。
   TASK-20 起同样多一个 ``region`` 键:用 :func:`services.region_gate.detect_region_coords`
   按 GPS 坐标判(Photon reverse 主 → Nominatim 兜底),这条路由本来就没有缓存,不新增。
+  TASK-25 起判出的 ``region`` 会**透传**给逆地理编码链:境外 GPS 走
+  :func:`services.place_loader.reverse_overseas`(Photon 主 → Nominatim 兜底,**不问高德**),
+  境内照旧高德主链;响应键零变化,失败仍是 200 + ``resolved=false``。
 * ``GET /api/places/highlights?place_ids=1,2`` —— 详情弹窗的**类别专属要点**(TASK-8a2):
   LLM 按分类出固定字段表(``自然``→最佳季节/门票/开放信息/游玩建议 等),按 POI **永久缓存**
   在 ``PlaceHighlight``(读库优先,命中零 LLM);batch ≤ 10、超限 400 中文,
@@ -141,6 +151,7 @@ INTROS_NOTE = (
 REVERSE_NOTE = (
     "浏览器定位(GPS 坐标)→ 逆地理编码反查城市起点(高德主 + Photon/Nominatim 降级,"
     "geocoder 字段标注这次是谁答的,none = 三个源都没答上);"
+    "境外坐标(TASK-25,按 region 判)改走 Photon 主 + Nominatim 兜底、不问高德;"
     "范围圈始终以传入的 GPS 坐标为圆心,不用行政区中心。"
     "反查失败/限流时 resolved=false,起点名降级为『我的位置(纬度,经度)』——"
     "仍是 HTTP 200,前端照常画环查库,不报错。"
@@ -274,18 +285,35 @@ def _cached_region(row: Any) -> Optional[str]:
     return cleaned if cleaned in REGION_CHOICES else None
 
 
-def _region_write_back(session: Session, row: Any, city: str, region: str) -> None:
-    """把现场判出的 ``region`` 补写回已有的地理编码缓存行(坐标/来源照原值,不动别的)。"""
-    repo.upsert_origin_cache(
-        session,
-        city=city,
-        name=row.name or city,
-        lat=row.lat,
-        lng=row.lng,
-        geocoder=row.geocoder or place_loader.GEOCODER_NONE,
-        region=region,
-    )
-    session.commit()
+def _cache_row_is_consistent(
+    row: Any,
+    resolved_region: str,
+    *,
+    cached_region: Optional[str],
+    determined: bool,
+) -> bool:
+    """缓存行还能不能当命中用(TASK-25 的两道**一致性闸**,脏缓存自愈的关键)。
+
+    闸一(region 串轨):行里的 ``region`` 与本次生效值不一致 → 未命中。行里是空串/None
+    (没判过)时看**本次判没判出**:判出了(给了 override,或 ``detector != none``)就说明
+    这行的坐标可能是串轨的旧值(境外名被高德吸附成国内同名 POI)→ 重解析并覆盖写回;
+    本次也判不出就无从比对,沿用现状命中(境内链"命中即零网络"这条口径不动)。
+
+    闸二(高德 × 境外):本次生效是 ``overseas`` 而行里 ``geocoder == "amap"`` → 未命中。
+    高德只服务境内,它答出的境外城市坐标必然是**国内同名 POI**(2026-10-13 实测:
+    因特拉肯→成都双流、皇后镇→安阳林州、巴黎→高雄),所以这一闸就是存量脏行的自愈路径
+    (同名城市再搜一次即被境外链的正确结果覆盖,不需要一次性清库脚本)。
+    """
+    if cached_region is None:
+        if determined:
+            return False
+    elif cached_region != resolved_region:
+        return False
+    if resolved_region == region_gate.REGION_OVERSEAS and (
+        str(getattr(row, "geocoder", "") or "").strip().lower() == place_loader.GEOCODER_AMAP
+    ):
+        return False
+    return True
 
 
 def resolve_intro_limit(limit: Optional[int]) -> Optional[int]:
@@ -828,12 +856,23 @@ def geocode_city(
     + ``region``);未命中/过期才走 :func:`place_loader.resolve_origin_with_source`,并且只在
     ``geocoder`` ∈ {amap, photon, nominatim} 时写缓存(给了坐标的 ``none`` 退化路径不写)。
 
-    ``region``(TASK-20)的取值优先级:**override 参数 > 缓存里已判出的值 > 现场判定**。
-    三条口径:① 给了 override 就**不调判定源**、也不写缓存(那是每次请求的临时口径,
-    写进 7 天缓存会污染别人的自动判定);② 命中缓存且 ``OriginCache.region`` 非空时
-    **零额外网络**(判定要问 Nominatim/Photon,比读一行贵得多);③ 现场判定只在
+    ``region``(TASK-20 起)的取值优先级:**override 参数 > 缓存里已判出的值 > 现场判定**。
+    ① 给了 override 就**不调判定源**(零额外网络);② 缓存里已判出过(``OriginCache.region``
+    非空)也不再问判定源(判定要问 Nominatim/Photon,比读一行贵得多);③ 现场判定只在
     ``detector != none`` 时随 upsert 写回 —— 判不出(断网/限流)就按 ``domestic`` 回报但
-    **不落库**,下次搜索还能重试。既有键与取值逐键零变化。
+    **不落库**(留空串,下次搜索还能重试)。
+
+    TASK-25 起这个生效值**真正驱动地理编码链**(此前它只是个标签,坐标始终由高德解析,
+    于是「因特拉肯」被吸附到成都双流、「皇后镇」到安阳林州、「巴黎」到高雄):
+    :func:`place_loader.resolve_origin_with_source` 收到 ``region="overseas"`` 就走境外链
+    (Nominatim 主 → Photon 兜底 + 国家码守卫,**不打高德**),其余走现状高德三腿链。
+    两条配套口径:① override 情形**也写缓存**(``region=`` 写生效值)—— 它现在会改变坐标
+    来源,写回才能让同一城市二次查询零网络**且坐标仍正确**;② 缓存命中要过
+    :func:`_cache_row_is_consistent` 的两道一致性闸(region 串轨 / 高德答的境外城市),
+    不过闸就当未命中、重解析并覆盖写回 —— 存量脏缓存靠这条自愈,不需要清库脚本。
+    响应键与形状(``origin``/``geocoder``/``region``/``bands``/``segments``)**逐键零变化**;
+    非法 ``region`` 仍是 **400 中文**(不是 pydantic 的 422);境外链两腿全失败同样 400
+    中文,消息里带上两腿的失败原因。
     """
     cleaned = _clean(city)
     if not cleaned:
@@ -842,7 +881,29 @@ def geocode_city(
     ttl = origin_cache_ttl_s()
     cached = repo.get_origin_cache(session, city=cleaned) if ttl > 0 else None
     age = origin_cache_age_s(cached) if cached is not None else None
-    if cached is not None and age is not None and age <= ttl:
+    fresh = cached is not None and age is not None and age <= ttl
+    cached_region = _cached_region(cached) if cached is not None else None
+    detected: Optional[dict[str, Any]] = None
+    if override is not None:
+        # 给了 override 就不调判定源;它现在会改变坐标来源,所以照样写回缓存(生效值)
+        resolved_region = cache_region = override
+    elif cached_region is not None:
+        # 缓存里已判出过 → 零额外网络(过期的行也还认这个判定:城市的境内外属性不会变)
+        resolved_region = cache_region = cached_region
+    else:
+        detected = region_gate.detect_region(cleaned)
+        resolved_region = detected["region"]
+        # 判不出(detector=none)不写 region:留空串,下次搜索还能重试
+        cache_region = (
+            None if detected["detector"] == region_gate.DETECTOR_NONE else detected["region"]
+        )
+    # 本次到底判没判出 region(override 或 detector != none):一致性闸要用它决定空行怎么办
+    determined = override is not None or (
+        detected is not None and detected["detector"] != region_gate.DETECTOR_NONE
+    )
+    if fresh and _cache_row_is_consistent(
+        cached, resolved_region, cached_region=cached_region, determined=determined
+    ):
         origin = {
             "city": cleaned,
             "name": cached.name or cleaned,
@@ -850,26 +911,16 @@ def geocode_city(
             "lng": cached.lng,
         }
         geocoder = cached.geocoder or place_loader.GEOCODER_NONE
-        resolved_region = override if override is not None else _cached_region(cached)
-        if resolved_region is None:
-            # 缓存里没有判过的行(detector=none 或补列前的旧库):现场补判一次并写回。
-            detected = region_gate.detect_region(cleaned)
-            resolved_region = detected["region"]
-            if detected["detector"] != region_gate.DETECTOR_NONE:
-                _region_write_back(session, cached, cleaned, resolved_region)
     else:
         try:
-            origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
+            # region 真正驱动解析链(TASK-25 的核心修复):overseas → Nominatim/Photon 境外链
+            origin, geocoder = place_loader.resolve_origin_with_source(
+                cleaned, region=resolved_region
+            )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except DataSourceError as exc:
             raise HTTPException(400, f"无法解析城市 '{cleaned}':{exc}") from exc
-        detected = None
-        if override is not None:
-            resolved_region = override
-        else:
-            detected = region_gate.detect_region(cleaned)
-            resolved_region = detected["region"]
         if geocoder in ORIGIN_CACHE_GEOCODERS:
             repo.upsert_origin_cache(
                 session,
@@ -878,12 +929,7 @@ def geocode_city(
                 lat=origin["lat"],
                 lng=origin["lng"],
                 geocoder=geocoder,
-                # 判不出(detector=none)不写 region:留空串,下次搜索还能重试
-                region=(
-                    None
-                    if detected is None or detected["detector"] == region_gate.DETECTOR_NONE
-                    else detected["region"]
-                ),
+                region=cache_region,
             )
             session.commit()
     return {
@@ -914,15 +960,24 @@ def reverse_geocode(
     ``region``(TASK-20)按 GPS 坐标判:**Photon reverse 主 → Nominatim 兜底**,两腿都失败
     按 ``domestic`` 回报、绝不抛(判定失败不该连累"我的位置"这个 200 口径);
     这条路由本来就没有缓存,这里也**不新增**缓存。
+
+    TASK-25 起判出的 ``region`` 会**透传**给逆地理编码链:``overseas`` → 走
+    :func:`place_loader.reverse_overseas`(Photon 主 → Nominatim 兜底,**跳过高德腿** ——
+    境外 GPS 问高德只会反查出国内行政区),``domestic`` → 现状高德三腿链;判定只调**一次**
+    (同一个结果既当响应键也当链路口径)。响应键零变化,失败仍是 200 + ``resolved=false``。
     """
+    detected = region_gate.detect_region_coords(lat, lng)
     origin, geocoder = place_loader.resolve_reverse_origin_with_source(
-        lat, lng, zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom))
+        lat,
+        lng,
+        zoom=(place_loader.REVERSE_ZOOM if zoom is None else int(zoom)),
+        region=detected["region"],
     )
     return {
         "origin": origin,
         "resolved": bool(origin.get("resolved")),
         "geocoder": geocoder,
-        "region": region_gate.detect_region_coords(lat, lng)["region"],
+        "region": detected["region"],
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=origin["city"]),
         "note": REVERSE_NOTE,

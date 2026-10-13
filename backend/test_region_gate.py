@@ -17,7 +17,9 @@ DB 用 ``tmp_path`` 下的临时 SQLite。
    Nominatim 只在 opt-in 时才带 ``addressdetails=1``;
 5. ``OriginCache.region`` 的落库/补列与 ``upsert_origin_cache(region=None)`` 不覆盖现值;
 6. API 层:响应只多 ``region`` 一个键、override 生效且不调判定源、非法值 400 中文、
-   缓存命中零判定、``detector=none`` 不写缓存(下次重试)。
+   缓存命中零判定、``detector=none`` 不写缓存(下次重试)。TASK-25 起 ``region`` 还会
+   **驱动地理编码链**、override 也写缓存生效值、缓存命中要过一致性闸 —— 那部分断言在
+   ``test_geocode_overseas.py``,本文件只按新口径校准受影响的既有断言。
 
 运行:``cd backend && ../.venv/bin/python -m pytest -q``
 """
@@ -29,7 +31,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 import requests
@@ -132,12 +134,22 @@ def session(tmp_path):
         engine.dispose()
 
 
-def stub_origin(monkeypatch: pytest.MonkeyPatch, *, geocoder: str = place_loader.GEOCODER_PHOTON) -> None:
-    """替换起点解析降级链:API 用例只关心 region,不该真去问地理编码源。"""
-    monkeypatch.setattr(
-        place_loader, "resolve_origin_with_source",
-        lambda city: ({"city": city, "name": f"{city}, 中国", **SHANGHAI}, geocoder),
-    )
+def stub_origin(
+    monkeypatch: pytest.MonkeyPatch, *, geocoder: str = place_loader.GEOCODER_PHOTON
+) -> list[Optional[str]]:
+    """替换起点解析降级链:API 用例只关心 region,不该真去问地理编码源。
+
+    TASK-25 起 API 会把生效 ``region`` 透传进来(它驱动地理编码链),这里顺手记录下来,
+    便于断言"境外时确实按境外口径去解析"。
+    """
+    seen: list[Optional[str]] = []
+
+    def fake(city: str, *, region: Optional[str] = None) -> tuple[dict[str, Any], str]:
+        seen.append(region)
+        return {"city": city, "name": f"{city}, 中国", **SHANGHAI}, geocoder
+
+    monkeypatch.setattr(place_loader, "resolve_origin_with_source", fake)
+    return seen
 
 
 def stub_detect(monkeypatch: pytest.MonkeyPatch, result: dict[str, Any]) -> list[str]:
@@ -526,19 +538,26 @@ def test_api_geocode_adds_only_the_region_key(session, monkeypatch: pytest.Monke
     assert row is not None and row.region == "overseas", "判定结果随缓存一起落库"
 
 
-def test_api_geocode_override_skips_detector_and_cache_write(
+def test_api_geocode_override_skips_detector_and_writes_effective_region(
     session, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stub_origin(monkeypatch)
+    """TASK-25 §1.2.4:override 不调判定源,但**要写缓存**(``region=`` 写生效值)。
+
+    理由是 override 现在会改变坐标来源(境外 → Nominatim/Photon 境外链),写回生效值才能
+    让同一城市二次查询零网络**且坐标仍正确**;不写回就会命中上一轨的坐标 = 串轨。
+    """
+    resolved = stub_origin(monkeypatch)
     calls = stub_detect(monkeypatch, OVERSEAS_CH)
     payload = places_api.geocode_city(city="上海", region="overseas", session=session)
     assert payload["region"] == "overseas" and calls == [], "override 生效且不调判定源"
+    assert resolved == ["overseas"], "生效 region 要透传给解析链(境外不打高德)"
     row = repo.get_origin_cache(session, city="上海")
-    assert row is not None and row.region == "", "override 是每次请求的临时口径,不写进 7 天缓存"
+    assert row is not None and row.region == "overseas", "override 的生效值随缓存落库"
 
     domestic = places_api.geocode_city(city="上海", region="domestic", session=session)
     assert domestic["region"] == "domestic" and calls == []
-    assert repo.get_origin_cache(session, city="上海").region == "", "另一档 override 同样不写库"
+    assert repo.get_origin_cache(session, city="上海").region == "domestic", "另一档同样写生效值"
+    assert resolved == ["overseas", "domestic"], "缓存行 region 与生效值不一致 → 重解析,不串轨"
 
 
 def test_api_geocode_region_override_is_case_insensitive_and_blank_is_auto(
@@ -548,8 +567,12 @@ def test_api_geocode_region_override_is_case_insensitive_and_blank_is_auto(
     calls = stub_detect(monkeypatch, OVERSEAS_CH)
     assert places_api.geocode_city(city="上海", region=" OVERSEAS ", session=session)["region"] == "overseas"
     assert calls == [], "给了合法 override 就不判定"
+    # 换个城市验"空串 = 没给":上海已被上一条 override 写进缓存(region=overseas),
+    # 命中缓存里的判定值就不再问判定源(TASK-25 §1.2.1 的顺序:override > 缓存 > 现场判定)。
     assert places_api.geocode_city(city="上海", region="  ", session=session)["region"] == "overseas"
-    assert calls == ["上海"], "空串 = 没给 → 走自动判定"
+    assert calls == [], "缓存里已判出 region → 空串也不必再判定"
+    assert places_api.geocode_city(city="皇后镇", region="  ", session=session)["region"] == "overseas"
+    assert calls == ["皇后镇"], "没有缓存行时空串 = 没给 → 走自动判定"
 
 
 def test_api_geocode_invalid_region_is_400_in_chinese(session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -593,33 +616,38 @@ def test_api_geocode_detector_none_is_domestic_and_not_cached(
     assert second == first, "口径不变(仍按境内回报)"
 
 
-def test_api_geocode_backfills_region_on_legacy_cache_row(
+def test_api_geocode_legacy_blank_region_row_is_reresolved_when_overseas(
     session, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """补列前的旧行(region="")命中时补判一次并**写回**,之后就是零额外网络。"""
-    repo.upsert_origin_cache(session, city="皇后镇", name="皇后镇, 新西兰",
-                             lat=-45.0312, lng=168.6626, geocoder="photon")
+    """补列前的旧行(region="")一旦判出 overseas 就**不再当命中**:重解析 + 覆盖写回。
+
+    TASK-25 一致性闸一:旧行的坐标可能是高德吸附的**国内同名 POI**(契约 §0 实测 ③ 的
+    13 行脏缓存:皇后镇→安阳林州),所以宁可多问一次地理编码源,也不能把串轨坐标当命中
+    端给用户;覆盖写回之后,同名城市的第二次查询就是零判定零解析。
+    """
+    repo.upsert_origin_cache(session, city="皇后镇", name="河南省安阳市林州市皇后镇",
+                             lat=35.880, lng=113.724, geocoder="amap")
     session.commit()
     assert repo.get_origin_cache(session, city="皇后镇").region == ""
-    monkeypatch.setattr(place_loader, "resolve_origin_with_source",
-                        lambda city: pytest.fail("命中缓存不该再问地理编码源"))
+    resolved = stub_origin(monkeypatch, geocoder=place_loader.GEOCODER_NOMINATIM)
     calls = stub_detect(monkeypatch, {"region": region_gate.REGION_OVERSEAS, "country_code": "NZ",
                                       "detector": region_gate.DETECTOR_PHOTON})
 
     first = places_api.geocode_city(city="皇后镇", session=session)
     assert first["region"] == "overseas" and calls == ["皇后镇"]
-    assert first["origin"] == {"city": "皇后镇", "name": "皇后镇, 新西兰",
-                               "lat": -45.0312, "lng": 168.6626}
+    assert resolved == ["overseas"], "按境外口径重新解析(境外链不打高德)"
+    assert first["origin"] == {"city": "皇后镇", "name": "皇后镇, 中国", **SHANGHAI}
     row = repo.get_origin_cache(session, city="皇后镇")
-    assert row.region == "overseas" and row.geocoder == "photon", "补判只写 region,其余照原值"
+    assert row.region == "overseas" and row.geocoder == "nominatim", "覆盖写回:region 与来源都换新"
+    assert (row.lat, row.lng) == (SHANGHAI["lat"], SHANGHAI["lng"]), "串轨的旧坐标被新结果覆盖"
 
     second = places_api.geocode_city(city="皇后镇", session=session)
-    assert calls == ["皇后镇"], "写回之后就零判定"
+    assert calls == ["皇后镇"] and resolved == ["overseas"], "写回之后就零判定零解析"
     assert second == first
 
 
 def test_api_geocode_override_wins_over_cached_region(session, monkeypatch: pytest.MonkeyPatch) -> None:
-    stub_origin(monkeypatch)
+    resolved = stub_origin(monkeypatch)
     stub_detect(monkeypatch, OVERSEAS_CH)
     places_api.geocode_city(city="上海", session=session)
     assert repo.get_origin_cache(session, city="上海").region == "overseas"
@@ -627,14 +655,17 @@ def test_api_geocode_override_wins_over_cached_region(session, monkeypatch: pyte
     calls = stub_detect(monkeypatch, OVERSEAS_CH)
     payload = places_api.geocode_city(city="上海", region="domestic", session=session)
     assert payload["region"] == "domestic" and calls == [], "override 优先于缓存里的判定"
-    assert repo.get_origin_cache(session, city="上海").region == "overseas", "且不覆盖缓存"
+    assert resolved == ["overseas", "domestic"], "生效值变了就按新口径重解析(不端旧轨坐标)"
+    assert repo.get_origin_cache(session, city="上海").region == "domestic", "并把生效值写回缓存"
 
 
 def test_api_reverse_geocode_reports_region(session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         place_loader, "resolve_reverse_origin_with_source",
-        lambda lat, lng, zoom=None: ({"city": "因特拉肯", "name": "因特拉肯", "lat": lat,
-                                      "lng": lng, "resolved": True}, place_loader.GEOCODER_PHOTON),
+        lambda lat, lng, zoom=None, region=None: (
+            {"city": "因特拉肯", "name": "因特拉肯", "lat": lat, "lng": lng, "resolved": True},
+            place_loader.GEOCODER_PHOTON,
+        ),
     )
     coords = stub_detect_coords(monkeypatch, {"region": region_gate.REGION_OVERSEAS,
                                               "country_code": "CH",
@@ -651,9 +682,11 @@ def test_api_reverse_geocode_region_never_breaks_the_200_contract(
     """判定失败(两条腿都被 no_network 兜住)也仍是 200 + ``region=domestic``,不连累定位。"""
     monkeypatch.setattr(
         place_loader, "resolve_reverse_origin_with_source",
-        lambda lat, lng, zoom=None: ({"city": "我的位置(31.23,121.47)", "name": "我的位置(31.23,121.47)",
-                                      "lat": lat, "lng": lng,
-                                      "resolved": False}, place_loader.GEOCODER_NONE),
+        lambda lat, lng, zoom=None, region=None: (
+            {"city": "我的位置(31.23,121.47)", "name": "我的位置(31.23,121.47)",
+             "lat": lat, "lng": lng, "resolved": False},
+            place_loader.GEOCODER_NONE,
+        ),
     )
     payload = places_api.reverse_geocode(lat=31.2304, lng=121.4737, zoom=None, session=session)
     assert payload["resolved"] is False and payload["geocoder"] == "none"

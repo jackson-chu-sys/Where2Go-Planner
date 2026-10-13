@@ -365,7 +365,7 @@
                不勾 = 后端按 Nominatim 主 → Photon 兜底自动判境内外。只存本机一个 0/1 开关,
                不存任何 key/密钥;本阶段只影响传参,地图与检索行为不变(region 的消费在 TASK-21+)。 -->
           <label style="display:flex;align-items:center;gap:4px;margin:0;font-weight:400;white-space:nowrap"
-                 title="起点在境外(因特拉肯、皇后镇…)时勾上:城市搜索会带 region=overseas,后端按境外口径处理、不再自动判定;不勾则由后端自动判定境内外(只在本机记住这个开关)">
+                 title="起点在境外(因特拉肯、皇后镇…)时勾上:城市搜索会带 region=overseas,后端按境外口径处理、不再自动判定;勾上后坐标解析改走 OSM 系(Nominatim 主 / Photon 兜底),不再用高德(高德只服务境内,会把境外地名吸附到国内同名 POI);不勾则由后端自动判定境内外(只在本机记住这个开关)">
             <input type="checkbox" id="regionOverride" style="width:auto"> 境外模式</label>
           <button id="locate" class="secondary"
                   title="用浏览器定位(GPS)反查起点城市;不支持或被拒绝时只给提示,不影响城市搜索">📍 我的位置</button>

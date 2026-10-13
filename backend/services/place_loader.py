@@ -44,6 +44,14 @@
 ``geocoder``(``amap`` / ``photon`` / ``nominatim``)字段一路报到 API 响应,方便排查
 "这次是哪个源在兜底";:class:`db.models.OriginCache` 会把结果缓存 7 天省配额。
 
+**境外另起一轨**(TASK-25):上面那两条链的主腿是高德,而高德只服务境内 —— 对境外地名它会
+``status=1`` 成功吸附**国内同名 POI**(2026-10-13 实测:「因特拉肯」→ 成都双流、「皇后镇」→
+安阳林州、「巴黎」→ 高雄),坐标彻底错轨。所以 ``region=overseas`` 时正向改走
+:func:`geocode_overseas`(**Nominatim 主 → Photon 兜底**,每腿带 ``include_country=True``
+做**国家码守卫**:判成 ``CN`` 或答不出国家码都当该腿失败),逆向改走 :func:`reverse_overseas`
+(**Photon 主 → Nominatim 兜底**,与 :func:`services.region_gate.detect_region_coords` 同向),
+两轨都**不打高德**;境外坐标是 WGS-84,直用不做 GCJ-02 转换(TASK-23 地图双轨同口径)。
+
 分类过滤只作用在**读取**阶段:一次抓取入库的数据覆盖全部分类,所以换分类查询
 同样命中库、不触网。网络调用全部可注入(``fetcher`` / ``geocoder`` / ``reverse_geocoder``),
 单测用替身即可。
@@ -99,7 +107,7 @@ from services.bands import (
 )
 from services.classify import classify_amap_places
 # 境内外口径(TASK-20 产物):本模块只**消费**判定结果,不自己判(判定在 services.region_gate)
-from services.region_gate import REGION_DOMESTIC, REGION_OVERSEAS
+from services.region_gate import REGION_DOMESTIC, REGION_OVERSEAS, classify_country_code
 
 # 四分类检索线索(TASK-9b 起走**高德** typecode/keywords 组,docs/TASK-9-CONTRACT.md §3):
 # 分组各带配额,避免餐饮这类高频大类把总量刷爆、滑雪场/古镇一条不剩;
@@ -169,6 +177,11 @@ GEOCODER_NOMINATIM = "nominatim"
 GEOCODER_NONE = "none"
 # 全链失败时报错的数据源名(三个源都写进消息,便于运维判断是全站断网还是单源挂了)
 GEOCODER_CHAIN_SOURCE = f"{AMAP_DS_SOURCE}/{PHOTON_SOURCE}/{NOMINATIM_SOURCE}"
+# 境外链(TASK-25)失败时报错的数据源名:**不含高德** —— 高德只服务境内,对境外地名会
+# status=1 成功吸附国内同名 POI(「因特拉肯」→ 成都、「皇后镇」→ 安阳),境外轨绝不打它。
+GEOCODER_CHAIN_OVERSEAS = f"{NOMINATIM_SOURCE}/{PHOTON_SOURCE}"
+# 境外**逆**向链的源名(方向与 services.region_gate.detect_region_coords 同向:Photon 主)
+REVERSE_CHAIN_OVERSEAS = f"{PHOTON_SOURCE}/{NOMINATIM_SOURCE}"
 # 高德地理编码结果拼 ``display_name`` 用的行政区字段(**由细到粗**,与 Photon/Nominatim
 # 的 "区, 市, 省" 顺序对齐):高德的 ``formatted_address`` 是不带逗号的一整串,
 # :func:`city_from_display_name` 挑不出城市名,所以逆地理必须用这几个字段自己拼。
@@ -276,7 +289,97 @@ def photon_geocode(city: str) -> dict[str, Any]:
     return dict(places[0])
 
 
-def geocode_with_fallback(city: str) -> tuple[dict[str, Any], str]:
+def _country_code_of(place: Any, key: str) -> str:
+    """从一腿结果里取国家码并归一成**大写**;形状不对 / 缺失一律空串(= 这一腿没答上)。
+
+    与 :func:`services.region_gate.detect_region` 同口径:Nominatim 给 ``country_code``、
+    Photon 给 ``countrycode``;空串**不当"境内"**,只当"这一腿失败"(判不出就不猜)。
+    """
+    if not isinstance(place, dict):
+        return ""
+    return str(place.get(key) or "").strip().upper()
+
+
+def _geo_shape(place: Mapping[str, Any]) -> dict[str, Any]:
+    """把带国家码的结果裁回降级链统一的三键形状 ``{lat, lng, display_name}``。
+
+    ``include_country=True`` 会**追加** ``country``/``country_code``(``countrycode``)两键,
+    那两键只用于守卫判定,不能漏进返回值 —— 返回形状必须与 :func:`geocode_with_fallback`
+    完全一致,API 与既有单测认定的就是那三个键。
+    """
+    return {
+        "lat": float(place["lat"]),
+        "lng": float(place["lng"]),
+        "display_name": str(place.get("display_name") or ""),
+    }
+
+
+def _require_overseas_code(city: str, source: str, code: str) -> None:
+    """境外链的**国家码守卫**(TASK-25 的核心防线)。
+
+    两种情况都判这一腿失败:① 国家码为空 = 这一腿没答上(与 :mod:`services.region_gate`
+    同口径,不猜);② 国家码归类为 ``domestic`` = 这一腿把境外名错定位到了**国内同名 POI**
+    (2026-10-13 实测:Photon 正向「巴黎」→ 高雄、「因特拉肯」→ 香港因特拉肯大道)。
+    """
+    if not code:
+        raise DataSourceError(source, f"{city!r} 的结果没有国家码,无法确认它在境外")
+    if classify_country_code(code) == REGION_DOMESTIC:
+        raise DataSourceError(
+            source, f"{city!r} 被 {source} 定位到境内(国家码 {code}),境外链不接受这个结果"
+        )
+
+
+def photon_geocode_overseas(city: str) -> dict[str, Any]:
+    """Photon 正向(**境外兜底腿**):一次调用同时拿坐标与国家码,**不打第二次网络**。
+
+    ``include_country=True`` 让每条结果多带 ``countrycode``;空结果、答不出国家码、
+    或国家码判成境内都当失败(交给 :func:`geocode_overseas` 报两腿原因)。
+    """
+    places = ds_photon_geocode(city, limit=PHOTON_LIMIT, include_country=True)
+    if not places:
+        raise DataSourceError(PHOTON_SOURCE, f"未找到与 {city!r} 匹配的地名(结果为空)")
+    place = dict(places[0])
+    _require_overseas_code(city, PHOTON_SOURCE, _country_code_of(place, "countrycode"))
+    return _geo_shape(place)
+
+
+def geocode_overseas(city: str) -> tuple[dict[str, Any], str]:
+    """**境外**正向地理编码链:**Nominatim 主 → Photon 兜底**,**绝不打高德**(TASK-25)。
+
+    返回形状与 :func:`geocode_with_fallback` 完全一致:``({"lat","lng","display_name"},
+    "nominatim"|"photon")``。方向与 :func:`services.region_gate.detect_region` 同向,理由也
+    相同:Photon 对**中文境外地名**会错定位到国内,所以它只能当兜底腿;Nominatim
+    (``accept-language=zh-CN`` + ``addressdetails=1``)中文境外 8/8 全中。
+
+    每一腿都过 :func:`_require_overseas_code` 的国家码守卫 —— 判成 ``CN``(或答不出国家码)
+    就当这一腿错配、降级到下一腿;两腿都失败抛 :class:`DataSourceError`,消息里带上两腿原因
+    (API 层转 HTTP 400)。宽 ``except Exception`` 只用在中间腿,理由同
+    :func:`geocode_with_fallback` 的 docstring。
+
+    境外坐标是 **WGS-84**,直用不做 GCJ-02 转换(TASK-23 地图双轨同口径)。
+    """
+    cleaned = (city or "").strip()
+    if not cleaned:
+        raise ValueError("起点城市不能为空")
+    reasons: list[str] = []
+    try:
+        # include_country=True 的**这一次**结果既给坐标也给国家码,不再另调 detect_region
+        place = dict(ds_geocode(cleaned, include_country=True))
+        _require_overseas_code(cleaned, NOMINATIM_SOURCE, _country_code_of(place, "country_code"))
+        return _geo_shape(place), GEOCODER_NOMINATIM
+    except Exception as exc:  # noqa: BLE001 - 中间腿失败只降级,不上抛(见 geocode_with_fallback)
+        reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
+    try:
+        return photon_geocode_overseas(cleaned), GEOCODER_PHOTON
+    except DataSourceError as exc:
+        reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
+        raise DataSourceError(
+            GEOCODER_CHAIN_OVERSEAS,
+            f"境外地理编码两个源都失败,无法解析 {cleaned!r}:" + ";".join(reasons),
+        ) from exc
+
+
+def geocode_with_fallback(city: str, *, region: Optional[str] = None) -> tuple[dict[str, Any], str]:
     """正向地理编码降级链:**高德主 → Photon → Nominatim**(TASK-9c)。
 
     返回 ``({"lat", "lng", "display_name"}, "amap"|"photon"|"nominatim")``。任一腿抛
@@ -287,7 +390,12 @@ def geocode_with_fallback(city: str) -> tuple[dict[str, Any], str]:
     前两腿刻意用宽 ``except Exception``:它们只是"尽力而为的主路径",任何异常
     (包括单测 ``no_network`` 兜底抛的 ``AssertionError``)都只该让它让位给下一腿,
     而不是把整条起点解析打挂 —— 真正的失败判定交给末腿 Nominatim。
+
+    ``region``(TASK-25):``overseas`` → 整条改走 :func:`geocode_overseas`(境外链,不打高德);
+    ``None``(默认)/ ``domestic`` / 垃圾值 → 现状三腿链**一字不改**(既有调用点与单测零改动)。
     """
+    if is_overseas_region(region):
+        return geocode_overseas(city)
     cleaned = (city or "").strip()
     if not cleaned:
         raise ValueError("起点城市不能为空")
@@ -310,13 +418,15 @@ def geocode_with_fallback(city: str) -> tuple[dict[str, Any], str]:
         ) from exc
 
 
-def default_geocoder(city: str) -> dict[str, Any]:
+def default_geocoder(city: str, *, region: Optional[str] = None) -> dict[str, Any]:
     """起点解析的默认实现:城市名 → ``{city, name, lat, lng, geocoder}``。
 
     走 :func:`geocode_with_fallback`(高德主 + Photon/Nominatim 降级);``geocoder`` 只是
     给 API 层标注"谁答的",:func:`resolve_origin` 会把它摘掉,origin 形状不变。
+
+    ``region``(TASK-25)透传给降级链:``overseas`` → 境外链(Nominatim/Photon),其余照旧。
     """
-    geo, geocoder = geocode_with_fallback(city)
+    geo, geocoder = geocode_with_fallback(city, region=region)
     return {
         "city": city,
         "name": geo["display_name"],
@@ -332,9 +442,10 @@ def resolve_origin(
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     geocoder: Optional[GeocodeFn] = None,
+    region: Optional[str] = None,
 ) -> dict[str, Any]:
     """解析起点:调用方给了坐标就直接用,否则查地理编码降级链(会触网)。"""
-    origin, _ = resolve_origin_with_source(city, lat=lat, lng=lng, geocoder=geocoder)
+    origin, _ = resolve_origin_with_source(city, lat=lat, lng=lng, geocoder=geocoder, region=region)
     return origin
 
 
@@ -344,12 +455,18 @@ def resolve_origin_with_source(
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     geocoder: Optional[GeocodeFn] = None,
+    region: Optional[str] = None,
 ) -> tuple[dict[str, Any], str]:
     """同 :func:`resolve_origin`,另外回报这次是哪个地理编码源答的。
 
     ``geocoder``(``"amap"|"photon"|"nominatim"|"none"``)只作为**第二个返回值**给 API 用,
     不进 origin 字典 —— origin 的 city/name/lat/lng 四字段是前端与既有单测认定的唯一形状。
     调用方直接给了坐标时没有源参与,报 ``"none"``。
+
+    ``region``(TASK-25)只影响**默认实现**走哪条链:``overseas`` → :func:`geocode_overseas`。
+    给了 ``lat``/``lng`` 的坐标退化路径与 ``region`` 无关(坐标已知,不必问地理编码源);
+    注入的 ``geocoder`` 替身多半是 ``(city)`` 单参签名,所以按 :func:`_accepts_kwarg`
+    **只给它认的关键字**(既有单测口径零改动,与 :func:`_fetcher_kwargs` 同一套路)。
     """
     cleaned = (city or "").strip()
     if not cleaned:
@@ -361,7 +478,8 @@ def resolve_origin_with_source(
             {"city": cleaned, "name": cleaned, "lat": float(lat), "lng": float(lng)},
             GEOCODER_NONE,
         )
-    geo = dict((geocoder or default_geocoder)(cleaned))
+    resolver = geocoder or default_geocoder
+    geo = dict(resolver(cleaned, **_geocoder_kwargs(resolver, region)))
     # 统一成 {city, name, lat, lng} 四个字段,API/前端只看这一种形状。
     origin = {
         "city": str(geo.get("city") or cleaned),
@@ -373,11 +491,17 @@ def resolve_origin_with_source(
     return origin, str(geo.get("geocoder") or GEOCODER_NOMINATIM)
 
 
+def _geocoder_kwargs(resolver: GeocodeFn, region: Optional[str]) -> dict[str, Any]:
+    """按替身签名挑它**认**的关键字:境内外口径(``region``,TASK-25)。"""
+    return {"region": region} if _accepts_kwarg(resolver, "region") else {}
+
+
 def reverse_with_fallback(
     lat: float,
     lng: float,
     *,
     zoom: int = REVERSE_ZOOM,
+    region: Optional[str] = None,
 ) -> tuple[dict[str, Any], str]:
     """逆地理编码降级链:**高德主 → Photon → Nominatim**(TASK-9c)。
 
@@ -385,7 +509,12 @@ def reverse_with_fallback(
     Nominatim 用得上(高德与 Photon 的 reverse 固定返回最近地点,不收 zoom);宽 ``except``
     的理由同 :func:`geocode_with_fallback`。三腿全失败时抛 :class:`DataSourceError`,
     由 :func:`resolve_reverse_origin` 兜成坐标起点(**不是** HTTP 错误)。
+
+    ``region``(TASK-25):``overseas`` → 改走 :func:`reverse_overseas`(**跳过高德腿**,
+    境外 GPS 问高德只会反查出国内行政区);其余取值 → 现状三腿链一字不改。
     """
+    if is_overseas_region(region):
+        return reverse_overseas(lat, lng, zoom=zoom)
     reasons: list[str] = []
     try:
         return amap_reverse(float(lat), float(lng)), GEOCODER_AMAP
@@ -406,9 +535,44 @@ def reverse_with_fallback(
         ) from exc
 
 
-def default_reverse_geocoder(lat: float, lng: float, zoom: int = REVERSE_ZOOM) -> dict[str, Any]:
+def reverse_overseas(
+    lat: float,
+    lng: float,
+    *,
+    zoom: int = REVERSE_ZOOM,
+) -> tuple[dict[str, Any], str]:
+    """**境外**逆地理编码链:**Photon 主 → Nominatim 兜底**,**不打高德**(TASK-25)。
+
+    方向与 :func:`services.region_gate.detect_region_coords` 同向(那边实测 Photon reverse
+    境外坐标 3/3 正确);返回形状与 :func:`reverse_with_fallback` 一致。两腿都失败抛
+    :class:`DataSourceError`,由 :func:`resolve_reverse_origin` 兜成坐标起点(仍是 HTTP 200)。
+    """
+    latitude, longitude = float(lat), float(lng)
+    reasons: list[str] = []
+    try:
+        return dict(ds_photon_reverse(latitude, longitude)), GEOCODER_PHOTON
+    except Exception as exc:  # noqa: BLE001 - 中间腿失败只降级,不上抛(见 geocode_with_fallback)
+        reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
+    try:
+        return dict(ds_reverse(latitude, longitude, zoom=int(zoom))), GEOCODER_NOMINATIM
+    except DataSourceError as exc:
+        reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
+        raise DataSourceError(
+            REVERSE_CHAIN_OVERSEAS,
+            f"境外逆地理编码两个源都失败,无法反查 ({latitude:.6f},{longitude:.6f}):"
+            + ";".join(reasons),
+        ) from exc
+
+
+def default_reverse_geocoder(
+    lat: float,
+    lng: float,
+    zoom: int = REVERSE_ZOOM,
+    *,
+    region: Optional[str] = None,
+) -> dict[str, Any]:
     """默认的**逆**地理编码:坐标 → ``{lat, lng, display_name, geocoder}``(高德主 + Photon/Nominatim 降级)。"""
-    geo, geocoder = reverse_with_fallback(lat, lng, zoom=zoom)
+    geo, geocoder = reverse_with_fallback(lat, lng, zoom=zoom, region=region)
     return {**geo, "geocoder": geocoder}
 
 
@@ -446,13 +610,14 @@ def resolve_reverse_origin(
     *,
     reverse_geocoder: Optional[ReverseGeocodeFn] = None,
     zoom: int = REVERSE_ZOOM,
+    region: Optional[str] = None,
 ) -> dict[str, Any]:
     """浏览器"我的位置" → 起点(**反查失败不报错**,降级成坐标起点)。
 
     细节(坐标口径、降级条件、``geocoder`` 标注)见 :func:`resolve_reverse_origin_with_source`。
     """
     origin, _ = resolve_reverse_origin_with_source(
-        lat, lng, reverse_geocoder=reverse_geocoder, zoom=zoom
+        lat, lng, reverse_geocoder=reverse_geocoder, zoom=zoom, region=region
     )
     return origin
 
@@ -463,6 +628,7 @@ def resolve_reverse_origin_with_source(
     *,
     reverse_geocoder: Optional[ReverseGeocodeFn] = None,
     zoom: int = REVERSE_ZOOM,
+    region: Optional[str] = None,
 ) -> tuple[dict[str, Any], str]:
     """同 :func:`resolve_reverse_origin`,另外回报这次是哪个地理编码源答的。
 
@@ -476,6 +642,10 @@ def resolve_reverse_origin_with_source(
     高德、Photon 与 Nominatim 都挂了/被限流、或返回的 ``display_name`` 里挑不出城市时,
     返回 ``resolved=False`` + :func:`unnamed_origin` 兜底名 —— API 层照常 200,
     前端地图照样能画环、能查库,只是起点名不好看。
+
+    ``region``(TASK-25)只影响**默认实现**走哪条链:``overseas`` → :func:`reverse_overseas`
+    (Photon 主 → Nominatim 兜底,不问高德);注入的 ``reverse_geocoder`` 替身是
+    ``(lat, lng)`` 两参签名,照旧原样调用(既有单测口径零改动)。
     """
     latitude = float(lat)
     longitude = float(lng)
@@ -487,7 +657,7 @@ def resolve_reverse_origin_with_source(
         "resolved": False,
     }
     # 注入的替身保持 (lat, lng) 两参;真实实现才需要 zoom(区县级反查更稳)
-    lookup = reverse_geocoder or (lambda point_lat, point_lng: default_reverse_geocoder(point_lat, point_lng, zoom=zoom))
+    lookup = reverse_geocoder or _reverse_lookup(zoom=zoom, region=region)
     try:
         geo = dict(lookup(latitude, longitude) or {})
     except (DataSourceError, ValueError, TypeError):
@@ -505,6 +675,23 @@ def resolve_reverse_origin_with_source(
     }
     # 注入的替身不带 geocoder 字段,它们顶的是 Nominatim 那一腿(既有单测口径)。
     return origin, str(geo.get("geocoder") or GEOCODER_NOMINATIM)
+
+
+def _reverse_lookup(*, zoom: int, region: Optional[str]) -> ReverseGeocodeFn:
+    """真实逆向实现的适配器:替身只收 ``(lat, lng)``,真链路还要 ``zoom`` 与 ``region``。
+
+    ``region`` 按 :func:`_accepts_kwarg` **只在真实现认它的时候才传** —— 既有单测注入的
+    ``default_reverse_geocoder`` 替身是 ``(lat, lng, zoom=10)`` 三参签名,不能因为加了
+    境内外口径就报 ``TypeError``(与 :func:`_geocoder_kwargs` 同一套路)。
+    """
+
+    def lookup(point_lat: float, point_lng: float) -> Mapping[str, Any]:
+        kwargs: dict[str, Any] = {"zoom": zoom}
+        if _accepts_kwarg(default_reverse_geocoder, "region"):
+            kwargs["region"] = region
+        return default_reverse_geocoder(point_lat, point_lng, **kwargs)
+
+    return lookup
 
 
 def band_bbox(lat: float, lng: float, radius_m: float) -> tuple[float, float, float, float]:

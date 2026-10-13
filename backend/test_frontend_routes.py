@@ -1053,10 +1053,11 @@ def geocode_session(monkeypatch: pytest.MonkeyPatch, page_session):
     """替身地理编码降级链:正向答 photon、逆向双失败降级成 none(坐标起点)。"""
     origin = {"lat": 31.2304, "lng": 121.4737, "name": "上海", "city": "上海"}
     monkeypatch.setattr(place_loader, "resolve_origin_with_source",
-                        lambda city: (dict(origin), place_loader.GEOCODER_PHOTON))
+                        lambda city, region=None: (dict(origin), place_loader.GEOCODER_PHOTON))
     monkeypatch.setattr(
         place_loader, "resolve_reverse_origin_with_source",
-        lambda lat, lng, zoom=None: ({**origin, "resolved": False}, place_loader.GEOCODER_NONE),
+        lambda lat, lng, zoom=None, region=None: ({**origin, "resolved": False},
+                                                  place_loader.GEOCODER_NONE),
     )
     return page_session
 
@@ -3501,3 +3502,60 @@ def test_topbar_city_input_has_min_width_and_row_can_wrap(html: str) -> None:
     # 回归:输入框不许再是 width:100% 独占(那是被挤扁的直接原因)
     city_input = html[html.index('<input id="city"'):html.index('<input id="city"') + 200]
     assert 'style="width:100%"' not in city_input, "起点输入框不许内联钉死 100% 宽"
+
+
+# =========================================================================== #
+# TASK-25(境外模式:地理编码不再走高德)—— 前端**只**改「境外模式」label 的 title 文案
+#
+# 后端把 region 变成真正驱动解析链的口径(overseas → Nominatim 主 / Photon 兜底 + 国家码守卫,
+# 不再被高德吸附到国内同名 POI:因特拉肯→成都、皇后镇→安阳、巴黎→高雄),前端一行逻辑都不用动:
+# `regionQuery()` / `isOverseasTrack()` 照旧。这里守两件事:① title 要说清"勾上后坐标解析改走
+# OSM 系、不再用高德"(让神朱这类用户明白开关到底改了什么);② 顶栏 CSS 修复(commit 8e6895d)
+# 与 TASK-21/23 的 region 透传逻辑**不许被顺带回退**。
+# =========================================================================== #
+
+
+def overseas_label(html: str) -> str:
+    """顶栏「境外模式」那个 ``<label>…</label>`` 整块(含 title)。"""
+    start = html.index('<input type="checkbox" id="regionOverride"')
+    return html[html.rindex("<label", 0, start):html.index("</label>", start) + len("</label>")]
+
+
+def test_task25_overseas_label_title_says_osm_geocoding(html: str) -> None:
+    title = re.search(r'title="([^"]*)"', overseas_label(html)).group(1)
+    assert "Nominatim" in title or "OSM 系" in title, "title 要写明改走 OSM 系(Nominatim/Photon)"
+    assert "不再用高德" in title, "要说清高德不再参与坐标解析(用户才知道开关改了什么)"
+    assert "region=overseas" in title, "既有说明(城市搜索带 region=overseas)不许丢"
+    assert "自动判定" in title, "既有说明(不勾则后端自动判定)不许丢"
+
+
+def test_task25_overseas_label_structure_unchanged(html: str) -> None:
+    """只改 title 字符串:结构/属性一个不动,也不新增任何 key 输入。"""
+    label = overseas_label(html)
+    assert ('<label style="display:flex;align-items:center;gap:4px;margin:0;'
+            'font-weight:400;white-space:nowrap"') in label, "label 的内联样式不许动"
+    assert '<input type="checkbox" id="regionOverride" style="width:auto"> 境外模式</label>' in label
+    assert label.count("<input") == 1 and label.count("title=") == 1, "只改 title,不加元素/属性"
+    assert "data-" not in label and "key" not in label.lower(), "开关不存任何 key/密钥"
+
+
+def test_task25_region_plumbing_and_topbar_css_not_regressed(html: str) -> None:
+    """TASK-21/23 的 region 透传与 commit 8e6895d 的顶栏布局修复都不许被顺带回退。"""
+    assert 'function regionQuery(){return regionOverride?"&region=overseas":"";}' in html, \
+        "城市搜索的 region 透传照旧"
+    assert ('function isOverseasTrack(){return regionOverride||'
+            'String(regionSeen||"").toLowerCase()==="overseas";}') in html, \
+        "routes/stays 的双轨判定照旧(TASK-23 QA 修正)"
+    flat = html[html.index("<style>"):html.index("</style>")].replace(" ", "").replace("\n", "")
+    for guard in (".field-city{flex:21320px;min-width:280px}", ".field-narrow{flex:01150px",
+                  ".inline{display:flex;gap:8px;flex-wrap:wrap", "min-width:150px",
+                  ".inline>button,.inline>label{flex:00auto}"):
+        assert guard in flat, f"顶栏布局修复被回退了:{guard}"
+
+
+@pytest.mark.skipif(NODE is None, reason="环境未安装 node,跳过内联脚本语法检查")
+def test_task25_inline_js_passes_node_check(html: str, tmp_path: Path) -> None:
+    script = tmp_path / "task25_inline.js"
+    script.write_text(inline_script(html), encoding="utf-8")
+    result = subprocess.run([NODE, "--check", str(script)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"内联脚本语法错误:\n{result.stderr}"

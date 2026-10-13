@@ -3462,3 +3462,42 @@ def test_task23_locate_button_serves_both_tracks(html: str) -> None:
         "定位这段与引擎无关:GPS 的 WGS-84 坐标由境外轨直用"
     assert 'params.set("region"' not in leaflet_section(html), \
         "切轨只认后端回报的 region,不在前端硬拼检索参数"
+
+
+# =========================================================================== #
+# 顶栏起点行布局(神朱 2026-10-13 报「输入框只有半个字的空间、我的位置与后面重叠」)
+#
+# 病根:旧口径 `.field{flex:1}` 让 起点/分段/分类 三格平分,而起点格里的 `.inline`
+# 塞了 输入框 + 搜索 + 境外模式 + 我的位置,`input{width:100%}` 在 flex 里被压到
+# **22px = 0 个中文字**(实测 800px/1280px 两档都是 22px)——默认值「上海」既看不见
+# 也删不掉,用户输入被拼成「新西伯利亚上海」→ 后端解析回上海(OriginCache 留有铁证)。
+# 修法:起点格 flex:2 1 320px / min-width 280px,分段与分类改 flex:0 1 150px,
+# `.inline` 允许换行、输入框保底 min-width:150px(≥6 个中文字),按钮/label 不参与伸缩。
+# =========================================================================== #
+
+def test_topbar_city_field_gets_priority_flex(html: str) -> None:
+    """起点城市那一格必须比 分段/分类 拿更多宽度(旧口径三格平分把输入框挤成 22px)。"""
+    css = html[html.index("<style>"):html.index("</style>")]
+    assert ".field-city{flex:2 1 320px;min-width:280px}" in css.replace(" ", "").replace("\n", "") \
+        or ".field-city{flex:2 1 320px" in css, \
+        "起点格要 flex:2 1 320px + min-width:280px(权重高于 .field 的 flex:1)"
+    assert ".field-narrow{flex:0 1 150px" in css, \
+        "分段/分类格要收窄(flex:0 1 150px),把宽度让给起点输入框"
+    body = html[:html.index("<script>")]
+    assert '<div class="field field-city"><label for="city">' in body, "起点格挂 field-city"
+    assert body.count('class="field field-narrow"') == 2, "分段与分类两格都挂 field-narrow"
+
+
+def test_topbar_city_input_has_min_width_and_row_can_wrap(html: str) -> None:
+    """输入框保底宽度 ≥ 6 个中文字,且 `.inline` 允许换行(按钮挤不下时换行,不压输入框)。"""
+    css = html[html.index("<style>"):html.index("</style>")]
+    flat = css.replace(" ", "").replace("\n", "")
+    assert ".inline{display:flex;gap:8px;flex-wrap:wrap" in flat, \
+        ".inline 必须 flex-wrap:wrap(窄窗口下按钮换行,而不是把输入框挤扁)"
+    assert "min-width:150px" in flat[flat.index(".inline>"):], \
+        "输入框要有 min-width 下限(150px ≈ 10 个中文字,验收线是 ≥6)"
+    assert ".inline>button,.inline>label{flex:00auto}" in flat, \
+        "按钮/label 不参与伸缩(flex:0 0 auto),否则又会去抢输入框的宽度"
+    # 回归:输入框不许再是 width:100% 独占(那是被挤扁的直接原因)
+    city_input = html[html.index('<input id="city"'):html.index('<input id="city"') + 200]
+    assert 'style="width:100%"' not in city_input, "起点输入框不许内联钉死 100% 宽"

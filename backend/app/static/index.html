@@ -15,7 +15,16 @@
   label{font-weight:600;font-size:13px;display:block;margin-bottom:5px}
   .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
   .field{flex:1;min-width:150px}
-  .inline{display:flex;gap:8px}
+  /* 顶栏起点行(神朱 2026-10-13 报「输入框只有半个字、我的位置与后面重叠」):
+     起点城市那一格给足权重 + 输入框有 min-width 下限,窄窗口下按钮**换行**而不是把
+     输入框挤扁(旧口径 .field{flex:1} 三格平分 + input{width:100%} 在 .inline 里
+     被搜索/境外模式/我的位置挤到 22px = 0 个中文字,默认值「上海」删不掉,
+     用户输入被拼成「新西伯利亚上海」→ 解析回上海)。 */
+  .field-city{flex:2 1 320px;min-width:280px}
+  .field-narrow{flex:0 1 150px;min-width:120px}
+  .inline{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .inline>input[type=text],.inline>#city{flex:1 1 150px;min-width:150px}
+  .inline>button,.inline>label{flex:0 0 auto}
   input,select{width:100%;padding:9px 10px;border:1px solid #d1d5db;border-radius:8px;font-size:14px;box-sizing:border-box}
   button{background:#0f766e;color:#fff;border:none;padding:10px 16px;border-radius:8px;font-size:14px;cursor:pointer;white-space:nowrap}
   button.secondary{background:#e5e7eb;color:#1f2937}
@@ -347,7 +356,7 @@
 <main>
   <div class="card">
     <div class="row">
-      <div class="field"><label for="city">起点城市 / 我的位置</label>
+      <div class="field field-city"><label for="city">起点城市 / 我的位置</label>
         <div class="inline">
           <input id="city" value="上海" placeholder="如:北京、上海、崇礼" autocomplete="off" list="cityList">
           <datalist id="cityList"></datalist>
@@ -362,8 +371,8 @@
                   title="用浏览器定位(GPS)反查起点城市;不支持或被拒绝时只给提示,不影响城市搜索">📍 我的位置</button>
         </div>
       </div>
-      <div class="field"><label for="band">距离分段(环形,互斥)</label><select id="band"></select></div>
-      <div class="field"><label for="category">分类</label><select id="category"></select></div>
+      <div class="field field-narrow"><label for="band">距离分段(环形,互斥)</label><select id="band"></select></div>
+      <div class="field field-narrow"><label for="category">分类</label><select id="category"></select></div>
       <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
         <div class="inline">
           <button id="reload" class="secondary" title="忽略库缓存,重新抓一次高德四分类检索(v3 place/around + place/polygon)">重新抓取</button>

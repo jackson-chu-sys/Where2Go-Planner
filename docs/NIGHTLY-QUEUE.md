@@ -1066,6 +1066,18 @@
 
 ---
 
+## [TASK-25] 境外模式下地理编码仍走高德 → 定位到国内同名 POI(神朱 2026-10-13 直报 bug)
+
+- 状态: pending
+- 背景: 神朱 2026-10-13 两个反馈之一(另一个=顶栏输入框被挤成 22px,已由 commit `8e6895d` 当场修掉)。实测坐实:`/api/geocode?city=因特拉肯&region=overseas` 返回 **geocoder=amap、name=四川省成都市双流区因特拉肯(东北门)**——`region` 只是个标签,坐标仍走高德主链,而高德对境外中文名会 status=1 成功吸附国内同名 POI(皇后镇→安阳林州、巴黎→高雄、新加坡→长武县、吉隆坡→凯里、北海道→香港)。OriginCache 已积累 **13 行 amap 脏缓存**(含 `札幌上海`/`新西伯利亚上海` 这类被挤扁输入框拼接出来的行)。对照实测:Nominatim zh-CN 对同批 8 个境外中文名 **8/8 全中**(country_code + 坐标都对)。
+- 目标: 境外解析链 = **Nominatim 主 → Photon 兜底**(不打高德),并加**国家码守卫**(某腿判出 CN = 错配,当失败降级);`region` 参数从 API 一路贯通到 place_loader 的解析函数;**自动判定为 overseas 时也走境外链**(不只 override 才生效);缓存加两道一致性闸(生效 region 与缓存不一致 / 缓存 geocoder=amap 但本次 overseas → 视为未命中并覆盖写回 = 脏缓存自愈,不写一次性脚本);逆向「我的位置」同理(境外 GPS 不问高德)。前端只改境外模式 label 的 title 文案。
+- 契约: **逐字执行 `docs/TASK-25-CONTRACT.md`**(含 §0 四组实测数据、§1 精确签名、§2 ≥20 测试用例分组、§3 禁止项与真机冒烟步骤)——R9 已满足,勿再自行探索仓库。
+- 涉及: backend/services/place_loader.py(新增 geocode_overseas + region 贯通)、backend/app/api/places.py(geocode_city/reverse_geocode)、backend/app/static/index.html(仅 label title)、backend/test_geocode_overseas.py(新)、backend/test_frontend_routes.py(追加)
+- 验收: pytest 零回归(基线 **1572 passed**)+ ≥20 新增全 mock;`/api/geocode`、`/api/places`、`/api/routes`、`/api/stays` 响应键逐键零变化;境内(高德)链路零回归;脏缓存靠一致性闸自愈(不新增清库脚本);真机冒烟 5 步见契约 §3;顶栏 CSS 修复(`8e6895d`)不得回退。
+- 结果: (待夜班回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 
 ## [TASK-xxx] 标题

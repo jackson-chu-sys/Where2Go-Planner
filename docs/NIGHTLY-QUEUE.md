@@ -1068,13 +1068,19 @@
 
 ## [TASK-25] 境外模式下地理编码仍走高德 → 定位到国内同名 POI(神朱 2026-10-13 直报 bug)
 
-- 状态: pending
+- 状态: done
 - 背景: 神朱 2026-10-13 两个反馈之一(另一个=顶栏输入框被挤成 22px,已由 commit `8e6895d` 当场修掉)。实测坐实:`/api/geocode?city=因特拉肯&region=overseas` 返回 **geocoder=amap、name=四川省成都市双流区因特拉肯(东北门)**——`region` 只是个标签,坐标仍走高德主链,而高德对境外中文名会 status=1 成功吸附国内同名 POI(皇后镇→安阳林州、巴黎→高雄、新加坡→长武县、吉隆坡→凯里、北海道→香港)。OriginCache 已积累 **13 行 amap 脏缓存**(含 `札幌上海`/`新西伯利亚上海` 这类被挤扁输入框拼接出来的行)。对照实测:Nominatim zh-CN 对同批 8 个境外中文名 **8/8 全中**(country_code + 坐标都对)。
 - 目标: 境外解析链 = **Nominatim 主 → Photon 兜底**(不打高德),并加**国家码守卫**(某腿判出 CN = 错配,当失败降级);`region` 参数从 API 一路贯通到 place_loader 的解析函数;**自动判定为 overseas 时也走境外链**(不只 override 才生效);缓存加两道一致性闸(生效 region 与缓存不一致 / 缓存 geocoder=amap 但本次 overseas → 视为未命中并覆盖写回 = 脏缓存自愈,不写一次性脚本);逆向「我的位置」同理(境外 GPS 不问高德)。前端只改境外模式 label 的 title 文案。
 - 契约: **逐字执行 `docs/TASK-25-CONTRACT.md`**(含 §0 四组实测数据、§1 精确签名、§2 ≥20 测试用例分组、§3 禁止项与真机冒烟步骤)——R9 已满足,勿再自行探索仓库。
 - 涉及: backend/services/place_loader.py(新增 geocode_overseas + region 贯通)、backend/app/api/places.py(geocode_city/reverse_geocode)、backend/app/static/index.html(仅 label title)、backend/test_geocode_overseas.py(新)、backend/test_frontend_routes.py(追加)
 - 验收: pytest 零回归(基线 **1572 passed**)+ ≥20 新增全 mock;`/api/geocode`、`/api/places`、`/api/routes`、`/api/stays` 响应键逐键零变化;境内(高德)链路零回归;脏缓存靠一致性闸自愈(不新增清库脚本);真机冒烟 5 步见契约 §3;顶栏 CSS 修复(`8e6895d`)不得回退。
-- 结果: (待夜班回填)
+- 结果: **完成**(代码由 2026-10-13 白天主会话派 Codex 落地,commit `0cf0762`;**夜班执行器本轮只做验收+真机冒烟**,未重复写码)。
+  - 代码产物(Codex,6 文件 +1365/-83):`services/place_loader.py` 新增 `geocode_overseas`(Nominatim 主→Photon 兜底,每腿 `include_country=True` 一次拿坐标+国家码,`_require_overseas_code` 守卫判 CN/空即降级)、`photon_geocode_overseas`、境外逆向链 `reverse_overseas`(Photon 主→Nominatim 兜底);常量 `GEOCODER_CHAIN_OVERSEAS`/`REVERSE_CHAIN_OVERSEAS`(源名不含高德);region 贯通 geocode_with_fallback / default_geocoder / resolve_origin(_with_source) / reverse_with_fallback / default_reverse_geocoder / resolve_reverse_origin(_with_source)(默认 None = 现状行为,既有单测零改动);境外 WGS-84 直用不做 GCJ-02。`app/api/places.py`:生效 region(override > 缓存行 > 现场判定)真正驱动解析链;缓存命中加两道一致性闸 `_cache_row_is_consistent`(region 串轨 / amap×overseas)→ 脏行再搜即自愈覆盖写回,未写一次性清库脚本;`_region_write_back` 被一致性闸取代故移除;reverse_geocode 先 `detect_region_coords` 再透传 region(境外 GPS 不问高德,判定只调一次);响应键与形状逐键零变化,非法 region 仍 400 中文,境外两腿全败 400 且消息带两腿原因。前端 index.html **只改**「境外模式」label 的 title。测试:新增 `test_geocode_overseas.py` **47 例**(契约 §2 第 1~6 组)+ `test_frontend_routes.py` +4 例(第 7 组)+ `test_region_gate.py` 按新口径校准 5 处既有断言。
+  - 验收数字(执行器本轮实跑):`cd backend && ../.venv/bin/python -m pytest -q` = **1623 passed**(1572 基线零回归 + 51 新增,121.98s);`amap × region=overseas` 缓存行 = **0**;顶栏 CSS 修复(`8e6895d`)与 regionQuery()/isOverseasTrack() 未回退(守卫断言在测)。
+  - 真机冒烟(契约 §3 ①-④ 全过,uvicorn :8000 已在跑新代码):①`/api/geocode?city=因特拉肯&region=overseas` → **geocoder=nominatim、name=「因特拉肯, Interlaken-Oberhasli …, 瑞士」、lat/lng=46.6855231/7.8585139**(不再是成都双流 30.482/104.100);②不带 region 搜「皇后镇」→ 自动判定 overseas、nominatim、**-45.0321923/168.661 新西兰**(不再是安阳林州);③二次查因特拉肯 → **0.016s 命中缓存、坐标仍正确**(脏行已被覆盖自愈;另抽查「巴黎」photon 脏行→nominatim 法国 48.8535/2.3484、「吉隆坡」amap 脏行→nominatim 马来西亚 3.1517/101.6942,一致性闸均生效);④`/api/geocode?city=上海` → **geocoder=amap、region=domestic、31.230525/121.473667 不变**(境内零回归)。
+  - browser_exec 真机 QA(§3 ⑤):勾「境外模式」→ 搜「因特拉肯」→ 地图切 **Leaflet 境外轨(amap-container 不可见)**、`/api/places?...&region=overseas` 200 且坐标为瑞士、境外冷抓入库 **30 条**(50-100km 段,来源「OSM 实时抓取 → 已入库」)、AI 推荐置顶 5 条(Verbier;Savoleyres 滑雪场 距起点 80.9km 等,均为瑞士真实 POI)、列表已显示 16 条、**window error 0 条**;`/api/geocode` 首次调用出现过一次 400(前端境外轨预热竞态),重试即 200,不影响渲染,已记录待观察。
+  - **Codex 256K 窗口统计(rollout-2026-10-13T14-56-16)**:单次调用 **33.5min**(14:56-15:29 UTC,40min 止损线内)、function_calls **81**、首轮写码(apply_patch)启动后 **10.5min**(R8 12min 线内)、total_tokens **6,158,728**(其中 cached_input 5.90M / output 76,812 / reasoning 41,235),零 compact、零「读→忘→重读」回圈。
+  - 备注:队列里该条 10/13 已由主会话派 Codex 并提交,夜班执行器按纪律先查产物目录+git log 发现已完成,**未双跑**,本轮转为验收+回填(10/5 阶段二同款处置)。
 
 ---
 

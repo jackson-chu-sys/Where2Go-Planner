@@ -1846,6 +1846,14 @@ function applyOrigin(data){
   state.geocoder=String(data.geocoder||"");
   // 境内外口径(TASK-20):两条地理编码路由都会带 region(domestic/overseas),状态栏照实显示
   regionSeen=String(data.region||"");
+  // TASK-26:勾着「境外模式」搜到境内城市时,后端按 CN 证据自动降级(note 说明)——
+  // 开关跟着证据关掉,免得接下来的 /api/places 还带 region=overseas 走境外轨
+  if(data.note&&regionOverride&&String(regionSeen).toLowerCase()==="domestic"){
+    regionOverride=false;
+    const cb=$("regionOverride");if(cb)cb.checked=false;
+    rememberRegionOverride(false);
+    showNote(data.note,false);
+  }
   // 地图引擎双轨(TASK-23):境外 → 懒加载 Leaflet 后切轨(就绪前的 drawRings/drawPins 会静默跳过,
   // 就绪时由 redrawMapTrack() 补画一遍);境内 → 高德轨照旧。勾着「境外模式」开关也算境外。
   syncMapEngine(regionSeen).catch(()=>{});

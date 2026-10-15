@@ -1359,7 +1359,9 @@ def test_geocode_contract_returns_geocoder(html: str, geocode_session) -> None:
     for body in (city, reverse):
         assert body["geocoder"] in labels, f"geocoder={body['geocoder']} 在状态栏没有对应文案"
     origin = html[html.index("function applyOrigin"):html.index("function locateMe")]
-    assert not (referenced_fields(origin, "data") - set(city) - {"resolved"}), \
+    # TASK-26:「境外模式搜境内城市」被 CN 证据降级时响应多一个 note 键(常规响应没有),
+    # applyOrigin 读 data.note 属合法契约键 → 白名单放行。
+    assert not (referenced_fields(origin, "data") - set(city) - {"resolved", "note"}), \
         "applyOrigin 只能读 /api/geocode(+/reverse)真的会给的键"
 
 

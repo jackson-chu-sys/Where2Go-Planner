@@ -139,6 +139,12 @@ ORIGIN_CACHE_GEOCODERS = frozenset(
 # 统一是 400 中文报错,所以在函数体里自己校验(见 :func:`_region_override`)。
 REGION_CHOICES = frozenset(region_gate.REGIONS)
 REGION_INVALID_MSG = "region 只支持 domestic 或 overseas"
+# TASK-26:勾着「境外模式」但 Nominatim 判出 CN(城市其实在境内)→ 自动降级回境内链,
+# 响应多一个 note 说明(常规响应不带这个键,LEGACY 键集零变化)。
+DOMESTIC_DOWNGRADE_NOTE = (
+    "「{city}」在境内,已按境内口径解析(高德)。当前勾着「境外模式」,"
+    "搜境内城市可关掉该开关。"
+)
 META_NOTE = (
     "分段:环形互斥,检索按 band 分组打高德 v3(下限 0 走 place/around 单圆,下限 > 0 走"
     "包围盒分格 place/polygon + 本地环带收敛;每组独立配额,selectors = 该组的 typecode 数 + 关键词组数);"
@@ -901,6 +907,18 @@ def geocode_city(
     determined = override is not None or (
         detected is not None and detected["detector"] != region_gate.DETECTOR_NONE
     )
+    # TASK-26:勾着「境外模式」但缓存行已是**境内证据坐实**的降级行(amap 只答境内、
+    # region=domestic 只由判定/降级写入)→ 直接按境内命中,不再走境外链被守卫弹回来。
+    downgraded = False
+    if (
+        fresh
+        and override == region_gate.REGION_OVERSEAS
+        and cached_region == region_gate.REGION_DOMESTIC
+        and str(getattr(cached, "geocoder", "") or "").strip().lower()
+        == place_loader.GEOCODER_AMAP
+    ):
+        resolved_region = cache_region = region_gate.REGION_DOMESTIC
+        downgraded = True
     if fresh and _cache_row_is_consistent(
         cached, resolved_region, cached_region=cached_region, determined=determined
     ):
@@ -917,6 +935,21 @@ def geocode_city(
             origin, geocoder = place_loader.resolve_origin_with_source(
                 cleaned, region=resolved_region
             )
+        except place_loader.DomesticMismatchError as exc:
+            # TASK-26:境外链拿到 CN 正面证据(神朱 10/14 直报:勾境外模式搜上海 → 400)
+            # → 自动降级回境内高德链重解析,按 domestic 口径回报并写缓存,不再是错误。
+            try:
+                origin, geocoder = place_loader.resolve_origin_with_source(cleaned)
+            except ValueError as inner:
+                raise HTTPException(400, str(inner)) from inner
+            except DataSourceError as inner:
+                # 境内链也答不出(高德没 key/断网):两条链的原因一起报,便于分辨故障
+                raise HTTPException(
+                    400, f"无法解析城市 '{cleaned}':{exc};境内降级链也失败:{inner}"
+                ) from inner
+            resolved_region = region_gate.REGION_DOMESTIC
+            cache_region = region_gate.REGION_DOMESTIC
+            downgraded = True
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         except DataSourceError as exc:
@@ -932,13 +965,17 @@ def geocode_city(
                 region=cache_region,
             )
             session.commit()
-    return {
+    payload: dict[str, Any] = {
         "origin": origin,
         "geocoder": geocoder,
         "region": resolved_region,
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "segments": repo.segment_overview(session, origin_city=cleaned),
     }
+    if downgraded:
+        # 只在「境外模式被证据降级」时多这一个键(常规响应键集零变化,LEGACY 断言不破)
+        payload["note"] = DOMESTIC_DOWNGRADE_NOTE.format(city=cleaned)
+    return payload
 
 
 @router.get("/geocode/reverse")

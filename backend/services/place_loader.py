@@ -320,13 +320,32 @@ def _require_overseas_code(city: str, source: str, code: str) -> None:
     两种情况都判这一腿失败:① 国家码为空 = 这一腿没答上(与 :mod:`services.region_gate`
     同口径,不猜);② 国家码归类为 ``domestic`` = 这一腿把境外名错定位到了**国内同名 POI**
     (2026-10-13 实测:Photon 正向「巴黎」→ 高雄、「因特拉肯」→ 香港因特拉肯大道)。
+
+    TASK-26:② 改抛 :class:`DomesticMismatchError`(仍是 :class:`DataSourceError` 子类,
+    既有捕获口径零变化)——它可能是「城市真在境内」的**正面证据**而不只是错配,
+    :func:`geocode_overseas` 只对**可信腿**(Nominatim 主腿)让它上抛给 API 层降级,
+    Photon 腿的 CN 仍只当错配失败(见 geocode_overseas docstring)。
     """
     if not code:
         raise DataSourceError(source, f"{city!r} 的结果没有国家码,无法确认它在境外")
     if classify_country_code(code) == REGION_DOMESTIC:
-        raise DataSourceError(
+        raise DomesticMismatchError(
             source, f"{city!r} 被 {source} 定位到境内(国家码 {code}),境外链不接受这个结果"
         )
+
+
+class DomesticMismatchError(DataSourceError):
+    """境外链拿到 **CN 正面证据** = 该城市其实在境内(TASK-26)。
+
+    与普通腿失败(网络/空结果/答不出国家码)不同,这不是「错误」而是「证据」:
+    API 层(:func:`app.api.places.geocode_city`)捕获后**自动降级回境内高德链**重解析,
+    响应 ``region=domestic`` + ``note`` 说明,而不是 400 报「城市定位失败」
+    (神朱 2026-10-14 直报:勾着「境外模式」搜上海 → 守卫拒收 CN → 两腿全败 400)。
+
+    只有 **Nominatim 主腿**的 CN 判定才有资格触发降级:契约 TASK-25 §0 实测
+    Nominatim zh-CN 对中文地名 8/8 全中,而 Photon 对中文**境外**名会错定位到国内
+    (巴黎→高雄)——Photon 腿的 CN 只当该腿错配失败,不当境内证据。
+    """
 
 
 def photon_geocode_overseas(city: str) -> dict[str, Any]:
@@ -362,21 +381,28 @@ def geocode_overseas(city: str) -> tuple[dict[str, Any], str]:
     if not cleaned:
         raise ValueError("起点城市不能为空")
     reasons: list[str] = []
+    # TASK-26:Nominatim 主腿的 CN 判定 = 境内正面证据(8/8 全中的可信腿);Photon 腿的 CN
+    # 只当错配失败(它对中文境外名会错定位到国内)。记下来,双失败时决定抛哪种异常。
+    domestic_evidence: Optional[DomesticMismatchError] = None
     try:
         # include_country=True 的**这一次**结果既给坐标也给国家码,不再另调 detect_region
         place = dict(ds_geocode(cleaned, include_country=True))
         _require_overseas_code(cleaned, NOMINATIM_SOURCE, _country_code_of(place, "country_code"))
         return _geo_shape(place), GEOCODER_NOMINATIM
+    except DomesticMismatchError as exc:
+        domestic_evidence = exc
+        reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
     except Exception as exc:  # noqa: BLE001 - 中间腿失败只降级,不上抛(见 geocode_with_fallback)
         reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
     try:
         return photon_geocode_overseas(cleaned), GEOCODER_PHOTON
     except DataSourceError as exc:
         reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
-        raise DataSourceError(
-            GEOCODER_CHAIN_OVERSEAS,
-            f"境外地理编码两个源都失败,无法解析 {cleaned!r}:" + ";".join(reasons),
-        ) from exc
+        message = f"境外地理编码两个源都失败,无法解析 {cleaned!r}:" + ";".join(reasons)
+        if domestic_evidence is not None:
+            # 有 CN 正面证据 → 抛 DomesticMismatchError,API 层据此自动降级回境内链(TASK-26)
+            raise DomesticMismatchError(GEOCODER_CHAIN_OVERSEAS, message) from exc
+        raise DataSourceError(GEOCODER_CHAIN_OVERSEAS, message) from exc
 
 
 def geocode_with_fallback(city: str, *, region: Optional[str] = None) -> tuple[dict[str, Any], str]:

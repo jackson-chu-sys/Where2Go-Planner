@@ -1084,8 +1084,23 @@
 
 ---
 
-## 追加模板(新任务复制此段)
+## [TASK-26] 境外模式搜境内城市:国家码守卫判 CN 时自动降级回境内链(神朱 2026-10-14 拍板)
 
+- 状态: done
+- 背景: TASK-25 落地后,勾着「境外模式」搜境内城市(如上海)→ 境外链国家码守卫判 CN 拒收 → 两腿全败 400「城市定位失败」(神朱 10/14 直报,夜班当场复现:`/api/geocode?city=上海&region=overseas` → Nominatim 答 CN 被守卫拒 + Photon 超时 → 400)。守卫本身按设计工作(防「巴黎→高雄」错配),但**对真境内城市不该报错,该降级**。
+- 目标(神朱拍板口径):境外链任一腿拿到 **CN 正面证据**(DomesticMismatch)→ API 层**自动降级回境内高德链**重解析,响应 region=domestic、缓存写 domestic(下次不带 override 也命中零网络),并加 `note` 说明「已按境内解析,建议关掉境外模式」;两腿都是网络失败/空结果(无 CN 证据)仍 400 不变。境外城市(因特拉肯等)行为零变化。前端 searchCity 把 note 用 showNote 提示。
+- 涉及: backend/services/place_loader.py(DomesticMismatchError + _require_overseas_code/geocode_overseas 改抛)、backend/app/api/places.py(geocode_city 降级分支 + note 键)、backend/app/static/index.html(searchCity 提示)、backend/test_geocode_overseas.py(追加第 8 组)、backend/test_frontend_routes.py(静态断言)
+- 验收: pytest 零回归(基线 1623 passed,LEGACY 键断言按新增 note 键校准)+ ≥8 新增全 mock;真机冒烟:勾境外模式搜上海 → 200/amap/domestic/note 非空;搜因特拉肯 → 仍 nominatim/overseas;二次搜上海命中缓存零网络。
+- 结果: **完成**(2026-10-15 夜班,执行器手写收口——上一轮夜班已把主体代码写到工作区但未提交未验收,本轮修完 2 个测试问题后全量验证落地)。
+  - 实现口径(按神朱 10/14 拍板):`place_loader` 新增 `DomesticMismatchError`(DataSourceError 子类,既有捕获零变化);`_require_overseas_code` 判 CN 改抛它;**只有 Nominatim 主腿的 CN 算境内正面证据**(契约 TASK-25 §0 实测 zh-CN 8/8 全中),Photon 腿的 CN 仍只当错配失败(巴黎→高雄防线不松)。`geocode_overseas` 双失败时有 CN 证据抛 DomesticMismatch、无证据维持普通 400。API 层 `geocode_city` 捕获后自动降级回境内高德链:响应 `region=domestic`+`geocoder=amap`+`note`(「已按境内解析,建议关掉境外模式」),缓存写 domestic 行;降级行再被 overseas override 命中时直通缓存(零网络)。境内链也失败 → 400 报两条链原因。常规响应键集不变(note 只在降级时出现)。前端 `applyOrigin` 见 note+domestic → 关境外开关+showNote 提示。
+  - 本轮修复:①`test_frontend_routes.py` 契约断言按新增 note 键校准(applyOrigin 白名单);②`test_api_geocode_downgrade_when_amap_also_fails_reports_both_chains` 原 stub 让 Nominatim 无条件答 CN,境内降级链末腿反而成功、400 触发不了——改为按 include_country 分流(境外腿答 CN 造证据、境内腿失败)。
+  - pytest backend/ = **1631 passed**(1623 基线零回归 + 8 新增,全 mock;首跑曾有 1 例 intro_backfill 线程池偶发 flake,单跑与复跑全量均过,与本任务无关)。
+  - 真机冒烟(uvicorn :8000 已带 /opt/data/.env 重启):①境外模式搜上海 → 200/amap/domestic/note 非空(0.14s,含降级重解析+写缓存);②因特拉肯 → 仍 nominatim/overseas(瑞士 46.686/7.859,行为零变化);③二次搜上海(带 overseas override)→ 0.014s 缓存命中、仍带 note;④不带 override 常规响应无 note 键(LEGACY 五键不变)。
+  - 备注:test_frontend_routes.py 的 applyOrigin 契约断言是前后端字段一致性闸,以后 geocode 响应加键都要同步校准这处白名单。
+
+---
+
+## 追加模板(新任务复制此段)
 ## [TASK-xxx] 标题
 - 状态: 示例(勿执行;新任务复制本段并改成 pending)
 - 目标:

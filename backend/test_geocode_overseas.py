@@ -947,3 +947,156 @@ def test_geocode_overseas_source_has_no_amap_reference() -> None:
                    place_loader.reverse_overseas):
         source = inspect.getsource(target)
         assert "amap" not in source.lower(), f"{target.__name__} 不该碰高德"
+
+
+# --------------------------------------------------------------------------- #
+# 8. TASK-26:境外模式搜境内城市 → CN 证据自动降级回境内链(不再 400)
+# --------------------------------------------------------------------------- #
+
+
+def test_geocode_overseas_cn_evidence_raises_domestic_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Nominatim 主腿判 CN + Photon 也失败 → 抛 DomesticMismatchError(不是普通 DataSourceError)。"""
+    forbid_amap_forward(monkeypatch)
+    stub_nominatim(monkeypatch, NOMINATIM_CN)
+    stub_photon(monkeypatch, error=DataSourceError("Photon", "请求超时(>15s)"))
+
+    with pytest.raises(place_loader.DomesticMismatchError) as ctx:
+        place_loader.geocode_overseas("上海")
+
+    message = str(ctx.value)
+    assert "境外地理编码两个源都失败" in message
+    assert "Nominatim=" in message and "Photon=" in message, "两腿原因仍要报全"
+    assert issubclass(place_loader.DomesticMismatchError, DataSourceError), "既有捕获口径零变化"
+
+
+def test_geocode_overseas_photon_cn_alone_is_not_domestic_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Photon 腿判 CN **不算**境内证据(巴黎→高雄防线):双失败仍是普通 DataSourceError。"""
+    forbid_amap_forward(monkeypatch)
+    stub_nominatim(monkeypatch, error=DataSourceError("Nominatim", "服务繁忙(HTTP 503)"))
+    stub_photon(monkeypatch, [PHOTON_CN])
+
+    with pytest.raises(DataSourceError) as ctx:
+        place_loader.geocode_overseas("巴黎")
+
+    assert not isinstance(ctx.value, place_loader.DomesticMismatchError), \
+        "Photon 的 CN 只当错配,不许触发降级"
+
+
+def test_api_geocode_overseas_mode_domestic_city_downgrades_to_amap(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """神朱 10/14 直报场景:region=overseas 搜「上海」→ 200 降级 amap/domestic + note。"""
+    amap_calls = stub_amap(monkeypatch)
+    stub_nominatim(monkeypatch, NOMINATIM_CN)
+    stub_photon(monkeypatch, error=DataSourceError("Photon", "请求超时(>15s)"))
+    writes = spy_upsert(monkeypatch)
+
+    payload = places_api.geocode_city(city="上海", region="overseas", session=session)
+
+    assert payload["geocoder"] == "amap" and amap_calls == ["上海"]
+    assert payload["region"] == "domestic"
+    assert (payload["origin"]["lat"], payload["origin"]["lng"]) == (
+        SHANGHAI["lat"], SHANGHAI["lng"])
+    assert "note" in payload and "境内" in payload["note"] and "上海" in payload["note"]
+    assert writes and writes[-1]["region"] == "domestic" and writes[-1]["geocoder"] == "amap", \
+        "降级结果写缓存(domestic),下次零网络"
+    row = repo.get_origin_cache(session, city="上海")
+    assert row.region == "domestic" and row.geocoder == "amap"
+
+
+def test_api_geocode_downgraded_row_second_query_hits_cache_zero_network(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """降级行落库后,再带 region=overseas 搜同名城市 → 直通缓存,地理编码零网络。"""
+    repo.upsert_origin_cache(session, city="上海", name="上海市",
+                             lat=SHANGHAI["lat"], lng=SHANGHAI["lng"],
+                             geocoder="amap", region="domestic")
+    session.commit()
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("降级行命中缓存不该触网")
+
+    for attribute in ("ds_geocode", "ds_photon_geocode", "ds_amap_geocode"):
+        monkeypatch.setattr(place_loader, attribute, boom)
+    monkeypatch.setattr(region_gate, "detect_region", boom)
+    writes = spy_upsert(monkeypatch)
+
+    payload = places_api.geocode_city(city="上海", region="overseas", session=session)
+
+    assert payload["geocoder"] == "amap" and payload["region"] == "domestic"
+    assert "note" in payload and writes == [], "命中路径不写库"
+
+    plain = places_api.geocode_city(city="上海", session=session)
+    assert plain["geocoder"] == "amap" and "note" not in plain, \
+        "不带 override 的常规响应没有 note 键(LEGACY 键集零变化)"
+
+
+def test_api_geocode_overseas_city_unchanged_no_note_key(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """境外城市(因特拉肯)行为零变化:响应不含 note 键,键集仍是 LEGACY 五键。"""
+    forbid_amap_forward(monkeypatch)
+    stub_nominatim(monkeypatch, NOMINATIM_CH)
+    stub_photon(monkeypatch, [PHOTON_NZ])
+
+    payload = places_api.geocode_city(city="因特拉肯", region="overseas", session=session)
+
+    assert set(payload) == LEGACY_GEOCODE_KEYS, "常规境外响应键集逐键零变化"
+    assert payload["region"] == "overseas" and payload["geocoder"] == "nominatim"
+
+
+def test_api_geocode_downgrade_when_amap_also_fails_reports_both_chains(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN 证据触发降级但境内链也失败(高德没 key/断网)→ 400,消息带两条链的原因。"""
+    monkeypatch.setattr(place_loader, "ds_amap_geocode",
+                        lambda city: (_ for _ in ()).throw(
+                            DataSourceError("amap", "未配置高德 key")))
+    # Nominatim 只对**境外腿**(include_country=True)答 CN 造出降级证据;
+    # 境内降级链再问它时失败 —— 否则末腿成功就轮不到「境内链也失败」这条 400。
+    def nominatim_cn_then_dead(query: str, *, limit: int = 1,
+                               include_country: bool = False, **kwargs: Any) -> Any:
+        if include_country:
+            return dict(NOMINATIM_CN)
+        raise DataSourceError("Nominatim", "直连超时")
+
+    monkeypatch.setattr(place_loader, "ds_geocode", nominatim_cn_then_dead)
+    stub_photon(monkeypatch, error=DataSourceError("Photon", "请求超时(>15s)"))
+    writes = spy_upsert(monkeypatch)
+
+    with pytest.raises(HTTPException) as ctx:
+        places_api.geocode_city(city="上海", region="overseas", session=session)
+
+    assert ctx.value.status_code == 400
+    detail = str(ctx.value.detail)
+    assert "无法解析城市 '上海'" in detail
+    assert "境内降级链也失败" in detail and "未配置高德 key" in detail
+    assert writes == [], "失败不写缓存"
+
+
+def test_api_geocode_double_network_failure_without_cn_evidence_still_400(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """两腿都是网络失败(无 CN 证据)→ 维持 TASK-25 的 400 口径,不降级。"""
+    amap_calls = forbid_amap_forward(monkeypatch)
+    stub_nominatim(monkeypatch, error=DataSourceError("Nominatim", "直连超时"))
+    stub_photon(monkeypatch, error=DataSourceError("Photon", "被限流(HTTP 429)"))
+
+    with pytest.raises(HTTPException) as ctx:
+        places_api.geocode_city(city="因特拉肯", region="overseas", session=session)
+
+    assert ctx.value.status_code == 400 and amap_calls == []
+    assert "境外地理编码两个源都失败" in str(ctx.value.detail)
+
+
+def test_api_geocode_downgrade_only_for_overseas_override_not_auto_detect(
+    session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自动判定路径判出 domestic 时本来就走境内链(现状),不会误挂 note。"""
+    amap_calls = stub_amap(monkeypatch)
+    stub_detect(monkeypatch, DOMESTIC_CN)
+
+    payload = places_api.geocode_city(city="上海", session=session)
+
+    assert payload["geocoder"] == "amap" and payload["region"] == "domestic"
+    assert "note" not in payload and amap_calls == ["上海"]

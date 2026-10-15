@@ -32,6 +32,10 @@
 * :class:`TripPlan` —— 一份行程方案(TASK-5a,M4):按**名字**唯一(同名提交=刷新),
   把已收藏的目的地 / 路线 / 住宿(``collections.id`` 引用,**不建外键**)组合起来;
   报价只读收藏快照的"当时口径",不重新调 ``/api/routes``(见 services.trips)。
+* :class:`AppConfig` —— 容器版**向导配置**(TASK-P2):镜像里没有 ``.env``,用户填的高德 /
+  LLM key 存进 SQLite;启动与保存时按「env 优先」注入 ``os.environ``(见
+  services.app_config),那 30 处直接读 env 的代码**一行不改**;``key`` 唯一 → 幂等 upsert,
+  且 ``value`` 是明文密钥 → API 只回掩码。
 
 去重口径(docs/STAGE1-PLAN.md 第 3 节):同一 OSM 实体在同一个城市库里只存一行,
 唯一键 ``(osm_type, osm_id, origin_city)``。环形分段互斥,所以 band 不进唯一键;
@@ -966,3 +970,45 @@ class PlannerMessage(Base):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试可读性
         return f"<PlannerMessage {self.id} s{self.session_id} {self.role} {len(self.content or '')}字>"
+
+
+# --------------------------------------------------------------------------- #
+# 向导配置(TASK-P2):AppConfig
+# --------------------------------------------------------------------------- #
+
+
+class AppConfig(Base):
+    """容器版**向导配置**的一行:``key`` = 环境变量名,``value`` = 用户在 ``/setup`` 填的值。
+
+    为什么要这张表:容器镜像里没有 ``.env``,用户只能在向导里填高德 / LLM 的 key;
+    而既有代码有 30 处直接读 ``os.environ``(且普遍带 ``environ=None`` 注入参数)。
+    逐处改成查库会把 DB 依赖渗进 ``data_sources`` 层,所以口径反过来:**启动时与保存时**
+    把本表的值注入 ``os.environ``,那 30 处一行不改(见 :mod:`services.app_config`
+    的 :func:`~services.app_config.load_into_environ` / :func:`~services.app_config.set_key`)。
+
+    优先级:**容器 env 永远压过库里的值** —— 注入只填「env 未设或为空串」的键,
+    所以 ``-e WHERE2GO_AMAP_KEY=…`` 与 ``.env`` 始终赢;``source`` 记这行是谁写的
+    (``setup`` = 向导,``env`` = 从环境变量回填),仅作展示,判定实际生效来源看
+    :func:`~services.app_config.effective_source`(现读 env → 回落到本表)。
+
+    安全口径:``value`` 里是**明文密钥**,所以 ``GET /api/config`` 只回掩码
+    (:func:`~services.app_config.mask_value`),完整值永不进 API 响应与日志;
+    可写的键由 :data:`~services.app_config.SCHEMA` **白名单**限定,
+    本表不是任意 env 的注入面。``key`` 唯一(:data:`uq_app_config_key`)→ 重复保存是
+    **幂等 upsert**(只刷新 ``value`` 与 ``updated_at``),旧库靠 ``create_all`` 自动建表,
+    不进 ``COLUMN_MIGRATIONS``(新表无存量)。
+    """
+
+    __tablename__ = "app_config"
+    __table_args__ = (UniqueConstraint("key", name="uq_app_config_key"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="setup")  # setup|env
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试可读性(**绝不打印 value**)
+        return f"<AppConfig {self.id} {self.key} source={self.source} len={len(self.value or '')}>"

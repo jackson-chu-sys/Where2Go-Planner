@@ -1180,6 +1180,30 @@ def test_more_does_not_disturb_pins_or_panel(html: str) -> None:
         assert token in first, f"首屏流程/分页 token 守卫少了 {token}"
 
 
+def test_load_places_clears_old_results_first(html: str) -> None:
+    """神朱 2026-10-15 反馈:搜索/重抓开始时旧 pin 与旧列表必须立刻下线,
+    免得长时间抓取(10~60s)期间被当成「已经搜完的新结果」。"""
+    # 清场函数存在,且真的清:state.places / 路线面板 / 两轨 pin 图层 / 列表占位
+    assert "function clearPlacesView(){" in html
+    clear = html[html.index("function clearPlacesView(){"):html.index("// 加载更多只给**新行**补 pin")]
+    for token in ("state.places=[]", "closeRoutePanel()", "clearOverlays(pins)", "closePinPopup()",
+                  "leafletClearPinsView()", "正在加载目的地"):
+        assert token in clear, f"clearPlacesView 缺少 {token}"
+    # loadPlaces 在发出请求前(await 之前)就调用清场
+    first = html[html.index("async function loadPlaces"):html.index("async function loadMorePlaces")]
+    assert "clearPlacesView();" in first
+    assert first.index("clearPlacesView();") < first.index("await getJSON"), \
+        "清场必须发生在请求发出之前,不是响应回来之后"
+    # 失败路径不留「正在加载」占位:catch 里重渲染空态
+    catch = first[first.index("}catch(error){"):first.index("}finally{")]
+    assert "renderPlaceList();" in catch, "查询失败后列表要落回空态,不能挂着加载占位"
+    # 境外轨半边在 TASK-23 段内(Leaflet 调用面围栏,见 test_leaflet_is_scoped_to_the_overseas_track)
+    assert "function leafletClearPinsView(){" in leaflet_section(html)
+    # 「加载更多」不清图层的既有契约不被波及(清场只属于 loadPlaces)
+    extra = html[html.index("// 加载更多只给**新行**补 pin"):html.index("async function loadPlaces")]
+    assert "clearPlacesView" not in extra
+
+
 # --- ② 路线卡片新口径:整车·人均双标 / price_source / 机票区间与 null 降级 ---------- #
 
 

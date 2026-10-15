@@ -2038,6 +2038,19 @@ function syncMoreButton(){
           ";翻到库尾时带 more=true 让后端再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
        : "后端回报 has_more=false:这个分段/分类下没有更多目的地了");
 }
+// 加载开始就清掉旧结果(神朱 2026-10-15 反馈):搜索/重抓可能跑 10~60s,旧 pin 与旧列表
+// 留在页面上会被当成「已经搜完的新结果」。清空后列表给加载占位文案,状态栏进度照旧。
+// 注意:这是 loadPlaces 专属的清场,「加载更多」不清图层、不关面板(见 drawMorePins 契约)。
+function clearPlacesView(){
+  state.places=[];
+  closeRoutePanel();   // 面板/画线以旧结果为前提,一并收掉(与 drawPins 同口径)
+  if(state.mapEngine==="leaflet") leafletClearPinsView();
+  else if(pins){clearOverlays(pins);closePinPopup();}
+  const box=$("placeListBody");
+  if(box) box.innerHTML='<div class="fp-empty">正在加载目的地…(已入库分段约 1s;'
+    +'冷抓第一轮约 10~60s,进度见顶部状态栏)</div>';
+  setListMsg("");
+}
 // 加载更多只给**新行**补 pin:不清图层、不关已打开的路线面板(drawPins 两件事都会做)
 function drawMorePins(rows){
   if(state.mapEngine==="leaflet"){leafletDrawMorePins(rows);return;}   // 境外轨(TASK-23)
@@ -2066,6 +2079,7 @@ async function loadPlaces(refresh){
   if(refresh) setStatus("正在重新抓取高德四分类检索(v3 place/around + place/polygon,约 3-20s)…");
   else if(known===undefined) setStatus("该分段尚未入库,正在抓第一轮(分页模式每轮 30 配额,约 10-60s)…");
   else setStatus("正在读取本地库(已入库,不触网;首屏每页 "+PLACES_PAGE_SIZE+" 条)…");
+  clearPlacesView();   // 旧 pin/旧列表立刻下线,免得长时间抓取时被当成新结果
   try{
     const data=await getJSON("/api/places?"+placesParams(refresh,0,false).toString());
     if(token!==state.page.token) return;   // 已换段/换分类:丢掉过期响应
@@ -2082,6 +2096,7 @@ async function loadPlaces(refresh){
   }catch(error){
     if(token!==state.page.token) return;
     showErr("查询失败:"+error.message);setStatus("查询失败");
+    renderPlaceList();   // 占位文案换成空态(错误详情已在 #err 条里),别留「正在加载」
   }finally{
     if(token===state.page.token){state.page.busy=false;setBusy(false);syncMoreButton();}
   }
@@ -4552,6 +4567,10 @@ function leafletDrawMorePins(rows){
     const index=ensurePlaceRow(place);
     leafletAddPin(place,index,false);
   });
+}
+// 加载清场的境外轨半边(clearPlacesView 调它):清 pin 图层 + 关 popup(环圈留着,applyOrigin 会重画)
+function leafletClearPinsView(){
+  if(lpins){lpins.clearLayers();leafletClosePinPopup();}
 }
 
 // 两轨容器互斥显隐;#mapFallback 是高德轨专属的降级层(境外轨自己用 showNote 给提示),

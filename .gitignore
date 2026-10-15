@@ -3,6 +3,8 @@ Github_PAT.txt
 AzureMapsKey.txt
 *.env
 .env*
+# 但配置样例要进仓库(给用户抄)
+!.env.example
 
 # Python
 __pycache__/

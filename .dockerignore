@@ -1,0 +1,54 @@
+# 镜像里只要运行所需:backend 代码 + requirements + entrypoint。其余全排。
+# ⚠️ 任何凭据/本地数据一旦进构建上下文就会被烙进镜像层(镜像要发 GHCR 公开仓库)。
+
+# 版本库与本地环境
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+
+# 凭据与本地配置(绝不进镜像)
+.env
+*.env
+.env.*
+!.env.example
+Github_PAT.txt
+AzureMapsKey.txt
+
+# 本地数据库与运行产物(SQLite 库含真实抓取数据,不打进镜像;运行时挂 /data 卷)
+backend/data
+*.db
+*.sqlite3
+data
+
+# 开发过程文件(决策①:仓库保留,但不进镜像)
+docs
+tools
+tasks
+*.txt
+!backend/requirements.txt
+意见*
+需求文档*
+0[12]-*.md
+AGENTS.md
+backend/README.md
+
+# 测试(镜像不跑 pytest;CI 在源码 checkout 上跑)
+backend/test_*.py
+backend/conftest.py
+
+# 容器与 CI 自身
+Dockerfile
+docker-compose.yml
+.dockerignore
+.github
+
+# 系统/编辑器
+.DS_Store
+*.swp
+node_modules
+dist

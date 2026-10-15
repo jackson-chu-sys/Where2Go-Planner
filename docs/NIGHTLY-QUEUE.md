@@ -1100,6 +1100,76 @@
 
 ---
 
+## [TASK-P1] 容器化基础文件:Dockerfile + compose + .env.example + entrypoint(神朱 2026-10-15 拍板「都按推荐」)
+
+- 状态: done
+- 目标: 按 docs/CONTAINER-SETUP-PLAN.md 第四节 P1 执行(执行器手写,≤30min 小任务):仓库根新增 `Dockerfile`(python:3.13-slim、非 root uid 1000、VOLUME /data、HEALTHCHECK /api/places/meta、ENV WHERE2GO_DB_URL=sqlite:////data/where2go.db WHERE2GO_UI_MODE=release)、`docker-compose.yml`(8000 端口、./data:/data、env_file .env、restart unless-stopped)、`.env.example`(全部 WHERE2GO_* 带中文注释+默认值)、`docker-entrypoint.sh`(建 /data、权限检测中文提示、exec uvicorn --workers 1)、`.dockerignore`(排 .git/.venv/backend/data/docs/tools/内部 txt/*.env)。
+- 涉及: 仓库根新文件(零 Python 改动)
+- 验收: compose YAML 语法过(python yaml.safe_load)、entrypoint `bash -n` 过、.dockerignore 覆盖 .env 与 backend/data;pytest 基线零回归(1632);commit。
+- 结果: **完成**(2026-10-15 夜班,执行器手写;commit 见 git log)。
+  - 5 个新文件:`Dockerfile`(slim+非 root uid 1000+VOLUME /data+HEALTHCHECK urllib 探 /api/places/meta+先装依赖后拷代码的缓存分层)、`docker-compose.yml`(GHCR latest 镜像、./data:/data、env_file `required:false`(compose≥2.24,注释给了老版降级写法)、`user: "1000:1000"` 备用行注释)、`docker-entrypoint.sh`(/data 可写检测→中文 chown 提示+`user:` 指引→exec uvicorn --workers 1)、`.env.example`(3 必填 key+5 LLM+17 可选项,全部带中文注释与实测默认值)、`.dockerignore`(排 .git/.venv/backend/data/docs/tools/tasks/内部 txt/测试文件,`!backend/requirements.txt`+`!.env.example` 例外)。
+  - 附带:`.gitignore` 加 `!.env.example` 例外(原 `.env*` 会把样例一起挡掉)。
+  - 验证:entrypoint `bash -n` 过;compose 用 pyyaml safe_load 解析过(image/ports/volumes/env_file/restart 五字段核对);`git check-ignore` 确认 5 文件均可提交;pytest backend/ = **1632 passed**(零 Python 改动,基线零回归)。
+  - 已知限制:本容器无 docker daemon,`docker build` 无法本地验证 → 镜像层留给 P4 的 GitHub Actions 首跑验证(见 CONTAINER-SETUP-PLAN 第三节验证策略)。
+  - 坑记录:write_file 会把形似密钥的字串(如 `WHERE2GO_AMAP_SECURITY_JS_CODE=`、`DASHSCOPE_API_KEY=`)掩成 `…`/`***` —— 写完 .env 类文件必须 grep 扫残留,已用 python 脚本复原。
+
+---
+
+## [TASK-P2] AppConfig 表 + 配置读写 API(/api/config + /api/health)
+
+- 状态: pending
+- 目标: 按 CONTAINER-SETUP-PLAN 第二节「配置注入策略」:AppConfig 表(key/value/source/updated_at,唯一键 key)+ `services/app_config.py`(白名单 SCHEMA 7 键、load_into_environ 启动注入「env 未设才填」、set_key 写表+同步 os.environ、mask_value 掩码)+ `GET /api/config`(只回掩码+label/hint/required/needs_restart)、`POST /api/config`(白名单外键 403/400)、`GET /api/health`(必填缺失清单,给 compose 与向导用)+ main.py lifespan 启动注入。
+- 依赖: P1(非硬依赖,可并行;建议 P1 先行)。
+- 涉及: backend/db/models.py、新 backend/services/app_config.py、新 backend/app/api/config.py、backend/app/main.py、新 backend/test_app_config.py
+- 验收: pytest +≥25 全 mock(掩码不漏明文、白名单外键拒写、env 压过 AppConfig、set_key 后 amap.resolve_key/intro.resolve_provider 立即看到新值、/api/config 响应 grep 不到明文 key);基线 1632 零回归;不动那 30 处 env 读取点;commit。
+- 结果: (待回填)
+
+---
+
+## [TASK-P3] /setup 用户向导页(4 步 + 真调校验 + 首页横幅)
+
+- 状态: pending
+- 目标: 按 CONTAINER-SETUP-PLAN P3:新 `app/static/setup.html`(不塞 index.html)4 步向导——①高德 Web服务 key(图文教程+后端真调一次 geocode("北京") 校验,infocode 中文解释);②高德 JS key+安全密钥(写明两 key 平台隔离/USERKEY_PLAT_NOMATCH/INVALID_USER_SCODE 血泪坑文案);③LLM 可选(预置 DeepSeek/阿里/OpenAI 下拉+自定义 base_url+model+key,发 1-token 测试消息);④完成(保存→POST /api/config→回首页)。校验端点只打一次请求防 QPS 10021。index.html 顶部横幅:GET /api/health 缺必填 → 引导条(不强制重定向,决策③)。
+- 依赖: P2。
+- 涉及: 新 backend/app/static/setup.html、backend/app/api/config.py(校验端点)、backend/app/static/index.html(横幅)、backend/test_frontend_routes.py(静态断言)
+- 验收: browser QA 全流程(无 key 起服务→横幅→向导 4 步→假 key 看报错文案→真 key 通过→回首页出图)0 JS error;pytest 静态断言+基线零回归;commit。
+- 结果: (待回填)
+
+---
+
+## [TASK-P5] README(中英双语)+ 第三方归属/免责 + 内部文件说明
+
+- 状态: pending
+- 目标: 仓库根 README.md:一句话介绍、quickstart(compose 三命令)、key 申请教程(高德控制台图文链接)、WHERE2GO_* 全表(与代码 grep 核一致)、FAQ(10021 QPS/INVALID_USER_SCODE/USERKEY_PLAT_NOMATCH/免费配额)、AGPL 与源码获取说明(决策⑤)、免责(高德条款/LLM 服务商/价格估算不代订)、顶部注明「docs/ 与根目录 md 是开发过程记录,用户只需看 README」(决策①,内部文件保留不动)。
+- 依赖: P1(命令要抄 compose);P2/P3 完成后核健康检查与向导入口描述。
+- 涉及: README.md(仓库根,现无)
+- 验收: 命令可复制即跑;env 表与 grep 结果一致;commit。
+- 结果: (待回填)
+
+---
+
+## [TASK-P4] GitHub Actions:CI + GHCR Release 流水线(multi-arch)
+
+- 状态: pending
+- 目标: `.github/workflows/ci.yml`(push/PR 跑 pytest,全 mock 零 secrets)+ `release.yml`(tag v* → buildx amd64+arm64(决策②)→ push ghcr.io/jackson-chu-sys/where2go:{tag,latest} + 容器冒烟 curl /api/places/meta)。注意:本容器无 docker daemon,镜像层只能靠 Actions 验证(CONTAINER-SETUP-PLAN 第三节);push 需神朱授权(仓库 44+ commit 未推)。
+- 依赖: P1;发布需 P2/P3(否则镜像无向导)。
+- 涉及: .github/workflows/
+- 验收: Actions 首跑绿;GHCR 出 multi-arch 镜像;NAS docker pull + compose up 冒烟(神朱配合)。
+- 结果: (待回填)
+
+---
+
+## [TASK-P6] 发布版 UI 精简(WHERE2GO_UI_MODE=release)
+
+- 状态: pending
+- 目标: 按 PUBLISH-PLAN 第三节:ui_mode 从 /api/places/meta 透出,release 隐藏状态栏技术细节/AI 副标模型名/长介绍批次消息/POI id/坐标系/补简介按钮;「估算」徽标保留(合规);dev 模式一切照旧。
+- 依赖: P3(横幅与向导落地后再动 index.html,避免双改)。
+- 涉及: backend/app/static/index.html、backend/app/api/places.py(meta 透出)、backend/test_frontend_routes.py
+- 验收: release/dev 双模 browser QA 对照 PUBLISH-PLAN §3.1 表逐条核;pytest 静态断言;commit。
+- 结果: (待回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 ## [TASK-xxx] 标题
 - 状态: 示例(勿执行;新任务复制本段并改成 pending)

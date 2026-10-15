@@ -1,0 +1,22 @@
+# Where2Go 自托管(一条命令起服务:docker compose up -d → 浏览器开 http://localhost:8000)
+# 首次使用:cp .env.example .env(可不填,起服务后走 /setup 向导配置也行)
+services:
+  where2go:
+    image: ghcr.io/jackson-chu-sys/where2go:latest
+    # 本地构建(开发/未发布时):build: .
+    container_name: where2go
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite 库与全部缓存落 ./data —— 升级镜像/重建容器数据不丢。
+      # ⚠️ 若启动报「数据目录不可写」:sudo chown -R 1000:1000 ./data
+      - ./data:/data
+    env_file:
+      # 可选:全部配置项见 .env.example。不建 .env 文件也能起,配置走 /setup 向导存进数据库。
+      # (required:false 需要 docker compose ≥2.24;老版本报「Unsupported」就 touch .env 建个空文件,
+      #  并把下面两行改回经典写法:env_file: - .env)
+      - path: .env
+        required: false
+    # NAS 宿主目录属主不是 uid 1000 时可解开下一行,让容器以你的用户身份跑:
+    # user: "1000:1000"

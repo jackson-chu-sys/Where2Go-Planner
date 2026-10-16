@@ -344,6 +344,11 @@
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
   footer{color:#9ca3af;font-size:12px;text-align:center;padding:14px}
+  /* TASK-P6 发布版 UI 精简:body.ui-release 时 .dev-only 隐藏、.release-only 显示;
+     dev(默认)一切照旧——隐藏≠删代码,夜班/开发排查不受影响。口径见 PUBLISH-PLAN §3.1 */
+  .release-only{display:none}
+  body.ui-release .dev-only{display:none!important}
+  body.ui-release .release-only{display:block}
   /* TASK-P3:缺必填配置的引导横幅(决策③:不强制重定向,只引导) */
   #setupBanner{display:none;margin:10px auto 0;max-width:1080px;padding:10px 14px;border-radius:10px;
     background:#fffbeb;border:1px solid #fde68a;color:#92400e;font-size:13px;line-height:1.6}
@@ -382,7 +387,7 @@
       <div class="field" style="flex:0 0 auto"><label>&nbsp;</label>
         <div class="inline">
           <button id="reload" class="secondary" title="忽略库缓存,重新抓一次高德四分类检索(v3 place/around + place/polygon)">重新抓取</button>
-          <button id="intro" class="secondary" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
+          <button id="intro" class="secondary dev-only" title="给该分段还没有简介的 POI 调 LLM 补一句话简介(已有的不重复调用)">补简介</button>
           <button id="openFav" class="secondary" title="收藏对比 + 勾选组合行程方案(POST/GET/DELETE /api/collections、/api/trip-plans)">⭐ 我的收藏</button>
         </div></div>
     </div>
@@ -448,7 +453,7 @@
       <div class="rp-ttl" id="placeListTitle">📋 目的地列表(AI 推荐置顶)</div>
     </div>
     <div class="rp-sub" id="placeListSub">先渲染名称 / 分类 / 距起点,2~3 句长介绍随后分批补上。</div>
-    <div class="pl-more">
+    <div class="pl-more dev-only">
       <button type="button" id="detailMore" class="secondary" disabled
               title="分批调 GET /api/places/details 补 2~3 句重点介绍(每批 10 条,推荐条优先;生成中再点一下 = 暂停自动续批)">继续生成介绍</button>
       <span class="fp-sub">长介绍由 LLM 按 POI 生成并缓存在库里,只补还没有的;失败会给可操作的中文提示。</span>
@@ -652,7 +657,7 @@
     </div>
   </aside>
 </main>
-<footer>
+<footer class="dev-only">
   Where2Go 阶段2b · 地图:高德 JS API 2.0(底图与 POI 同源、坐标 GCJ-02;JS key 与安全密钥由
   /api/map-config 运行时下发,不进 git、不写在本页)· 数据:高德 v3 四分类检索
   (place/around + 包围盒分格 place/polygon)抓取后入 SQLite,
@@ -679,6 +684,14 @@
   机票给公布价锚定区间「¥A–B(浮动)」;给不出票价时不编数字,只留 OTA deep-link 看实时价 ·
   住宿空态分三档:reason=no_data(附近没找到住宿,给最近一家的距离)/ datasource_error(数据源暂时不可用,
   可重试)/ timeout(查询超时,请稍后再试);价格还在后台回填(estimating=true)时显示「AI 估价生成中,稍后刷新」
+</footer>
+<!-- TASK-P6:release 模式页脚(面向用户的简介 + 免责,替代上面的开发口径技术说明段) -->
+<footer class="release-only">
+  Where2Go · 自由行目的地规划:选起点城市与距离分段,AI 推荐最值得去的目的地,
+  提供驾车 / 铁路 / 飞机路线对比与周边住宿参考 ·
+  目的地数据来自高德;简介、推荐理由与住宿价格由 AI 生成,价格与时长均为<b>估算 · 仅供参考</b>,
+  以官方 / OTA 实时为准 · 预订与导航外链仅跳转官方渠道,本站不代订、不抓取实时价格 ·
+  开源协议 AGPL-3.0,源码见项目仓库
 </footer>
 <script>
 const $=id=>document.getElementById(id);
@@ -939,6 +952,7 @@ function renderLegend(counts){
     const hint=item.blurb?(" title="+esc('"'+item.blurb+'"')):"";
     return '<span'+hint+'><i style="background:'+item.color+'"></i>'+esc(item.label)+" <b>"+total+"</b></span>";
   }).join("");
+  if(isReleaseUI()) return;   // TASK-P6:release 只留四分类图例,归类优先级/LLM/种子说明隐藏
   const priority=(state.meta.category_priority||[]).join(" > ");
   const llm=state.meta.llm||{};
   $("legend").innerHTML+='<span><b>归类优先级</b> '+esc(priority)+"</span>"+
@@ -998,7 +1012,7 @@ function popupHtml(place,index){
   const bandLabel=(state.bandMeta&&state.bandMeta.label)||currentBand().label;
   const distance=(place.distance_km===null||place.distance_km===undefined)?"—":(place.distance_km+" km");
   const hasIntro=!!(place.intro&&String(place.intro).trim());
-  const intro=hasIntro?esc(place.intro):"暂无简介(LLM 未生成或调用降级,可点「补简介」重试)";
+  const intro=hasIntro?esc(place.intro):(isReleaseUI()?"暂无简介":"暂无简介(LLM 未生成或调用降级,可点「补简介」重试)");
   return '<div class="pop"><div class="nm">'+(esc(place.name)||"(无名)")+"</div>"+
     '<span class="cat" style="background:'+meta.color+'">'+meta.emoji+" "+esc(meta.label)+"</span>"+
     '<div class="kv">距起点直线 <b>'+distance+"</b> · 分段 "+esc(bandLabel)+"</div>"+
@@ -1022,6 +1036,12 @@ function popupHtml(place,index){
 //   种子行 → 人工种子数据 + WGS-84 偏差提示(种子坐标不做转换,与高德底图可能差 ≤500m)。
 //   存量 OSM 行 → 照旧显示 (type, id),同样标 WGS-84 偏差。
 function identityHtml(place){
+  if(isReleaseUI()){
+    // TASK-P6:release 隐藏 POI id 与坐标系/坐标值,只留来源大类(「估算」徽标不在此处,保留)
+    const seed=place.source===SEED_SOURCE;
+    const amap=String(place.osm_type||"").toLowerCase()===AMAP_OSM_TYPE||place.source===AMAP_SOURCE;
+    return '<div class="src">来源:<b>'+(seed?"人工补录":(amap?"高德":"OpenStreetMap"))+"</b></div>";
+  }
   const coord=" · "+Number(place.lat).toFixed(4)+", "+Number(place.lng).toFixed(4);
   const tags=(place&&place.tags)||{};
   if(place.source===SEED_SOURCE){
@@ -1808,8 +1828,18 @@ function drawPins(places){
   });
 }
 
+// TASK-P6:发布版 UI 精简 —— ui_mode 从 /api/places/meta 透出(env WHERE2GO_UI_MODE,
+// 后端默认 dev、发布容器默认 release)。双闸门:body.ui-release 的 CSS 隐藏 .dev-only 元素
+// (按钮/页脚),isReleaseUI() 的 JS 分支精简状态栏/推荐副标/批次消息/来源脚注文案。
+function applyUiMode(){
+  const mode=String((state.meta&&state.meta.ui_mode)||"dev");
+  document.body.dataset.uiMode=mode;
+  document.body.classList.toggle("ui-release",mode==="release");
+}
+function isReleaseUI(){return document.body.classList.contains("ui-release");}
 async function loadMeta(){
   state.meta=await getJSON("/api/places/meta");
+  applyUiMode();
   if(!state.meta.bands.some(band=>band.key===state.band)) state.band=state.meta.bands[0].key;
   renderBandOptions();renderCategoryOptions();renderLegend({});renderCityHints();
 }
@@ -1974,6 +2004,10 @@ const PLACES_SOURCE_LABEL={amap:"高德实时抓取 → 已入库",osm:"OSM 实�
 // (TASK-21 时这里挂的是"地图层稍后再切"的过渡提示,双轨落地后按契约 §1.1 正式下线。)
 const OVERSEAS_COORD_HINT="境外模式 · OSM/Leaflet · WGS-84";
 function placesStatusHtml(data){
+  if(isReleaseUI())
+    return '起点 <b>'+esc(data.origin.name)+"</b> · "+esc(data.band.label)+
+      " · 分类 <b>"+esc(state.category||"全部")+"</b> · 已显示 <b>"+(state.places||[]).length+
+      "</b> 条";   // 来源/耗时/抓取轮次/geocoder/待补简介等技术细节全隐藏(PUBLISH-PLAN §3.1)
   const bandTotal=Object.values(data.counts_by_category||{}).reduce((sum,value)=>sum+value,0);
   const from=(data.source==="db")?"本地 SQLite 读库(未触网)"
     :(PLACES_SOURCE_LABEL[String(data.source||"")]||PLACES_SOURCE_LABEL.amap);
@@ -2027,22 +2061,26 @@ function syncMoreButton(){
   const offset=Math.max(0,Math.round(num(state.page.offset)||0));
   const expand=pageNeedsExpand();
   if(wrap) wrap.style.display=(total>0||busy)?"flex":"none";
-  if(sub) sub.textContent=total
+  if(sub) sub.textContent=isReleaseUI()
+    ? ((state.places||[]).length?("已显示 "+(state.places||[]).length+" 条"):"")
+    : (total
     ? ("已显示 "+(state.places||[]).length+" / 库内 "+total+" 条 · 每页 "+PLACES_PAGE_SIZE+
        " 条 · 已抓 "+state.page.rounds+" 轮"+(state.page.hasMore
           ? (expand?(" · 下一页要现场扩抓高德("+EXPAND_HINT_SECONDS+")"):" · 库里还有下一页")
           : " · 没有更多了(has_more=false)"))
-    : "";
+    : "");
   if(!button) return;
   button.textContent=busy?(expand?MORE_EXPAND_HINT:MORE_PAGE_HINT):MORE_BTN_LABEL;
   button.disabled=busy||!state.page.hasMore;
   button.style.display=(busy||state.page.hasMore)?"inline-block":"none";
-  button.title=busy
-    ? ("正在请求下一页(翻到库尾时后端会再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
-    : (state.page.hasMore
-       ? ("取下一页 "+PLACES_PAGE_SIZE+" 条(offset="+offset+
-          ";翻到库尾时带 more=true 让后端再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
-       : "后端回报 has_more=false:这个分段/分类下没有更多目的地了");
+  button.title=isReleaseUI()
+    ? (busy?"正在加载…":(state.page.hasMore?"加载更多目的地":"没有更多了"))
+    : (busy
+      ? ("正在请求下一页(翻到库尾时后端会再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
+      : (state.page.hasMore
+         ? ("取下一页 "+PLACES_PAGE_SIZE+" 条(offset="+offset+
+            ";翻到库尾时带 more=true 让后端再抓一轮高德检索,"+EXPAND_HINT_SECONDS+")")
+         : "后端回报 has_more=false:这个分段/分类下没有更多目的地了"));
 }
 // 加载开始就清掉旧结果(神朱 2026-10-15 反馈):搜索/重抓可能跑 10~60s,旧 pin 与旧列表
 // 留在页面上会被当成「已经搜完的新结果」。清空后列表给加载占位文案,状态栏进度照旧。
@@ -2082,7 +2120,9 @@ async function loadPlaces(refresh){
   state.page.busy=true;
   syncMoreButton();
   const known=state.cached[state.band];
-  if(refresh) setStatus("正在重新抓取高德四分类检索(v3 place/around + place/polygon,约 3-20s)…");
+  if(isReleaseUI())
+    setStatus(refresh?"正在刷新目的地…":(known===undefined?"正在搜索目的地(首次约 10-60s)…":"正在加载目的地…"));
+  else if(refresh) setStatus("正在重新抓取高德四分类检索(v3 place/around + place/polygon,约 3-20s)…");
   else if(known===undefined) setStatus("该分段尚未入库,正在抓第一轮(分页模式每轮 30 配额,约 10-60s)…");
   else setStatus("正在读取本地库(已入库,不触网;首屏每页 "+PLACES_PAGE_SIZE+" 条)…");
   clearPlacesView();   // 旧 pin/旧列表立刻下线,免得长时间抓取时被当成新结果
@@ -2118,9 +2158,10 @@ async function loadMorePlaces(){
   state.page.token+=1;
   const token=state.page.token;
   syncMoreButton();
-  setStatus(expand
-    ? (MORE_EXPAND_HINT+"(本页已到库尾,后端正在再抓一轮高德检索:"+EXPAND_HINT_SECONDS+",别切分段)")
-    : (MORE_PAGE_HINT+"(offset="+offset+",读库约 1s)"));
+  setStatus(isReleaseUI()?(expand?MORE_EXPAND_HINT:MORE_PAGE_HINT)
+    : (expand
+      ? (MORE_EXPAND_HINT+"(本页已到库尾,后端正在再抓一轮高德检索:"+EXPAND_HINT_SECONDS+",别切分段)")
+      : (MORE_PAGE_HINT+"(offset="+offset+",读库约 1s)")));
   try{
     const data=await getJSON("/api/places?"+placesParams(false,offset,true).toString());
     if(token!==state.page.token) return;
@@ -2241,7 +2282,7 @@ async function fillIntros(){
     return;
   }
   showErr("");setBusy(true);
-  setStatus("正在给本页 "+ids.length+" 条缺简介的目的地调 LLM(已有的跳过)…");
+  setStatus(isReleaseUI()?"正在补齐简介…":("正在给本页 "+ids.length+" 条缺简介的目的地调 LLM(已有的跳过)…"));
   const params=new URLSearchParams({origin:state.origin.city,band:state.band,
     limit:String(INTRO_LIMIT),place_ids:ids.join(",")});
   if(state.category) params.set("category",state.category);
@@ -2453,11 +2494,13 @@ function renderListSub(){
         ? ("按距离推荐(未走 AI)置顶 "+state.list.reco+" 条")
         : ("AI 推荐置顶 "+state.list.reco+" 条"))
     : "AI 推荐加载中…";
-  box.textContent="已显示 "+shown+" 条"+(total?(" / 库内 "+total+" 条"):"")+" · "+recoPart+
-    " · 其他 "+state.list.other+" 条按距起点由近到远 · 长介绍每批 "+DETAIL_BATCH+
-    " 条懒加载(推荐条优先)"+
-    (state.page.hasMore?(" · 底部「加载更多」每次 +"+PLACES_PAGE_SIZE+" 条"):"")+
-    (pending>0?(" · 还剩 "+pending+" 条待生成"):(shown?" · 长介绍已补齐":""));
+  box.textContent=isReleaseUI()
+    ? ("已显示 "+shown+" 条 · "+recoPart+" · 其他 "+state.list.other+" 条按距起点由近到远")
+    : ("已显示 "+shown+" 条"+(total?(" / 库内 "+total+" 条"):"")+" · "+recoPart+
+       " · 其他 "+state.list.other+" 条按距起点由近到远 · 长介绍每批 "+DETAIL_BATCH+
+       " 条懒加载(推荐条优先)"+
+       (state.page.hasMore?(" · 底部「加载更多」每次 +"+PLACES_PAGE_SIZE+" 条"):"")+
+       (pending>0?(" · 还剩 "+pending+" 条待生成"):(shown?" · 长介绍已补齐":"")));
 }
 function syncDetailMore(){
   const button=$("detailMore");
@@ -2533,14 +2576,17 @@ function applyDetails(payload){
   const failed=Number((payload&&payload.failed)||0);
   if(filled<=0){
     state.reco.auto=false;   // 没有进展就停下来,别空转烧额度;给出可操作的下一步
-    setListMsg("长介绍没有生成:"+detailReasonText(payload)+" · 本批扫了 "+
-      Number((payload&&payload.scanned)||0)+" 条 / 失败 "+failed+" 条。"+
-      "列表骨架与地图不受影响,可稍后点「继续生成介绍」重试。","err");
+    setListMsg(isReleaseUI()
+      ? "介绍生成失败,稍后自动重试"   // TASK-P6:release 一句话,不报批次/原因/条数
+      : ("长介绍没有生成:"+detailReasonText(payload)+" · 本批扫了 "+
+         Number((payload&&payload.scanned)||0)+" 条 / 失败 "+failed+" 条。"+
+         "列表骨架与地图不受影响,可稍后点「继续生成介绍」重试。"),"err");
     syncDetailMore();
     return;
   }
   const pending=state.reco.pending;
-  setListMsg("长介绍:本批生成 "+filled+" 条 · 失败 "+failed+" 条 · 还剩 "+pending+" 条 · "+
+  if(isReleaseUI()) setListMsg("");   // TASK-P6:release 成功批次静默(自动续批照跑,不打扰)
+  else setListMsg("长介绍:本批生成 "+filled+" 条 · 失败 "+failed+" 条 · 还剩 "+pending+" 条 · "+
     String((payload&&payload.provider)||"LLM")+" · 耗时 "+Number((payload&&payload.elapsed_s)||0)+"s"+
     ((pending>0&&state.reco.auto)?" · 自动续批中(点「⏸ 暂停自动生成」可停)":""),
     pending>0?"":"warn");
@@ -2641,6 +2687,13 @@ function applyRecoData(payload){
       "。先点「重新抓取」把该分段入库,或换个分段/分类;地图可切「全部目的地」照常看。","warn");
     return;
   }
+  if(isReleaseUI()){
+    // TASK-P6:release 只留条数 + 换一批引导;模型名/候选数/依据/缓存命中/长介绍 pending 全隐藏
+    setRecoMsg((payload.degraded||payload.basis==="distance")
+      ? ("AI 推荐 "+items.length+" 条(按距离推荐)· 不满意可点「🔁 换一批 / 重新推荐」")
+      : ("AI 推荐 "+items.length+" 条 · 不满意可点「🔁 换一批 / 重新推荐」"),
+      (payload.degraded||payload.basis==="distance")?"warn":"");
+  }else{
   const bandLabel=(payload.band&&payload.band.label)||currentBand().label;
   const parts=["AI 推荐 "+items.length+" 条 · "+bandLabel+" · 候选 "+
     Number((payload&&payload.candidates)||0)+" 条"];
@@ -2654,6 +2707,7 @@ function applyRecoData(payload){
   if(state.reco.pending>0) parts.push("长介绍还剩 "+state.reco.pending+" 条待生成(下方分批补)");
   setRecoMsg(parts.join(" · ")+" · 不满意可点「🔁 换一批 / 重新推荐」(refresh=true)",
     (payload.degraded||payload.basis==="distance")?"warn":"");
+  }
   if(state.reco.auto&&state.reco.pending>0&&!state.reco.busy){
     const ids=pendingDetailIds(DETAIL_BATCH);
     if(ids.length) loadDetails(DETAIL_BATCH,ids);
@@ -2669,10 +2723,13 @@ async function loadRecommend(refresh){
   const token=state.reco.token;
   state.reco.loading=true;
   state.reco.failed=false;
-  setRecoMsg("正在让 AI 从「"+String(state.origin.name||state.origin.city)+" · "+
-    ((state.bandMeta&&state.bandMeta.label)||currentBand().label)+" · "+
-    (state.category?categoryMeta(state.category).label:"全部分类")+"」的候选里挑 "+RECO_COUNT+
-    " 个最值得去的(只读库不触网;首次要调 LLM,实测约 1-2 分钟;同分段命中缓存后秒回)…");
+  setRecoMsg(isReleaseUI()
+    ? "正在生成 AI 推荐…"
+    : ("正在让 AI 从「"+String(state.origin.name||state.origin.city)+" · "+
+       ((state.bandMeta&&state.bandMeta.label)||currentBand().label)+" · "+
+       (state.category?categoryMeta(state.category).label:"全部分类")+
+       "」的候选里挑 "+RECO_COUNT+
+       " 个最值得去的(只读库不触网;首次要调 LLM,实测约 1-2 分钟;同分段命中缓存后秒回)…"));
   try{
     const params=new URLSearchParams({origin:String(state.origin.city),band:String(state.band),
       count:String(RECO_COUNT)});

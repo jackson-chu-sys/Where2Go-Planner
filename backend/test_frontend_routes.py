@@ -1369,7 +1369,7 @@ def test_geocoder_lands_in_status_bar_and_footer(html: str) -> None:
     assert "geocoderNote()" in status, "状态栏要带上起点解析源"
     note = section[section.index("function geocoderNote"):section.index("// 是否要现场扩抓")]
     assert "起点解析" in note and "GEOCODER_LABEL[key]" in note, "geocoder 要翻成中文口径再进状态栏"
-    footer = html[html.index("<footer>"):html.index("</footer>")]
+    footer = html[html.index('<footer class="dev-only">'):html.index("</footer>")]  # TASK-P6:开发口径页脚(dev 版)
     assert "Photon" in footer and "Nominatim" in footer and "geocoder" in footer, \
         "页脚口径说明要写清 geocoder 三档"
 
@@ -1557,7 +1557,7 @@ def test_geocoder_labels_and_wording_are_amap(html: str) -> None:
     labels = js_map(html, "GEOCODER_LABEL")
     assert place_loader.GEOCODER_AMAP in labels, "geocoder=amap 要有中文文案"
     assert "高德(主路径)" in labels, "高德是主路径,Photon/Nominatim 降为降级"
-    footer = html[html.index("<footer>"):html.index("</footer>")]
+    footer = html[html.index('<footer class="dev-only">'):html.index("</footer>")]  # TASK-P6:开发口径页脚(dev 版)
     for token in ("Overpass", "OSRM", "Leaflet", "OpenStreetMap", "osrm_refs"):
         assert token not in footer, f"页脚还留着旧数据源文案 {token}"
     assert "高德 JS API 2.0" in footer and "GCJ-02" in footer and "/api/map-config" in footer
@@ -3582,6 +3582,165 @@ def test_task25_region_plumbing_and_topbar_css_not_regressed(html: str) -> None:
 @pytest.mark.skipif(NODE is None, reason="环境未安装 node,跳过内联脚本语法检查")
 def test_task25_inline_js_passes_node_check(html: str, tmp_path: Path) -> None:
     script = tmp_path / "task25_inline.js"
+    script.write_text(inline_script(html), encoding="utf-8")
+    result = subprocess.run([NODE, "--check", str(script)], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, f"内联脚本语法错误:\n{result.stderr}"
+
+
+# --------------------------------------------------------------------------- #
+# TASK-P6:发布版 UI 精简(WHERE2GO_UI_MODE=release)
+# 口径见 PUBLISH-PLAN §3.1:ui_mode 从 /api/places/meta 透出;release 隐藏
+# 状态栏技术细节 / AI 副标模型名 / 长介绍批次消息 / POI id / 坐标系 / 补简介按钮;
+# 「估算」徽标保留(合规);dev 模式一切照旧(隐藏≠删代码,dev 分支断言原样在)。
+# --------------------------------------------------------------------------- #
+
+
+def test_p6_meta_exposes_ui_mode_default_dev(monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认(未设 env)必须是 dev——开发/夜班环境零变化。"""
+    monkeypatch.delenv("WHERE2GO_UI_MODE", raising=False)
+    meta = places_api.places_meta()
+    assert meta["ui_mode"] == "dev"
+    assert {"bands", "categories", "llm", "seeds", "note"} <= set(meta), "既有键只增不减"
+
+
+def test_p6_meta_ui_mode_release_only_exact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """只认 release(大小写不敏感),其余值一律 dev——不许把开发态误判成发布态。"""
+    for value, expect in (("release", "release"), ("RELEASE", "release"), (" Release ", "release"),
+                          ("dev", "dev"), ("production", "dev"), ("", "dev")):
+        monkeypatch.setenv("WHERE2GO_UI_MODE", value)
+        assert places_api.places_meta()["ui_mode"] == expect, f"WHERE2GO_UI_MODE={value!r}"
+
+
+def test_p6_css_double_gate(html: str) -> None:
+    """CSS 闸门:默认藏 .release-only;body.ui-release 时藏 .dev-only、显 .release-only。"""
+    css = html[html.index("<style>"):html.index("</style>")].replace(" ", "").replace("\n", "")
+    assert ".release-only{display:none}" in css
+    assert "body.ui-release.dev-only{display:none!important}" in css
+    assert "body.ui-release.release-only{display:block}" in css
+
+
+def test_p6_ui_mode_wired_into_boot(html: str) -> None:
+    """ui_mode 接线:loadMeta 里 applyUiMode();dataset + classList 双落地。"""
+    assert "function applyUiMode()" in html and "function isReleaseUI()" in html
+    boot = html[html.index("async function loadMeta()"):html.index("function renderCityHints()")]
+    assert "applyUiMode();" in boot, "loadMeta 拿到 meta 后必须立即应用 ui_mode"
+    assert 'document.body.dataset.uiMode' in html and 'classList.toggle("ui-release"' in html
+
+
+def test_p6_manual_llm_buttons_hidden_in_release(html: str) -> None:
+    """「补简介」「继续生成介绍/暂停」按钮 release 隐藏(dev 下 DOM 仍在,只是 CSS 藏)。"""
+    assert '<button id="intro" class="secondary dev-only"' in html
+    assert '<div class="pl-more dev-only">' in html and 'id="detailMore"' in html
+    # 加载更多(moreWrap)不是 LLM 操作按钮,不许被误藏
+    assert 'id="moreWrap" style="display:none"' in html
+
+
+def test_p6_dual_footers(html: str) -> None:
+    """页脚双版本:dev 技术说明段照旧;release 换成用户简介+免责。"""
+    assert '<footer class="dev-only">' in html and '<footer class="release-only">' in html
+    release = html[html.index('<footer class="release-only">'):html.index("</footer>", html.index('<footer class="release-only">'))]
+    for token in ("估算 · 仅供参考", "不代订", "AGPL-3.0"):
+        assert token in release, f"release 页脚缺 {token}"
+    for token in ("GCJ-02", "SQLite", "osm_type", "has_more"):
+        assert token not in release, f"release 页脚不许出现技术细节 {token}"
+    # dev 页脚原样保留(TASK-9d 断言仍要过)
+    dev = html[html.index('<footer class="dev-only">'):html.index("</footer>")]
+    assert "高德 JS API 2.0" in dev and "/api/map-config" in dev
+
+
+def _release_branch(html: str, fn_name: str, end_marker: str) -> str:
+    start = html.index(f"function {fn_name}")
+    return html[start:html.index(end_marker, start)]
+
+
+def _strip_js_comments(code: str) -> str:
+    """去掉 // 注释(整行与行尾)再断言——注释里提技术词不算泄漏给 release 用户;
+    适用分支的字符串字面量里都不含 "//"(https:// 之类),行尾剥离安全。"""
+    out = []
+    for line in code.split("\n"):
+        if line.lstrip().startswith("//"):
+            continue
+        cut = line.find("//")
+        out.append(line if cut < 0 else line[:cut])
+    return "\n".join(out)
+
+
+def test_p6_status_bar_release_only_user_facing(html: str) -> None:
+    """状态栏:release 只留 起点/分段/分类/已显示;来源/耗时/轮次/geocoder 全不进 release 分支。"""
+    status = _release_branch(html, "placesStatusHtml", "function applyPlacesPage")
+    branch = _strip_js_comments(
+        status[status.index("if(isReleaseUI())"):status.index("const bandTotal=")])
+    for keep in ("起点 <b>", "esc(data.band.label)", "分类 <b>", "已显示 <b>"):
+        assert keep in branch, f"release 状态栏必须保留 {keep}"
+    for hide in ("来源:", "耗时", "elapsed_s", "已抓", "起点解析", "introNote", "pagingNote",
+                 "geocoderNote", "OVERSEAS_COORD_HINT"):
+        assert hide not in branch, f"release 状态栏不许出现 {hide}"
+    # dev 分支原样(既有断言 test_geocoder_note 已核 geocoderNote() 仍在函数里)
+    assert "geocoderNote()" in status and "introNote(data)" in status
+
+
+def test_p6_identity_release_hides_poi_and_coords(html: str) -> None:
+    """popup/详情来源脚注:release 只留来源大类,POI id 与坐标系隐藏。"""
+    ident = _release_branch(html, "identityHtml", "function num(value)")
+    branch = _strip_js_comments(
+        ident[ident.index("if(isReleaseUI())"):ident.index("const coord=")])
+    assert "POI" not in branch and "GCJ-02" not in branch and "WGS-84" not in branch
+    assert "toFixed(4)" not in branch, "坐标值也不许出现"
+    assert '"高德"' in branch and "OpenStreetMap" in branch and "人工补录" in branch
+    # dev 分支的「来源:高德 · POI <id> · 坐标(GCJ-02)」照旧(TASK-9d 断言同源)
+    assert "来源:<b>高德</b> · POI " in ident and "坐标(GCJ-02)" in ident
+
+
+def test_p6_reco_subtitle_release_minimal(html: str) -> None:
+    """AI 推荐副标:release 只留「AI 推荐 N 条」+换一批;模型名/候选/依据/缓存全隐藏。"""
+    reco = _release_branch(html, "applyRecoData", "async function loadRecommend(")
+    branch = _strip_js_comments(
+        reco[reco.index("if(isReleaseUI()){"):reco.index("const bandLabel=")])
+    assert '"AI 推荐 "+items.length+" 条' in branch and "换一批" in branch
+    for hide in ("provider", "模型", "候选", "依据", "命中推荐缓存", "payload.cached", "detail_pending"):
+        assert hide not in branch, f"release 推荐副标不许出现 {hide}"
+    # dev 分支照旧
+    assert 'parts.push("模型 "+String(payload.provider))' in reco
+    assert "命中推荐缓存" in reco
+
+
+def test_p6_detail_batch_messages_release_silent(html: str) -> None:
+    """长介绍批次消息:release 成功静默、失败一句话;dev 的批次统计照旧。"""
+    details = _release_branch(html, "applyDetails", "// 懒加载续批")
+    assert 'if(isReleaseUI()) setListMsg("");' in details, "release 成功批次必须静默"
+    assert '"介绍生成失败,稍后自动重试"' in details, "release 失败一句话"
+    assert "本批生成" in details and "自动续批中" in details, "dev 批次统计不许被删"
+
+
+def test_p6_estimate_badges_kept(html: str) -> None:
+    """合规红线:「估算」「AI 预估 · 仅供参考 · 以 OTA 实时为准」标注不进 dev-only,release 也必须在。"""
+    assert 'class="sc-est"' in html
+    est = html[html.index('<span class="sc-est"'):]
+    assert "估算" in html and "AI 预估 · 仅供参考 · 以 OTA 实时为准" in html
+    # 这两个标注所在元素不许挂 dev-only(挂了 release 用户就看不到免责了)
+    for token in ('class="sc-est"', "AI 预估 · 仅供参考 · 以 OTA 实时为准"):
+        pos = html.index(token)
+        ctx = html[max(0, pos - 300):pos + 300]
+        assert "dev-only" not in ctx.split(token)[0].rsplit("<", 1)[-1], f"{token} 不许被 dev-only 藏"
+
+
+def test_p6_progress_and_subtexts_release_branches(html: str) -> None:
+    """进度/副文案 release 分支:loadPlaces/loadMorePlaces/syncMoreButton/renderListSub/fillIntros。"""
+    assert '"正在刷新目的地…"' in html and "正在搜索目的地(首次约 10-60s)" in html
+    lp = _release_branch(html, "loadPlaces", "async function loadMorePlaces(")
+    assert "isReleaseUI()" in lp and "v3 place/around" in lp, "dev 技术文案保留在 else 分支"
+    more = _release_branch(html, "loadMorePlaces", "function introNote(")
+    assert "MORE_EXPAND_HINT" in more
+    smb = _release_branch(html, "syncMoreButton", "function clearPlacesView(")
+    assert "offset=" in smb and 'button.title=isReleaseUI()' in smb, "title 里的 offset 技术细节 release 不出"
+    rls = _release_branch(html, "renderListSub", "function syncDetailMore(")
+    assert "DETAIL_BATCH" in rls and "isReleaseUI()" in rls, "dev 的每批口径保留"
+    assert '"正在补齐简介…"' in html
+
+
+@pytest.mark.skipif(NODE is None, reason="环境未安装 node,跳过内联脚本语法检查")
+def test_p6_inline_js_passes_node_check(html: str, tmp_path: Path) -> None:
+    script = tmp_path / "task_p6_inline.js"
     script.write_text(inline_script(html), encoding="utf-8")
     result = subprocess.run([NODE, "--check", str(script)], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, f"内联脚本语法错误:\n{result.stderr}"

@@ -408,10 +408,21 @@ def _fetch_rounds(outcome: place_loader.SegmentOutcome) -> int:
     return int((outcome.segment or {}).get("fetch_rounds") or 0)
 
 
+def _ui_mode() -> str:
+    """TASK-P6:发布版 UI 开关(``WHERE2GO_UI_MODE``,容器默认 release、开发默认 dev)。
+
+    只认 ``release``(大小写不敏感),其余值一律按 ``dev``——宁可见到技术细节,
+    也不能把开发态误判成发布态。每次调用现读 env(与 intro/amap 同口径,测试可 monkeypatch)。
+    """
+    mode = str(os.environ.get("WHERE2GO_UI_MODE", "")).strip().lower()
+    return "release" if mode == "release" else "dev"
+
+
 @router.get("/places/meta")
 def places_meta() -> dict[str, Any]:
     """分段 + 四分类 + 归类优先级 + 检索分组 + LLM 配置 + 种子概览(前端图例/状态栏的唯一出处)。"""
     return {
+        "ui_mode": _ui_mode(),
         "bands": [dict(band) for band in DISTANCE_BANDS],
         "categories": [dict(item) for item in CATEGORIES],
         "category_priority": list(CATEGORY_PRIORITY),

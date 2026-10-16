@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Where2Go · 配置向导</title>
+<!--
+  TASK-P3:/setup 用户配置向导(容器版没有 .env,在这里把 key 存进数据库)。
+  4 步:①高德 Web服务 key ②高德 JS key + 安全密钥 ③LLM(可选)④完成。
+  口径(docs/CONTAINER-SETUP-PLAN.md):
+  - 每步「真调校验」只发**一次**外部请求(POST /api/config/validate,防高德 QPS 10021);
+  - 保存走 POST /api/config(单键提交,写库 + 热生效,无需重启);
+  - key 永不回显明文(GET /api/config 只给掩码);
+  - 两把高德 key 平台隔离(混用报 USERKEY_PLAT_NOMATCH / infocode 10009);
+  - 安全密钥必须与 JS key 配套,缺失或填错 → 首页地图报 INVALID_USER_SCODE(服务端校验不了它,只能靠文案讲清)。
+-->
+<style>
+  :root{--brand:#0f766e;--warn:#b45309;--err:#b91c1c;--ok:#15803d;--muted:#6b7280;--line:#e5e7eb}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:#f8fafc;color:#111827;line-height:1.6}
+  header{background:#fff;border-bottom:1px solid var(--line);padding:18px 20px}
+  header h1{margin:0;font-size:20px}
+  header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  main{max-width:760px;margin:0 auto;padding:20px 16px 60px}
+  .steps{display:flex;gap:6px;margin:0 0 18px;flex-wrap:wrap}
+  .steps span{flex:1;min-width:120px;text-align:center;padding:8px 6px;border-radius:8px;
+       background:#fff;border:1px solid var(--line);font-size:13px;color:var(--muted)}
+  .steps span.active{border-color:var(--brand);color:var(--brand);font-weight:600}
+  .steps span.done{background:#ecfdf5;border-color:#a7f3d0;color:var(--ok)}
+  .card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:14px}
+  .card h2{margin:0 0 6px;font-size:17px}
+  .card .sub{color:var(--muted);font-size:13px;margin:0 0 12px}
+  label.f{display:block;font-size:13px;font-weight:600;margin:14px 0 4px}
+  label.f .req{color:var(--err)}
+  label.f .opt{color:var(--muted);font-weight:400}
+  input[type=text],input[type=password],select{width:100%;padding:9px 10px;border:1px solid #cbd5e1;
+       border-radius:8px;font-size:14px;font-family:ui-monospace,Consolas,monospace}
+  input:focus,select:focus{outline:2px solid #99f6e4;border-color:var(--brand)}
+  .hint{font-size:12px;color:var(--muted);margin-top:4px}
+  .state{font-size:12px;margin-top:4px}
+  .state.env{color:var(--warn)}
+  .state.ok{color:var(--ok)}
+  .btns{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
+  button{padding:9px 18px;border-radius:8px;border:1px solid var(--brand);background:var(--brand);
+       color:#fff;font-size:14px;cursor:pointer}
+  button.ghost{background:#fff;color:var(--brand)}
+  button.plain{background:#fff;color:#374151;border-color:#cbd5e1}
+  button:disabled{opacity:.55;cursor:not-allowed}
+  .msg{display:none;margin-top:12px;padding:10px 12px;border-radius:8px;font-size:13px;white-space:pre-wrap}
+  .msg.ok{display:block;background:#f0fdf4;border:1px solid #bbf7d0;color:var(--ok)}
+  .msg.err{display:block;background:#fef2f2;border:1px solid #fecaca;color:var(--err)}
+  .msg.warn{display:block;background:#fffbeb;border:1px solid #fde68a;color:var(--warn)}
+  .msg.busy{display:block;background:#f1f5f9;border:1px solid var(--line);color:var(--muted)}
+  .tut{background:#f8fafc;border:1px dashed #cbd5e1;border-radius:8px;padding:10px 12px;font-size:13px;margin:10px 0}
+  .tut a{color:var(--brand)}
+  .tut ol{margin:6px 0 0;padding-left:20px}
+  code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+  .kv{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:6px 0;border-bottom:1px dashed var(--line)}
+  .kv:last-child{border-bottom:none}
+  footer{text-align:center;color:#9ca3af;font-size:12px;padding:14px}
+</style>
+</head>
+<body>
+<header>
+  <h1>🧭 Where2Go · 配置向导</h1>
+  <p>容器版没有 .env 文件:在这里填入你自己的 key,保存后<b>即时生效、无需重启</b>。配置存在容器数据卷的数据库里;若容器环境变量已设同名变量,以环境变量为准。key 永不回显明文。</p>
+</header>
+<main>
+  <div class="steps" id="stepBar">
+    <span data-step="1">① 高德 Web服务 key</span>
+    <span data-step="2">② 高德 JS key + 安全密钥</span>
+    <span data-step="3">③ LLM(可选)</span>
+    <span data-step="4">④ 完成</span>
+  </div>
+
+  <!-- ① 高德 Web 服务 key -->
+  <section class="card" id="step1">
+    <h2>第 1 步 · 高德 Web 服务 key <span style="color:var(--err)">*</span></h2>
+    <p class="sub">后端 POI 检索 / 地理编码 / 驾车路线全靠它。缺了它,首页地图和搜索都不可用。</p>
+    <div class="tut">
+      <b>怎么申请(免费,约 3 分钟):</b>
+      <ol>
+        <li>打开 <a href="https://console.amap.com/dev/key/app" target="_blank" rel="noopener">高德开放平台控制台 → 应用管理 → 我的应用</a>(未注册先注册,个人开发者实名认证即可)。</li>
+        <li>「创建新应用」→ 应用里「添加 Key」。</li>
+        <li><b>服务平台务必选「Web服务」</b>(不是「Web端(JS API)」!)。选错平台,后端调用会报 <code>USERKEY_PLAT_NOMATCH</code>(infocode 10009)。</li>
+        <li>创建后复制那串 key,粘贴到下面。</li>
+      </ol>
+    </div>
+    <label class="f" for="amapKey">Web服务 key <span class="req">(必填)</span></label>
+    <input type="password" id="amapKey" placeholder="粘贴高德 Web服务 key" autocomplete="off">
+    <div class="state" id="amapKeyState"></div>
+    <div class="hint">点「校验」会用这张 key 真调一次高德地理编码(只打一次请求,不会触发限流);通过后自动保存。</div>
+    <div class="btns">
+      <button id="amapValidate">校验并保存</button>
+      <button class="plain" id="amapSkipWarn" style="display:none">跳过(先不配)</button>
+      <button class="ghost" id="toStep2" disabled>下一步 →</button>
+    </div>
+    <div class="msg" id="amapMsg"></div>
+  </section>
+
+  <!-- ② 高德 JS key + 安全密钥 -->
+  <section class="card" id="step2" style="display:none">
+    <h2>第 2 步 · 高德 Web端(JS API)key + 安全密钥 <span style="color:var(--err)">*</span></h2>
+    <p class="sub">首页地图(高德 JS API 2.0)用这两个值加载。<b>与第 1 步的 key 是同一应用下的两把不同 key,平台隔离、不能混用。</b></p>
+    <div class="tut">
+      <b>血泪坑,请照抄:</b>
+      <ol>
+        <li>在<b>同一个应用</b>里再「添加 Key」,服务平台选 <b>「Web端(JS API)」</b>。</li>
+        <li>创建 JS key 时会同时给出一个<b>安全密钥(securityJsCode)</b>——两个都要复制。</li>
+        <li>把「Web服务」key 填到这里、或把 JS key 填到第 1 步,都会报 <code>USERKEY_PLAT_NOMATCH</code>(infocode 10009)。</li>
+        <li>安全密钥缺失或填错 → 首页地图整块空白,浏览器控制台报 <code>INVALID_USER_SCODE</code>。本向导保存后,首页会在加载地图脚本<b>之前</b>写入 <code>window._AMapSecurityConfig</code>,顺序已处理好,你只需要把值填对。</li>
+      </ol>
+    </div>
+    <label class="f" for="jsKey">JS API key <span class="req">(必填)</span></label>
+    <input type="password" id="jsKey" placeholder="粘贴高德 Web端(JS API)key" autocomplete="off">
+    <div class="state" id="jsKeyState"></div>
+    <label class="f" for="jsCode">安全密钥 securityJsCode <span class="req">(必填)</span></label>
+    <input type="password" id="jsCode" placeholder="粘贴与 JS key 配套的安全密钥" autocomplete="off">
+    <div class="state" id="jsCodeState"></div>
+    <div class="hint">点「校验」会拿 JS key 打一次 REST 探针:被高德以「10009 平台不符」拒绝 = <b>恰好证明它是真的 JS key</b>,即校验通过。安全密钥只在浏览器加载地图时使用,服务端无法预先校验。</div>
+    <div class="btns">
+      <button id="jsValidate">校验并保存</button>
+      <button class="plain" id="toStep1">← 上一步</button>
+      <button class="ghost" id="toStep3" disabled>下一步 →</button>
+    </div>
+    <div class="msg" id="jsMsg"></div>
+  </section>
+
+  <!-- ③ LLM(可选) -->
+  <section class="card" id="step3" style="display:none">
+    <h2>第 3 步 · LLM(可选)</h2>
+    <p class="sub">用于 POI 一句话简介与 AI 行程推荐。<b>不配也能用</b>:简介留空、AI 推荐降级,地图与检索照常。</p>
+    <label class="f" for="llmProvider">服务商</label>
+    <select id="llmProvider">
+      <option value="">(自动 / 不指定)</option>
+      <option value="deepseek">DeepSeek(api.deepseek.com)</option>
+      <option value="qwen">阿里 Qwen(百炼兼容模式)</option>
+      <option value="custom">自定义(任意 OpenAI 兼容服务)</option>
+    </select>
+    <label class="f" for="llmBase">接口地址 base_url <span class="opt">(选「自定义」时必填,否则留空用服务商默认)</span></label>
+    <input type="text" id="llmBase" placeholder="如 https://api.deepseek.com" autocomplete="off">
+    <label class="f" for="llmModel">模型名 <span class="opt">(留空用服务商默认)</span></label>
+    <input type="text" id="llmModel" placeholder="如 deepseek-chat / qwen-plus" autocomplete="off">
+    <label class="f" for="llmKey">API key <span class="opt">(可选)</span></label>
+    <input type="password" id="llmKey" placeholder="粘贴 LLM API key" autocomplete="off">
+    <div class="state" id="llmKeyState"></div>
+    <div class="hint">点「测试」会发一条 1-token 的测试消息(可能产生极小额费用);也可以直接跳过。</div>
+    <div class="btns">
+      <button id="llmValidate">测试并保存</button>
+      <button class="ghost" id="llmSkip">跳过(不配 LLM)</button>
+      <button class="plain" id="toStep2b">← 上一步</button>
+    </div>
+    <div class="msg" id="llmMsg"></div>
+  </section>
+
+  <!-- ④ 完成 -->
+  <section class="card" id="step4" style="display:none">
+    <h2>第 4 步 · 完成</h2>
+    <p class="sub">当前配置状态(来自 <code>GET /api/health</code> 与 <code>GET /api/config</code>,只回掩码):</p>
+    <div id="summary"></div>
+    <div class="msg" id="doneMsg"></div>
+    <div class="btns">
+      <button id="goHome">🧭 回到首页</button>
+      <button class="plain" id="toStep3b">← 上一步</button>
+    </div>
+  </section>
+</main>
+<footer>Where2Go · 配置保存在容器数据卷 · 环境变量优先于向导配置 · AGPL-3.0</footer>
+<script>
+// TASK-P3 向导逻辑:纯 fetch + 原生 JS,无外部依赖。
+// 保存 = POST /api/config(单键);校验 = POST /api/config/validate(每步只打一次外部请求)。
+(function(){
+"use strict";
+var $=function(id){return document.getElementById(id);};
+var FIELDS={amapKey:"WHERE2GO_AMAP_KEY",jsKey:"WHERE2GO_AMAP_JS_KEY",jsCode:"WHERE2GO_AMAP_SECURITY_JS_CODE",
+            llmProvider:"WHERE2GO_LLM_PROVIDER",llmBase:"WHERE2GO_LLM_BASE_URL",
+            llmModel:"WHERE2GO_LLM_MODEL",llmKey:"WHERE2GO_LLM_API_KEY"};
+var PROVIDER_DEFAULTS={deepseek:{base:"https://api.deepseek.com",model:"deepseek-chat"},
+                       qwen:{base:"",model:"qwen-plus"}};
+
+function setMsg(id,text,kind){var el=$(id);el.textContent=text||"";el.className="msg"+(text?(" "+kind):"");}
+function setBusy(on){["amapValidate","jsValidate","llmValidate"].forEach(function(id){$(id).disabled=on;});}
+function stepTo(n){
+  [1,2,3,4].forEach(function(i){$("step"+i).style.display=(i===n)?"":"none";});
+  var bar=$("stepBar").children;
+  for(var i=0;i<bar.length;i++){
+    var s=parseInt(bar[i].getAttribute("data-step"),10);
+    bar[i].className=(s===n)?"active":(s<n?"done":"");
+  }
+  if(n===4)renderSummary();
+}
+async function api(path,opt){
+  var resp=await fetch(path,opt);
+  var data=await resp.json().catch(function(){return {};});
+  if(!resp.ok)throw new Error(data.detail||("HTTP "+resp.status));
+  return data;
+}
+function postJSON(path,body){return api(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});}
+async function saveKey(key,value){return postJSON("/api/config",{key:key,value:value});}
+
+// 已配置状态(掩码展示;env 来源的键在向导里改不动,给黄色提示)
+function paintState(stateId,items,keyName){
+  var el=$(stateId);if(!el||!items)return;
+  var it=null;
+  for(var i=0;i<items.length;i++){if(items[i].key===keyName){it=items[i];break;}}
+  if(!it||!it.configured){el.textContent="当前:未配置";el.className="state";return;}
+  if(it.source==="env"){
+    el.textContent="当前:已配置("+it.masked+")· 来自容器环境变量 —— 在向导里保存也会被环境变量压过,要改请改 .env / -e";
+    el.className="state env";
+  }else{
+    el.textContent="当前:已配置("+it.masked+")· 来自本向导,重新粘贴可覆盖";
+    el.className="state ok";
+  }
+}
+async function loadConfig(){
+  try{
+    var data=await api("/api/config");
+    paintState("amapKeyState",data.items,FIELDS.amapKey);
+    paintState("jsKeyState",data.items,FIELDS.jsKey);
+    paintState("jsCodeState",data.items,FIELDS.jsCode);
+    paintState("llmKeyState",data.items,FIELDS.llmKey);
+    window.__w2gConfig=data;
+  }catch(e){/* 服务异常时不阻塞向导,保存时再报 */}
+}
+
+// —— 第 1 步 ——
+$("amapValidate").addEventListener("click",async function(){
+  var v=$("amapKey").value.trim();
+  if(!v){setMsg("amapMsg","请先粘贴 key(申请教程见上方)。","warn");return;}
+  setBusy(true);setMsg("amapMsg","正在用这张 key 真调一次高德地理编码(约 1~3 秒)…","busy");
+  try{
+    var r=await postJSON("/api/config/validate",{target:"amap",value:v});
+    if(r.ok){
+      await saveKey(FIELDS.amapKey,v);
+      setMsg("amapMsg","✅ "+r.detail+"\n已保存并即时生效(无需重启)。","ok");
+      $("amapKey").value="";$("toStep2").disabled=false;$("amapSkipWarn").style.display="none";
+      loadConfig();
+    }else{
+      setMsg("amapMsg","❌ 校验未通过:"+r.detail+"\n(key 没有被保存;修正后可重试。确有特殊情况也可点「跳过」先不配。)","err");
+      $("amapSkipWarn").style.display="";
+    }
+  }catch(e){setMsg("amapMsg","❌ 请求失败:"+e.message,"err");}
+  setBusy(false);
+});
+$("amapSkipWarn").addEventListener("click",function(){
+  setMsg("amapMsg","已跳过:没配 Web服务 key 时,首页搜索/地图不可用,但可以之后随时回来补。","warn");
+  $("toStep2").disabled=false;
+});
+$("toStep2").addEventListener("click",function(){stepTo(2);});
+$("toStep1").addEventListener("click",function(){stepTo(1);});
+
+// —— 第 2 步 ——
+$("jsValidate").addEventListener("click",async function(){
+  var k=$("jsKey").value.trim(),c=$("jsCode").value.trim();
+  if(!k||!c){setMsg("jsMsg","JS key 与安全密钥是一对,两个都要填(申请教程见上方)。","warn");return;}
+  setBusy(true);setMsg("jsMsg","正在用 JS key 打一次 REST 探针(预期被高德以 10009「平台不符」拒绝=通过)…","busy");
+  try{
+    var r=await postJSON("/api/config/validate",{target:"amap_js",value:k});
+    if(r.ok){
+      await saveKey(FIELDS.jsKey,k);
+      await saveKey(FIELDS.jsCode,c);
+      setMsg("jsMsg","✅ "+r.detail+"\nJS key 与安全密钥均已保存(安全密钥无法在服务端预校验:若首页地图空白并报 INVALID_USER_SCODE,回来核对这一对值)。","ok");
+      $("jsKey").value="";$("jsCode").value="";$("toStep3").disabled=false;
+      loadConfig();
+    }else{
+      setMsg("jsMsg","❌ 校验未通过:"+r.detail+"\n(两个值都没有被保存。最常见原因:把第 1 步的「Web服务」key 填到了这里——两把 key 平台隔离,请回高德控制台确认。)","err");
+    }
+  }catch(e){setMsg("jsMsg","❌ 请求失败:"+e.message,"err");}
+  setBusy(false);
+});
+$("toStep3").addEventListener("click",function(){stepTo(3);});
+$("toStep2b").addEventListener("click",function(){stepTo(2);});
+
+// —— 第 3 步 ——
+$("llmProvider").addEventListener("change",function(){
+  var p=PROVIDER_DEFAULTS[$("llmProvider").value];
+  if(p){if(!$("llmBase").value)$("llmBase").placeholder="如 "+(p.base||"(服务商默认)");if(!$("llmModel").value)$("llmModel").placeholder="如 "+(p.model||"(默认)");}
+});
+$("llmValidate").addEventListener("click",async function(){
+  var provider=$("llmProvider").value,base=$("llmBase").value.trim(),
+      model=$("llmModel").value.trim(),key=$("llmKey").value.trim();
+  if(provider==="custom"&&!base){setMsg("llmMsg","选了「自定义」就要填接口地址 base_url。","warn");return;}
+  if(!key){setMsg("llmMsg","没填 key 就没法测试;不想配 LLM 请点「跳过」。","warn");return;}
+  setBusy(true);setMsg("llmMsg","正在发一条 1-token 测试消息…","busy");
+  try{
+    var r=await postJSON("/api/config/validate",{target:"llm",value:key,provider:provider,base_url:base,model:model});
+    if(r.ok){
+      await saveKey(FIELDS.llmKey,key);
+      if(provider)await saveKey(FIELDS.llmProvider,provider);
+      await saveKey(FIELDS.llmBase,base);
+      await saveKey(FIELDS.llmModel,model);
+      setMsg("llmMsg","✅ "+r.detail+"\nLLM 配置已保存并即时生效。","ok");
+      $("llmKey").value="";loadConfig();stepTo(4);
+    }else{
+      setMsg("llmMsg","❌ 测试未通过:"+r.detail+"\n(什么都没保存;这一步是可选的,也可以点「跳过」。)","err");
+    }
+  }catch(e){setMsg("llmMsg","❌ 请求失败:"+e.message,"err");}
+  setBusy(false);
+});
+$("llmSkip").addEventListener("click",function(){stepTo(4);});
+$("toStep3b").addEventListener("click",function(){stepTo(3);});
+
+// —— 第 4 步 ——
+async function renderSummary(){
+  var box=$("summary");box.textContent="加载中…";
+  try{
+    var h=await api("/api/health");
+    var c=await api("/api/config");
+    var rows="";
+    for(var i=0;i<c.items.length;i++){
+      var it=c.items[i];
+      rows+='<div class="kv"><span>'+it.label+'</span><span>'+(it.configured
+        ?("已配置("+(it.masked||"掩码")+") · "+(it.source==="env"?"环境变量":"向导"))
+        :(it.required?'<b style="color:var(--err)">未配置(必填)</b>':'未配置(可选)'))+'</span></div>';
+    }
+    box.innerHTML=rows+'<div class="kv"><span>版本</span><span>'+h.version+'</span></div>';
+    if(h.status==="ok"){
+      setMsg("doneMsg","🎉 必填项已配齐。回首页搜一个城市(如「上海」)试试:地图出 pin、点 pin 出路线对比,就说明全链路通了。","ok");
+    }else{
+      setMsg("doneMsg","⚠️ 还缺必填项:"+(h.missing_required||[]).join("、")+"。首页仍可打开(列表/收藏可用),但地图与搜索不可用——随时可回本向导补配。","warn");
+    }
+  }catch(e){box.textContent="状态加载失败:"+e.message;}
+}
+$("goHome").addEventListener("click",function(){location.href="/";});
+
+// 已配好必填项时,第 1/2 步的「下一步」直接可点(允许只改 LLM 或重配)
+(function prefill(){
+  loadConfig().then(function(){
+    var data=window.__w2gConfig;
+    if(!data)return;
+    var missing=data.missing_required||[];
+    if(missing.indexOf(FIELDS.amapKey)<0)$("toStep2").disabled=false;
+    if(missing.indexOf(FIELDS.jsKey)<0&&missing.indexOf(FIELDS.jsCode)<0)$("toStep3").disabled=false;
+  });
+})();
+stepTo(1);
+})();
+</script>
+</body>
+</html>

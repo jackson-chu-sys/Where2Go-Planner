@@ -344,6 +344,10 @@
     #routePanel{position:static;width:auto;max-height:none;margin-top:10px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
   }
   footer{color:#9ca3af;font-size:12px;text-align:center;padding:14px}
+  /* TASK-P3:缺必填配置的引导横幅(决策③:不强制重定向,只引导) */
+  #setupBanner{display:none;margin:10px auto 0;max-width:1080px;padding:10px 14px;border-radius:10px;
+    background:#fffbeb;border:1px solid #fde68a;color:#92400e;font-size:13px;line-height:1.6}
+  #setupBanner a{color:#b45309;font-weight:600}
 </style>
 </head>
 <body>
@@ -353,6 +357,8 @@
      地图下方列表推荐置顶、长介绍分批懒加载 · 点 pin 出驾车/铁路/飞机路线对比 ·
      <a href="/list.html">列表模式(POC)</a> · <a href="/docs">API 文档</a></p>
 </header>
+<!-- TASK-P3:GET /api/health 缺必填项时显示,引导去 /setup 向导;配齐则永远不出现 -->
+<div id="setupBanner"></div>
 <main>
   <div class="card">
     <div class="row">
@@ -5055,7 +5061,26 @@ renderAssistMsgs();          // 空态占位(抽屉默认收着,打开时才回�
 renderAssistTripMsgs();
 renderAssistTripTags();
 
+// TASK-P3:缺必填配置(高德三件套)时显示引导横幅 → /setup 向导;配齐/接口挂了都保持隐藏。
+// 决策③口径:不强制重定向,列表/收藏/AI 等其余功能照常可用。
+async function checkSetupBanner(){
+  try{
+    const data=await getJSON("/api/health");
+    const missing=Array.isArray(data.missing_required)?data.missing_required:[];
+    const banner=$("setupBanner");
+    if(!banner)return;
+    if(!missing.length){banner.style.display="none";banner.innerHTML="";return;}
+    banner.innerHTML="⚠️ 尚未完成配置(缺:"+missing.map(escapeHtml).join("、")+
+      ")。地图与城市搜索需要高德 key → <a href=\"/setup\">打开配置向导</a>(保存后即时生效,无需重启)。";
+    banner.style.display="block";
+  }catch(error){/* /api/health 不可达时不打扰用户:横幅保持隐藏 */}
+}
+function escapeHtml(text){
+  return String(text).replace(/[&<>"']/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+}
+
 (async function boot(){
+  checkSetupBanner().catch(()=>{});   // 横幅独立于地图链路,先查先显示
   // 地图(TASK-9d):先运行时取 key(GET /api/map-config,key 不进 git、不写在本页),
   // 再动态注入高德 JS API 2.0(安全密钥先于脚本写好)。**没 key / 加载失败只降地图**:
   // 目的地列表、AI 推荐、长介绍、收藏与行程方案、路线对比全部照常可用,不抛 JS 错。

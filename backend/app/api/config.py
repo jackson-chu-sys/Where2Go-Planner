@@ -25,6 +25,7 @@ FastAPI 拦成 422 英文报错,同一个"参数不对"就有两种状态码。�
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -32,8 +33,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic.fields import FieldInfo
 from sqlalchemy.orm import Session
 
+from data_sources import DataSourceError, TransientDataSourceError, amap
 from db.base import get_session
 from services import app_config
+from services import intro as intro_service
 
 router = APIRouter()
 
@@ -181,3 +184,177 @@ def health(session: Session = Depends(get_session)) -> dict[str, Any]:
         "missing_required": missing,
         "version": APP_VERSION,
     }
+
+
+# --------------------------------------------------------------------------- #
+# TASK-P3:向导「真调校验」端点(每步只打**一次**外部请求,防高德 QPS 10021)
+# --------------------------------------------------------------------------- #
+
+#: 可校验的目标:①高德 Web 服务 key ②高德 JS key ③LLM(发 1-token 测试消息)
+VALIDATE_TARGETS: tuple[str, ...] = ("amap", "amap_js", "llm")
+#: Web 服务 key 的探针:一次正向地理编码(固定城市,不做批量探活)
+PROBE_ADDRESS = "北京"
+#: JS key 探针的预期 infocode:10009 = 「平台不符」恰好证明它**就是** JS 平台的 key
+JS_KEY_EXPECTED_INFOCODE = "10009"
+LLM_PROBE_PROMPT = "连通性测试,请只回复一个字:好"
+LLM_PROBE_MAX_TOKENS = 16
+LLM_PROBE_TIMEOUT_S = 20.0
+_INFOCODE_RE = re.compile(r"infocode=(\d+)")
+
+VALIDATE_NOTE = (
+    "校验只发一次真实请求(高德 QPS 限制,连打会报 10021);结果不落库,key 不回显明文。"
+)
+
+
+def _scrub(text: str, *values: str) -> str:
+    """把可能混进错误文案的明文值替换成掩码(**完整值永不进响应**,照 P2 口径)。"""
+    out = str(text or "")
+    for value in values:
+        cleaned = (value or "").strip()
+        if cleaned and cleaned in out:
+            out = out.replace(cleaned, app_config.mask_value(cleaned))
+    return out
+
+
+def _extract_infocode(text: str) -> str:
+    match = _INFOCODE_RE.search(str(text or ""))
+    return match.group(1) if match else ""
+
+
+def _validate_amap(session: Session, value: str) -> dict[str, Any]:
+    """真调一次 ``geocode("北京")`` 校验**Web 服务** key;失败给 infocode 中文解释。"""
+    key = value.strip() or app_config.effective_value(session, app_config.ENV_AMAP_KEY)
+    if not key:
+        return {"ok": False, "target": "amap", "infocode": "",
+                "detail": "还没填 key:先粘贴「Web服务」平台的高德 key 再点校验。"}
+    try:
+        rows = amap.geocode(PROBE_ADDRESS, environ={amap.ENV_AMAP_KEY: key})
+    except DataSourceError as exc:  # 含 Transient(重试打满后也归到这一档)
+        text = _scrub(exc.message or str(exc), key)
+        return {"ok": False, "target": "amap",
+                "infocode": _extract_infocode(text), "detail": text}
+    if not rows:
+        return {"ok": False, "target": "amap", "infocode": "",
+                "detail": f"key 能用但地理编码「{PROBE_ADDRESS}」零结果(罕见),请核对 key 权限。"}
+    first = rows[0]
+    return {
+        "ok": True, "target": "amap", "infocode": "",
+        "detail": (f"校验通过:geocode(「{PROBE_ADDRESS}」)返回 {len(rows)} 条,"
+                   f"首条「{first.get('formatted_address') or PROBE_ADDRESS}」。"),
+        "sample": {"formatted_address": first.get("formatted_address", ""),
+                   "lng": first.get("lng"), "lat": first.get("lat")},
+    }
+
+
+def _validate_amap_js(session: Session, value: str) -> dict[str, Any]:
+    """用 JS key 打一次 REST 探针:**返回 10009(平台不符)= 校验通过**。
+
+    JS key 与 Web 服务 key 平台隔离(血泪坑:混用报 ``USERKEY_PLAT_NOMATCH``,
+    infocode 10009)。所以「拿它调 REST 被拒、且拒的原因正是平台不符」恰恰证明
+    它是一张真的「Web端(JS API)」key;返回 10001/10013 等则是 key 本身无效。
+    安全密钥(securityJsCode)无法在服务端校验(只在浏览器加载地图脚本时用),
+    向导文案已写明:填错会在首页地图报 ``INVALID_USER_SCODE``。
+    """
+    key = value.strip() or app_config.effective_value(session, app_config.ENV_AMAP_JS_KEY)
+    if not key:
+        return {"ok": False, "target": "amap_js", "infocode": "",
+                "detail": "还没填 key:先粘贴「Web端(JS API)」平台的高德 key 再点校验。"}
+    try:
+        amap.geocode(PROBE_ADDRESS, environ={amap.ENV_AMAP_KEY: key})
+    except DataSourceError as exc:
+        text = _scrub(exc.message or str(exc), key)
+        infocode = _extract_infocode(text)
+        if infocode == JS_KEY_EXPECTED_INFOCODE:
+            return {
+                "ok": True, "target": "amap_js", "infocode": infocode,
+                "detail": ("校验通过:高德返回 10009「key 与平台类型不符」——这恰好证明它是一张"
+                           "「Web端(JS API)」key(与 Web 服务 key 平台隔离、不能混用);"
+                           "前端地图将用它 + 安全密钥加载。"),
+            }
+        if isinstance(exc, TransientDataSourceError):
+            return {"ok": False, "target": "amap_js", "infocode": infocode,
+                    "detail": f"高德暂时不可达,无法判定:{text}(稍后重试即可,别连点)"}
+        return {"ok": False, "target": "amap_js", "infocode": infocode, "detail": text}
+    # REST 居然成功了:说明这张 key 同时开了 Web 服务平台(或填的其实是 Web 服务 key)
+    return {
+        "ok": True, "target": "amap_js", "infocode": "",
+        "detail": ("这张 key 也能调通 Web 服务 REST(可能同时开通了两个平台,或填成了 Web 服务 key)。"
+                   "地图大概率能用,但请确认它是在「Web端(JS API)」平台下申请的;"
+                   "两个 key 平台隔离,前端地图只认 JS key + 安全密钥。"),
+    }
+
+
+def _validate_llm(session: Session, body: Mapping[str, Any], value: str) -> dict[str, Any]:
+    """发一条 1-token 测试消息校验 LLM 配置(provider/base_url/model 可临时覆盖)。"""
+    overrides = {
+        intro_service.ENV_PROVIDER: _optional_text(body.get("provider")) or "",
+        intro_service.ENV_BASE_URL: _optional_text(body.get("base_url")) or "",
+        intro_service.ENV_MODEL: _optional_text(body.get("model")) or "",
+    }
+    key = value.strip() or app_config.effective_value(session, app_config.ENV_LLM_API_KEY)
+    environ: dict[str, str] = {name: text for name, text in overrides.items() if text}
+    if key:
+        environ[intro_service.ENV_API_KEY] = key
+    resolved = intro_service.resolve_provider(environ if environ else None)
+    if resolved is None:
+        return {"ok": False, "target": "llm", "infocode": "",
+                "detail": ("没有可校验的 LLM key:这一步是可选的,可以直接跳过;"
+                           "要校验就填 key(任意 OpenAI 兼容服务)。")}
+    try:
+        client = intro_service.LLMClient(
+            resolved=resolved, timeout=LLM_PROBE_TIMEOUT_S, max_tokens=LLM_PROBE_MAX_TOKENS
+        )
+        reply = client.chat(LLM_PROBE_PROMPT)
+    except DataSourceError as exc:
+        text = _scrub(exc.message or str(exc), key, resolved.api_key)
+        return {"ok": False, "target": "llm", "infocode": "",
+                "detail": f"[{resolved.label} · {resolved.model}] {text}"}
+    except Exception as exc:  # noqa: BLE001 —— 校验端点绝不 500,一律给中文解释
+        text = _scrub(f"{type(exc).__name__}: {exc}", key, resolved.api_key)
+        return {"ok": False, "target": "llm", "infocode": "",
+                "detail": f"[{resolved.label} · {resolved.model}] {text}"}
+    return {
+        "ok": True, "target": "llm", "infocode": "",
+        "detail": (f"校验通过:[{resolved.label} · {resolved.model}] 回复"
+                   f"「{(reply or '').strip()[:20] or '(空)'}」。"),
+    }
+
+
+@router.post("/config/validate")
+def validate_config(
+    payload: Any = Body(
+        None,
+        description='{"target": "amap|amap_js|llm", "value": "待校验的值(可空=用当前生效值)", '
+                    'llm 另可带 "provider"/"base_url"/"model"}',
+    ),
+    session: Session = Depends(get_session),
+) -> dict[str, Any]:
+    """向导每步的**真调校验**(恒 200,``ok`` 字段报成败;校验失败不是 HTTP 错误)。
+
+    * ``target=amap`` —— 用给的(或已生效的)Web 服务 key 真调一次 ``geocode("北京")``;
+    * ``target=amap_js`` —— 用 JS key 打同一次探针,**10009 平台不符 = 通过**(见函数注释);
+    * ``target=llm`` —— 发一条 1-token 测试消息(provider/base_url/model 可临时覆盖)。
+
+    QPS 口径(CONTAINER-SETUP-PLAN §6.5):每次校验**只发一次请求**,不做批量探活;
+    高德的瞬时错误由 ``amap._request`` 内置退避重试(2s/5s),永久错误(key 无效)不重试。
+    """
+    body = _payload_dict(payload)
+    target = (_optional_text(body.get("target")) or "").strip().lower()
+    if target not in VALIDATE_TARGETS:
+        raise HTTPException(
+            400, f"未知的校验目标:{target or '(缺)'}(可选:{'、'.join(VALIDATE_TARGETS)})"
+        )
+    value = body.get("value")
+    if value is None:
+        value = ""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise HTTPException(400, f"待校验的 value 必须是字符串,收到:{type(value).__name__}")
+    text = str(value)
+    if target == "amap":
+        result = _validate_amap(session, text)
+    elif target == "amap_js":
+        result = _validate_amap_js(session, text)
+    else:
+        result = _validate_llm(session, body, text)
+    result.setdefault("note", VALIDATE_NOTE)
+    return result

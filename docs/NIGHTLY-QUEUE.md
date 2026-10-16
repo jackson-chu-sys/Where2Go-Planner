@@ -1117,45 +1117,62 @@
 
 ## [TASK-P2] AppConfig 表 + 配置读写 API(/api/config + /api/health)
 
-- 状态: pending
+- 状态: done
 - 目标: 按 CONTAINER-SETUP-PLAN 第二节「配置注入策略」:AppConfig 表(key/value/source/updated_at,唯一键 key)+ `services/app_config.py`(白名单 SCHEMA 7 键、load_into_environ 启动注入「env 未设才填」、set_key 写表+同步 os.environ、mask_value 掩码)+ `GET /api/config`(只回掩码+label/hint/required/needs_restart)、`POST /api/config`(白名单外键 403/400)、`GET /api/health`(必填缺失清单,给 compose 与向导用)+ main.py lifespan 启动注入。
 - 依赖: P1(非硬依赖,可并行;建议 P1 先行)。
 - 涉及: backend/db/models.py、新 backend/services/app_config.py、新 backend/app/api/config.py、backend/app/main.py、新 backend/test_app_config.py
 - 验收: pytest +≥25 全 mock(掩码不漏明文、白名单外键拒写、env 压过 AppConfig、set_key 后 amap.resolve_key/intro.resolve_provider 立即看到新值、/api/config 响应 grep 不到明文 key);基线 1632 零回归;不动那 30 处 env 读取点;commit。
-- 结果: (待回填)
+- 结果: **完成**(代码 2026-10-15 白天主会话派 Codex 落地,契约 `b8632ec`、实现 `9cddcc2`;**本轮夜班按纪律先查 git log 发现已完成,未双跑,转为验收+回填**)。
+  - 产物(5 文件 +1423/-2):`db/models.py` AppConfig 表(唯一键 uq_app_config_key,create_all 自动建表);`services/app_config.py`(7 键白名单 SCHEMA:高德三件套 required+secret、LLM 四件套可选;load_into_environ 只填 env 未设键→容器 env 永远压过库;set_key 写库+同步 os.environ 热生效、空串删行;mask_value 前2…后2);`app/api/config.py`(GET /api/config 只回掩码、POST 单键保存白名单外 400 中文、GET /api/health 恒 200 报 missing_required+version 0.1.0-beta);main.py lifespan 启动注入;30 处 env 读取点/data_sources/index.html 零改动。
+  - 验收(执行器本轮实跑):pytest backend/ = **1690 passed**(基线 1632 零回归 + 58 新增,127s;test_app_config.py 全 mock:json.dumps 断言明文不出接口、env 压过库、set_key 后 amap.resolve_key()/intro.resolve_provider() 立即生效、FieldInfo 直调兼容)。
 
 ---
 
 ## [TASK-P3] /setup 用户向导页(4 步 + 真调校验 + 首页横幅)
 
-- 状态: pending
+- 状态: done
 - 目标: 按 CONTAINER-SETUP-PLAN P3:新 `app/static/setup.html`(不塞 index.html)4 步向导——①高德 Web服务 key(图文教程+后端真调一次 geocode("北京") 校验,infocode 中文解释);②高德 JS key+安全密钥(写明两 key 平台隔离/USERKEY_PLAT_NOMATCH/INVALID_USER_SCODE 血泪坑文案);③LLM 可选(预置 DeepSeek/阿里/OpenAI 下拉+自定义 base_url+model+key,发 1-token 测试消息);④完成(保存→POST /api/config→回首页)。校验端点只打一次请求防 QPS 10021。index.html 顶部横幅:GET /api/health 缺必填 → 引导条(不强制重定向,决策③)。
 - 依赖: P2。
 - 涉及: 新 backend/app/static/setup.html、backend/app/api/config.py(校验端点)、backend/app/static/index.html(横幅)、backend/test_frontend_routes.py(静态断言)
 - 验收: browser QA 全流程(无 key 起服务→横幅→向导 4 步→假 key 看报错文案→真 key 通过→回首页出图)0 JS error;pytest 静态断言+基线零回归;commit。
-- 结果: (待回填)
+- 结果: **完成**(2026-10-16 夜班,执行器手写;commit `8e463a5`)。
+  - `app/api/config.py` 新增 `POST /api/config/validate`(恒 200,ok 报成败):target=amap 真调一次 geocode(北京);target=amap_js 拿 JS key 打 REST 探针、**被拒 infocode=10009(平台不符)=恰好证明是真 JS key 即通过**(10001 等则失败;REST 居然成功→提示可能双平台/填错,仍 ok 但带警示);target=llm 发 1-token 测试消息(provider/base_url/model 临时覆盖,resolve_provider 口径)。每步只打一次外部请求(QPS 防线,计数断言在测);校验不落库不写 env;错误文案经 _scrub 掩码替换,**明文 key 永不进响应**。
+  - `app/static/setup.html`(新,独立页):4 步向导(①Web服务 key 图文教程+USERKEY_PLAT_NOMATCH 坑文案+控制台链接 ②JS key+安全密钥,平台隔离/INVALID_USER_SCODE 血泪坑原文照抄,安全密钥服务端不可预校验已写明 ③LLM 可选:DeepSeek/Qwen 预置+自定义,可跳过 ④完成:/api/health+/api/config 掩码汇总+回首页);每步「校验并保存」=validate 通过后 POST /api/config 单键保存即热生效;已配置项显掩码+来源(env 来源黄字提示「向导里改不动」);node --check 通过。
+  - `index.html` +13 行:#setupBanner 默认隐藏,boot 时 checkSetupBanner() 查 /api/health,缺必填 → 黄色引导条(列缺项+链 /setup;决策③不强制重定向);配齐/接口挂永不出;escapeHtml 防注入。
+  - `test_setup_wizard.py` 34 用例全 mock(注:队列条目原写 test_frontend_routes.py,执行器选择独立新文件避免 3587 行巨文件再加压,断言覆盖不减):三 target 成功/失败/降级、只打一次请求、明文 grep、校验不落库、400 中文、FieldInfo 兼容、setup.html DOM/两 API/7 键/坑文案/无内嵌 key、横幅默认隐藏/health 数据源/无强制重定向。
+  - pytest backend/ = **1724 passed**(1690 基线零回归 + 34 新增,132s)。
+  - 真机 QA(:8001 无 key 假 env 实例 + /tmp 临时库,browser_exec):首页横幅出现列出 3 缺项 → 向导填假 key → ❌「infocode=10001 · key 不正确或已过期」中文报错、key 未保存 → 真 key 第 1 步「geocode(北京)返回 1 条」✅ → 第 2 步 JS key 10009 判定通过 ✅ → 第 3 步跳过 → 第 4 步掩码汇总(37…1e/c5…e6/2d…8c,来源=向导)+「必填项已配齐」→ 回首页**横幅消失、AMap 用向导存的 key 热加载成功**、上海 50_100 冷抓 28 条入临时库、5 pin、**window error 0**;全程 DOM grep 无明文 key。QA 临时库已删、:8001 实例已停,:8000 正式实例已带 env 重启并 curl 冒烟(/api/health=ok、/setup.html=200、真 key validate amap+amap_js 双通过、假 key 10001 文案、LLM qwen 回复「好」)。
+  - 环境备注:QA 中高德地图重页又一次把 CDP tab 拖死(Runtime.evaluate timeout),按 hermes-browser-cdp-setup 旧例 kill 后新 user-data-dir(/tmp/chrome-cdp-w2gp3)重启即恢复。
 
 ---
 
 ## [TASK-P5] README(中英双语)+ 第三方归属/免责 + 内部文件说明
 
-- 状态: pending
+- 状态: done
 - 目标: 仓库根 README.md:一句话介绍、quickstart(compose 三命令)、key 申请教程(高德控制台图文链接)、WHERE2GO_* 全表(与代码 grep 核一致)、FAQ(10021 QPS/INVALID_USER_SCODE/USERKEY_PLAT_NOMATCH/免费配额)、AGPL 与源码获取说明(决策⑤)、免责(高德条款/LLM 服务商/价格估算不代订)、顶部注明「docs/ 与根目录 md 是开发过程记录,用户只需看 README」(决策①,内部文件保留不动)。
 - 依赖: P1(命令要抄 compose);P2/P3 完成后核健康检查与向导入口描述。
 - 涉及: README.md(仓库根,现无)
 - 验收: 命令可复制即跑;env 表与 grep 结果一致;commit。
-- 结果: (待回填)
+- 结果: **完成**(2026-10-16 夜班,执行器手写;commit `d26672a`)。
+  - 仓库根新建 README.md(115 行,中英双语):顶部「docs/ 与根目录 md 是开发过程记录,用户只需看 README」(决策①);quickstart 三条命令(抄自 docker-compose.yml,含无镜像时 `--build` 降级、chown 权限提示、卷不丢数据说明);高德 key 申请图文步骤(console.amap.com 控制台链接 + USERKEY_PLAT_NOMATCH/INVALID_USER_SCODE 两坑前置);WHERE2GO_* 全表 **26 个变量与代码 grep 逐一核对一致**(含兼容 key 口径 DEEPSEEK_API_KEY 等);FAQ(10021 QPS/10009 平台不符/INVALID_USER_SCODE/免费配额/不配 LLM 降级/升级);AGPL-3.0 与镜像分发源码获取义务(决策⑤:写明仓库地址);第三方归属(高德条款/OSM ODbL/Overpass/OSRM/Photon/Nominatim/Wikimedia/LLM 服务商)与免责(价格估算不代订、deep-link 仅跳官方渠道、无隶属背书)。
+  - `git check-ignore` 确认 README.md 可提交;env 表来源 = 全仓 python/html grep 扫描(26 变量)+ .env.example 31 处交叉核对。
+  - 备注:P2/P3 描述已按本轮落地实况核过(/setup 向导 4 步 + /api/health 横幅口径);镜像未发布期间的「本地构建」降级路径已写明。
 
 ---
 
 ## [TASK-P4] GitHub Actions:CI + GHCR Release 流水线(multi-arch)
 
-- 状态: pending
+- 状态: needs_review
 - 目标: `.github/workflows/ci.yml`(push/PR 跑 pytest,全 mock 零 secrets)+ `release.yml`(tag v* → buildx amd64+arm64(决策②)→ push ghcr.io/jackson-chu-sys/where2go:{tag,latest} + 容器冒烟 curl /api/places/meta)。注意:本容器无 docker daemon,镜像层只能靠 Actions 验证(CONTAINER-SETUP-PLAN 第三节);push 需神朱授权(仓库 44+ commit 未推)。
 - 依赖: P1;发布需 P2/P3(否则镜像无向导)。
 - 涉及: .github/workflows/
 - 验收: Actions 首跑绿;GHCR 出 multi-arch 镜像;NAS docker pull + compose up 冒烟(神朱配合)。
-- 结果: (待回填)
+- 结果: **代码完成、验收待授权 → needs_review**(2026-10-16 夜班,执行器手写;commit `ce9b47d`)。
+  - `.github/workflows/ci.yml`:push/PR 跑全量 pytest(setup-python 3.13 + pip 缓存 backend/requirements.txt,全 mock 零 secrets 不触网)。
+  - `.github/workflows/release.yml`:tag `v*` → ①先 buildx 出 **amd64 本地镜像冒烟**(无 key 起容器:`/api/health` 与 `/api/places/meta` 恒 200、`/setup.html` 200、镜像卫生双保险断言不含 `backend/data/where2go.db` 与 `.env`)②multi-arch **amd64+arm64**(决策②,QEMU 交叉 + gha 缓存,push 与冒烟共享缓存层)push `ghcr.io/jackson-chu-sys/where2go:{semver,major.minor,latest}`;packages:write 权限、需仓库设置 Workflow permissions=Read and write packages。
+  - 顺手收口(P3 遗留):`main.py` 加 `GET /setup → 307 /setup.html`(P3 横幅与 README 都链 `/setup`,实测 StaticFiles 只认 `.html` 报 404);`test_setup_wizard.py` 补重定向断言。pytest backend/ = **1725 passed**(1724 零回归 + 1)。三个 yml 全部 pyyaml safe_load 通过。
+  - **为什么 needs_review 而非 done**:验收三条(Actions 首跑绿 / GHCR 出镜像 / NAS 冒烟)都要先把代码 **push 到远端**才能触发,而仓库有 46 个未推 commit、push 需神朱授权(AGENTS.md「只 commit 不 push」)。**待神朱拍板**:授权 push(建议先只 push main 触发 CI,验证绿后再打 `v0.1.0-beta` 触发 Release)→ 本轮流水线代码即可验收。
+  - 镜像层无法本地验证:本容器无 docker daemon(CONTAINER-SETUP-PLAN §三既定),buildx/冒烟只能靠 Actions 首跑。
 
 ---
 

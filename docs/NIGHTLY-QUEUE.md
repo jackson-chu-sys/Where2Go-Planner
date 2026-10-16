@@ -1178,12 +1178,28 @@
 
 ## [TASK-P6] 发布版 UI 精简(WHERE2GO_UI_MODE=release)
 
-- 状态: pending
+- 状态: done
 - 目标: 按 PUBLISH-PLAN 第三节:ui_mode 从 /api/places/meta 透出,release 隐藏状态栏技术细节/AI 副标模型名/长介绍批次消息/POI id/坐标系/补简介按钮;「估算」徽标保留(合规);dev 模式一切照旧。
 - 依赖: P3(横幅与向导落地后再动 index.html,避免双改)。
 - 涉及: backend/app/static/index.html、backend/app/api/places.py(meta 透出)、backend/test_frontend_routes.py
 - 验收: release/dev 双模 browser QA 对照 PUBLISH-PLAN §3.1 表逐条核;pytest 静态断言;commit。
-- 结果: (待回填)
+- 结果: **完成**(2026-10-16 夜班加时,执行器手写;commit `ca0264a`)。
+  - `app/api/places.py`:`/api/places/meta` 新增 `ui_mode` 键(`_ui_mode()` 现读 env,只认 release 大小写不敏感、其余一律 dev;既有键只增不减,15 处 meta 消费断言零改动)。
+  - index.html 双闸门(PUBLISH-PLAN §3.2 口径):**CSS** `body.ui-release` 隐藏 `.dev-only`(补简介按钮、「继续生成介绍/⏸暂停」整行、dev 技术页脚)并显示 `.release-only`(新用户页脚:估算仅供参考+外链不代订+AGPL 源码获取);**JS** `isReleaseUI()` 分支精简——状态栏只留「起点/分段/分类/已显示 N 条」,AI 推荐副标只留「AI 推荐 N 条」+换一批(模型名/候选数/依据/缓存命中/pending 隐藏),长介绍批次消息成功静默、失败一句话「介绍生成失败,稍后自动重试」,identityHtml 只留来源大类(POI id/GCJ-02/WGS-84/坐标值隐藏),renderLegend 只留四分类(归类优先级/LLM/种子说明隐藏),加载/扩抓/补简介进度文案精简;「估算」「AI 预估 · 仅供参考 · 以 OTA 实时为准」合规标注**保留**且有静态断言守(不许被 dev-only 藏)。dev 分支代码一行未删(隐藏≠删代码)。
+  - test_frontend_routes.py +13 例(ui_mode 默认 dev/只认 release 精确匹配/CSS 闸门/loadMeta 接线/按钮隐藏不误伤 moreWrap/双页脚内容/状态栏 release 白名单+黑名单/identity/推荐副标/批次静默/估算徽标红线/进度分支/node --check);既有 2 处 `html.index("<footer>")` 断言因加 class 校准为 dev-only 页脚切片。pytest backend/ = **1738 passed**(1725 基线零回归 + 13 新增)。
+  - browser QA 双模真机(uvicorn 各起一次):dev 搜上海→状态栏全技术细节/图例归类优先级/推荐副标模型名全在、0 error;release 搜上海→`body[data-ui-mode=release]`、状态栏「起点 上海 · 50-100 km · 分类 全部 · 已显示 15 条」、图例只剩四分类、副标「AI 推荐 5 条 · 不满意可点换一批」、popup 来源只「来源:高德」无 POI/坐标系、sc-est 徽标在、批次消息静默、补简介/继续生成介绍按钮 display=none、release 页脚显示,全程 window error **0** 条;QA 未产生测试数据。
+  - 附带(同晚):修稳 `test_intro_backfill.py` 真线程池 flake(commit `ee20de5`,详见下一条)。
+
+---
+
+## [TASK-FLAKE-1] 修稳 test_intro_backfill 真线程池偶发失败(神朱 2026-10-16 拍板)
+
+- 状态: done
+- 目标: 全量 pytest 偶发 1 failed(`test_load_segment_returns_before_intros_with_real_pool`,TASK-26 时记录过"偶发 flake");实测单跑 10 次挂 2 次(~20%),会随机弄脏 P4 的 Actions CI 首跑。定位根因并修稳。
+- 结果: **完成**(2026-10-16 夜班,执行器手写;commit `ee20de5`)。
+  - 根因(用 20 轮复现脚本抓到):`_load()` helper 在 `load_segment` 返回时立即复原 `intro_service.default_client`,但真线程池模式下后台 worker 是**惰性解析** `default_client()` 的——worker 起跑稍慢就拿到真 LLMClient(测试环境无 key → no_network fixture 抛错 → 退避重试),表现为「简介全空 + inflight 15s 不清 + llm.calls=0」;InlineExecutor 路径同步执行故其他用例不受影响。复现率 1/20(与 pytest 单跑 2/10 同量级,受机器负载影响)。
+  - 修法:`_load` 加 `keep_client=True` 参数(保持替身 client 不复原),两个真线程池用例改为 `wait_backfill()` **落地后**再复原 `default_client`;生产代码零改动(worker 吞异常口径本身是对的)。
+  - 验证:修复后 `test_intro_backfill.py` 整文件连跑 **25 次全过**(修复前单文件跑 10 次挂 2 次);全量 pytest 1738 passed 含此文件零失败。
 
 ---
 

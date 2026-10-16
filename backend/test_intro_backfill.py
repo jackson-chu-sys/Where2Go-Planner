@@ -132,7 +132,12 @@ def real_executor() -> Iterator[None]:
         intro_service.set_backfill_executor(None)
 
 
-def _load(session, fetcher: FakeFetcher, llm: Any, **kwargs: Any):
+def _load(session, fetcher: FakeFetcher, llm: Any, *, keep_client: bool = False, **kwargs: Any):
+    """keep_client=True:不在返回时复原 default_client——真线程池模式下后台 worker
+    是**惰性解析** default_client() 的,若 _load 一返回就复原,worker 起跑稍慢就会
+    拿到真 LLMClient(无 key → no_network 抛错 → 退避重试),表现为 ~10-20% 概率
+    的「简介全空 + inflight 不清」flake(2026-10-16 定位)。调用方须在
+    wait_backfill 之后自行复原。"""
     monkey_llm = llm
     orig_client = intro_service.default_client
     intro_service.default_client = lambda: monkey_llm  # type: ignore[assignment]
@@ -143,7 +148,8 @@ def _load(session, fetcher: FakeFetcher, llm: Any, **kwargs: Any):
             seeds=[], **kwargs,
         )
     finally:
-        intro_service.default_client = orig_client
+        if not keep_client:
+            intro_service.default_client = orig_client
 
 
 # --------------------------------------------------------------------------- #
@@ -156,8 +162,9 @@ def test_load_segment_returns_before_intros_with_real_pool(session, real_executo
     fetcher = FakeFetcher(rows)
     llm = SlowFakeLLM(delay=0.4)
 
+    orig_client = intro_service.default_client
     t0 = time.perf_counter()
-    outcome = _load(session, fetcher, llm, intros=True)
+    outcome = _load(session, fetcher, llm, intros=True, keep_client=True)
     wall = time.perf_counter() - t0
 
     assert outcome.source == "amap" and outcome.written == 6
@@ -166,7 +173,10 @@ def test_load_segment_returns_before_intros_with_real_pool(session, real_executo
     assert all(not p["intro"] for p in outcome.places), "返回瞬间简介还没补上"
 
     session.rollback()  # 释放调用方读事务快照(SQLite SHARED 锁会挡后台 worker 写库)
-    intro_service.wait_backfill(timeout=15)
+    try:
+        intro_service.wait_backfill(timeout=15)
+    finally:
+        intro_service.default_client = orig_client  # worker 落地后再复原(见 _load 注释)
     stored = repo.list_places(session, origin_city="上海", band=BAND,
                               origin_lat=SHANGHAI["lat"], origin_lng=SHANGHAI["lng"])
     assert stored and all(row["intro"] for row in stored), "后台补完后库内每行都有简介"
@@ -282,8 +292,12 @@ def test_read_from_db_path_never_triggers_backfill(session, real_executor) -> No
     """二次查询读库路径:intro_stats 保持 None、零 LLM 调用(既有口径不回退)。"""
     fetcher = FakeFetcher([point_at(60, name="丁山", osm_id=11)])
     llm = SlowFakeLLM(delay=0.01)
-    _load(session, fetcher, llm, intros=True)
-    intro_service.wait_backfill(timeout=10)
+    orig_client = intro_service.default_client
+    _load(session, fetcher, llm, intros=True, keep_client=True)
+    try:
+        intro_service.wait_backfill(timeout=10)
+    finally:
+        intro_service.default_client = orig_client  # 同 race 修复:worker 落地后再复原
     calls_before = llm.calls
     outcome = place_loader.load_segment(
         session, city="上海", band=BAND, fetcher=fetcher, seeds=[], intros=True,

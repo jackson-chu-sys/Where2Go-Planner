@@ -1,0 +1,87 @@
+# TASK-P4:Release —— 打 tag v* 触发:buildx multi-arch(amd64+arm64,决策②)
+# → push ghcr.io/jackson-chu-sys/where2go:{tag,latest} → amd64 容器冒烟(curl /api/health)。
+# 权限:仓库 Settings → Actions → Workflow permissions 选 "Read and write packages"。
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: jackson-chu-sys/where2go
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (arm64 交叉构建)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta (tag / latest)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      # 冒烟用:先出一份 amd64 镜像加载到本机 docker(与下面 push 共享 buildx 缓存层)
+      - name: Build amd64 image (local, for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: where2go:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test (无 key 起容器 → /api/health 与 /api/places/meta 恒 200)
+        run: |
+          docker run -d --name w2g-smoke -p 8000:8000 where2go:smoke
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/api/health || true)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          echo "--- /api/health ---"
+          curl -fsS http://127.0.0.1:8000/api/health; echo
+          echo "--- /api/places/meta (head) ---"
+          curl -fsS http://127.0.0.1:8000/api/places/meta | head -c 300; echo
+          echo "--- /setup.html ---"
+          curl -fsS -o /dev/null -w 'setup=%{http_code}\n' http://127.0.0.1:8000/setup.html
+          # 镜像卫生:不得打进真实 db 与 .env(.dockerignore 已排,这里双保险)
+          ! docker exec w2g-smoke sh -c 'test -e /app/backend/data/where2go.db' || { echo "镜像里混入了开发库!"; exit 1; }
+          ! docker exec w2g-smoke sh -c 'test -e /app/.env' || { echo "镜像里混入了 .env!"; exit 1; }
+          docker logs w2g-smoke 2>&1 | tail -5
+          docker rm -f w2g-smoke
+
+      - name: Build & push multi-arch (amd64 + arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -490,6 +490,12 @@ def test_index_banner_no_forced_redirect(index_html: str) -> None:
         "决策③:只引导,不强制重定向"
 
 
+def test_setup_route_redirects_to_static_page(http) -> None:
+    """/setup → 302 /setup.html(横幅与 README 都写 /setup,静态页实际叫 setup.html)。"""
+    code, _ = http("GET", "/setup")
+    assert code in (302, 307), f"/setup 应重定向,实际 {code}"
+
+
 @pytest.mark.skipif(NODE is None, reason="环境未安装 node")
 def test_index_inline_js_still_passes_node_check(index_html: str, tmp_path: Path) -> None:
     blocks = re.findall(r"<script>(.*?)</script>", index_html, re.S)

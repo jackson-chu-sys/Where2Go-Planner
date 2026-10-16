@@ -32,6 +32,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from .api import assistant, collections, config, discover, planner, places, routes, stays, trips
@@ -68,4 +69,12 @@ app.include_router(assistant.router, prefix="/api")
 app.include_router(config.router, prefix="/api")
 
 STATIC = Path(__file__).parent / "static"
+
+
+@app.get("/setup", include_in_schema=False)
+def setup_redirect() -> RedirectResponse:
+    """``/setup`` → ``/setup.html``(TASK-P3):横幅与文档都写 ``/setup``,静态页实际叫 setup.html。"""
+    return RedirectResponse(url="/setup.html")
+
+
 app.mount("/", StaticFiles(directory=str(STATIC), html=True), name="static")

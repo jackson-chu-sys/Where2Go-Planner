@@ -1220,7 +1220,7 @@
     - 反向降级:`/api/geocode?city=上海&region=overseas` → `geocoder=amap, region=domestic` + note「已按境内口径解析」,**不再 400**(TASK-26 降级链恢复可用,这正是 bug ③ 的验证点)。
     - 不勾境外开关搜「苏黎世」也自动判 overseas(region_gate 采信修正生效)。
   - **未做(留 TODO)**:(a) 高德 geocode `level` 判据(真城市=省/市/区县,境外吸附=兴趣点/道路/村庄,实测 12/12 可区分)未落码——脏缓存自愈要用它;(b) 库内既有 amap 吸附行未清(如 `北海道→香港油尖旺北海街`、`新加坡→陕西咸阳新加坡村`),本次已手工清理 OriginCache 脏行(删 6 行:北海道/新加坡/昆西利亚/新西伯利亚上海×2/札幌上海,删后重搜全部落到正确境外坐标)。
-  - **commit**: 见同日 `fix(境外)` 提交(只 commit 不 push)。
+  - **commit**: `6ef68be`(只 commit 不 push;未推 commit 累计待发布流水线一起推)
 
 ---
 

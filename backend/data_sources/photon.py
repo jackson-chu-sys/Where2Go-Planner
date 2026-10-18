@@ -97,6 +97,62 @@ def country_fields(properties: Any) -> dict[str, str]:
     }
 
 
+#: Photon 的**行政区级** type 白名单(TASK-27 境外中文地名修复)。
+#: 实测口径(2026-10-18,17 个中文名 + 17 个英文名逐条核):Photon 对中文境外城市名
+#: 会返回**同名 POI**而不是城市本身 —— 「因特拉肯」→ 成都双流「因特拉肯大道」(type=street)、
+#: 「巴黎」→ 高雄「巴黎」(type=house)、「皇后镇」→ 北京「皇后镇休闲度假村」(type=house)、
+#: 「苏黎世」→ 天津「莹湖苑」(type=locality)。这些结果都**不是**行政区,所以
+#: 「type ∈ 本表 且 osm_type ∈ R/N」才能当城市级候选采信;其余一律视为该腿没答上。
+ADMIN_PLACE_TYPES: frozenset[str] = frozenset({
+    "city", "town", "village", "district", "county", "municipality",
+    "state", "country", "borough", "suburb",
+})
+
+
+def place_level_fields(properties: Any) -> dict[str, str]:
+    """从 feature 取**行政区级判据**两键(``osm_type`` / ``type``,TASK-27 opt-in 追加)。
+
+    ``osm_type`` 是 OSM 元素类型(``R``=relation / ``W``=way / ``N``=node),``type`` 是
+    Photon 归一后的地物类型。上层用 :func:`is_admin_place` 判「这条结果是不是城市级」,
+    避免把「因特拉肯大道」这类同名 POI 当成因特拉肯市。
+    """
+    props = properties if isinstance(properties, dict) else {}
+    return {
+        "osm_type": str(props.get("osm_type") or "").strip().upper(),
+        "type": str(props.get("type") or "").strip().lower(),
+    }
+
+
+def admin_place_verdict(place: Any) -> Optional[bool]:
+    """这条 Photon 结果是行政区级吗?——**三态**:``True`` / ``False`` / ``None``(判不出)。
+
+    * ``True``:``type`` ∈ :data:`ADMIN_PLACE_TYPES` **且** ``osm_type`` ∈ ``{R, N}``
+      (relation = 行政边界多边形,node = 城市中心点);
+    * ``False``:两个判据字段都在,但明确落在 POI 级(实测 ``W``/``house``/``street``/
+      ``locality`` 全是「境外中文名被吸附成国内同名地物」的形态);
+    * ``None``:判据字段缺失(旧 stub / 异常响应)—— **不猜**,调用方沿用「只看国家码」
+      的旧口径,降级方向安全。
+
+    TASK-27 用 ``False`` 挡掉错配、用 ``None`` 保住既有行为,所以真实数据上生效、
+    既有单测的 stub(只给 countrycode)零改动。
+    """
+    if not isinstance(place, dict):
+        return None
+    osm_type = str(place.get("osm_type") or "").strip().upper()
+    place_type = str(place.get("type") or "").strip().lower()
+    if not osm_type or not place_type:
+        return None
+    return osm_type in ("R", "N") and place_type in ADMIN_PLACE_TYPES
+
+
+def is_admin_place(place: Any) -> bool:
+    """严格口径:只有 :func:`admin_place_verdict` 明确判 ``True`` 才算行政区级。
+
+    (给需要「必须有判据」的调用方用;境外链与 region gate 用的是三态版。)
+    """
+    return admin_place_verdict(place) is True
+
+
 def parse_feature(
     raw: Any, *, action: str = "地理编码", include_country: bool = False
 ) -> dict[str, Any]:
@@ -137,6 +193,9 @@ def parse_feature(
     }
     if include_country:
         place.update(country_fields(properties))
+        # TASK-27:行政区级判据(osm_type/type)随 include_country 一并给出——
+        # 境外链要靠它区分「真城市」与「同名 POI」(因特拉肯大道/巴黎村/皇后镇度假村)。
+        place.update(place_level_fields(properties))
     return place
 
 

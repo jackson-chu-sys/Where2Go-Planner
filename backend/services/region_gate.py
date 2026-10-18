@@ -34,6 +34,7 @@ from typing import Any
 
 from data_sources.nominatim import geocode as ds_nominatim_geocode
 from data_sources.nominatim import reverse as ds_nominatim_reverse
+from data_sources.photon import admin_place_verdict as ds_photon_admin_verdict
 from data_sources.photon import geocode as ds_photon_geocode
 from data_sources.photon import reverse as ds_photon_reverse
 
@@ -113,6 +114,15 @@ def detect_region(city: str) -> dict[str, Any]:
         places = ds_photon_geocode(cleaned, limit=PHOTON_LIMIT, include_country=True)
         first = places[0] if isinstance(places, (list, tuple)) and places else None
         code = _code_of(first, "countrycode")
+        # TASK-27:**只采信行政区级结果**(三态判定,缺字段=沿用旧口径不猜)。Photon 对中文
+        # 境外地名会返回同名 POI(实测 2026-10-18:「因特拉肯」→ 成都双流「因特拉肯大道」
+        # street/cc=CN、「皇后镇」→ 北京「皇后镇休闲度假村」house/cc=CN、「巴黎」→ 高雄
+        # house/cc=TW),照旧采信就会把境外城市判成 domestic 并被 API 层**缓存 7 天**
+        # (OriginCache),之后 TASK-25 的境外链永远不再触发 —— 神朱 10/18 直报的
+        # 「国外目的地完全不支持中文」根因之一。明确判成 POI 级(verdict is False)= 这一腿
+        # 没答上,落到 detector=none:按 domestic 处理但**不写缓存**,下次搜索还能重试。
+        if code and ds_photon_admin_verdict(first) is False:
+            return _unknown_region()
         if code:
             return _result(code, DETECTOR_PHOTON)
     except Exception:  # noqa: BLE001 - 同上:兜底腿失败就按境内,绝不把起点解析打挂

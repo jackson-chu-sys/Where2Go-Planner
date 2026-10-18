@@ -1203,6 +1203,27 @@
 
 ---
 
+## [TASK-27] 境外目的地「中文城市名全部定位错」修复:Photon 行政区级判据 + 境外链 CN 证据双源 + Overpass 代理口径(神朱 2026-10-18 直报)
+
+- 状态: done(2026-10-18 主会话交互修复;晚于夜班,夜班 22:02 因队列空跳过)
+- 目标: 神朱直报「国外目的地完全不支持中文,搜索全错」。定位到 3 个代码 bug + 1 个部署问题并全部修掉,不动境内(高德)链路。
+- 涉及: backend/data_sources/_common.py、backend/data_sources/photon.py、backend/data_sources/osm_overseas.py、backend/services/region_gate.py、backend/services/place_loader.py、backend/test_region_gate.py、backend/test_osm_overseas.py、.env.example、README.md
+- 验收: 中文境外城市名不再被吸附成国内同名 POI;勾境外模式搜境内城市能自动降级而非 400;全量 pytest 零回归。
+- 结果: **完成**(2026-10-18 23:06~23:38 主会话手写,非夜班;全量 pytest **1739 passed**/126s,基线 1738 零回归 +1)。
+  - **根因实测(容器内 vs 走 NAS 代理 7892)**:Nominatim 直连 15s `Network unreachable` / 代理 0.69s;Overpass 直连 502 / 代理 30.9s n=5;Photon 直连 1.3s;OSRM 直连 0.9s。→ 境外链两条腿在国内直连都不通,是**部署缺代理**而非代码不可用(`.env.example`/README 已补代理说明与 FAQ)。
+  - **bug ①(Photon 同名 POI 错配)**:中文境外城市名返回国内同名地物——「因特拉肯」→成都双流「因特拉肯大道」(street)、「巴黎」→高雄(house)、「皇后镇」→北京度假村(house)、「苏黎世」→天津(house)。新增 `photon.admin_place_verdict()` 三态判据(`type ∈ ADMIN_PLACE_TYPES` 且 `osm_type ∈ {R,N}` = True;字段齐但落 POI 级 = False;字段缺 = None 沿用旧口径),`parse_feature(include_country=True)` 增 `osm_type`/`type` 两键。实测判据 12/12 正确(上海=state、崇礼=district;因特拉肯/皇后镇/东京均被正确否掉)。
+  - **bug ②(错配结果被判 domestic 且缓存 7 天)**:`region_gate.detect_region` 原只看国家码 → 中文境外名被判 domestic 写入 OriginCache 7 天 → **之后境外链永不触发**(错一次就永久错)。改为采信前过 `admin_place_verdict`,明确 False 时返回 `_unknown_region()`(按 domestic 处理但不写缓存,下次可重试)。
+  - **bug ③(反向:勾境外搜「上海」400)**:境内证据原本只认 Nominatim 的 CN,而它直连不通 → 自动降级(TASK-26)永远触发不了,直接 400。改为 Photon **行政区级** CN 也算境内正面证据(抛 `DomesticMismatchError`),非行政区级 CN 仍只当该腿失败(「巴黎→高雄」防线不松)。
+  - **端点教训**:`overpass.osm.ch` 国内直连 0.49s 最快,但**只有瑞士数据**(皇后镇/札幌/巴黎/纽约/上海全 n=0,仅因特拉肯有),已回滚;这类部分数据实例绝不能进端点链(空结果会被误判成「该分段没 POI」= 静默错答)。`_common.DEFAULT_SOURCE_PROXY["overpass"]` 由 off 改 env 并写明 9/27「代理 504」口径已过时。
+  - **真机冒烟(2026-10-19 07:5x,CST;uvicorn :8000 带 NAS 代理重启后实测六个城市,全部正向)**:
+    - 神朱报错的样本全部修好:`苏黎世`→蘇黎世 District Zurich 瑞士 47.374/8.541(**此前被 Photon 吸附成天津**);`新加坡`→1.357/103.819(**此前→陕西咸阳新加坡村**);`东京`→东京都/東京都 日本;**`北海道`→北海道 43.45/142.82(此前→香港油尖旺北海街)**;`因特拉肯`→瑞士 46.686/7.859;`Queenstown`→皇后镇 新西兰 -45.03/168.66。
+    - 反向降级:`/api/geocode?city=上海&region=overseas` → `geocoder=amap, region=domestic` + note「已按境内口径解析」,**不再 400**(TASK-26 降级链恢复可用,这正是 bug ③ 的验证点)。
+    - 不勾境外开关搜「苏黎世」也自动判 overseas(region_gate 采信修正生效)。
+  - **未做(留 TODO)**:(a) 高德 geocode `level` 判据(真城市=省/市/区县,境外吸附=兴趣点/道路/村庄,实测 12/12 可区分)未落码——脏缓存自愈要用它;(b) 库内既有 amap 吸附行未清(如 `北海道→香港油尖旺北海街`、`新加坡→陕西咸阳新加坡村`),本次已手工清理 OriginCache 脏行(删 6 行:北海道/新加坡/昆西利亚/新西伯利亚上海×2/札幌上海,删后重搜全部落到正确境外坐标)。
+  - **commit**: 见同日 `fix(境外)` 提交(只 commit 不 push)。
+
+---
+
 ## [TASK-WORLDMAP] 备忘:高德「世界地图」权限工单(等神朱结果,勿执行)
 
 - 状态: blocked(2026-10-17 神朱拍板:他去高德控制台提工单商务咨询问价;结果回填本条前,夜班执行器**不得启动本条**)

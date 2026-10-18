@@ -51,8 +51,10 @@ DEFAULT_SOURCE_PROXY: dict[str, str] = {
     "llm": PROXY_ENV,        # aliyuncs / deepseek 在 NO_PROXY 白名单里,走不走都一样
     "wikimedia": PROXY_ENV,  # 维基/Commons(TASK-8a1 图片兜底):沿用环境变量代理口径
     "ctrip": PROXY_OFF,      # 携程 suggest(TASK-17 外链解析):国内站直连
-    "overpass": PROXY_OFF,   # 境外轨 POI 源(TASK-21 osm_overseas.py):10/10 实测直连 8.5s 可用、代理反而 504
-    "osrm": PROXY_OFF,       # 境外轨驾车源(TASK-22 osrm.py):10/10 实测直连 1.3s 可用
+    "overpass": PROXY_ENV,   # 境外轨 POI 源(TASK-21):2026-10-18 实测直连 502(Network unreachable 级)、
+                             # 走 NAS 代理 30.9s 可用 → 从 off 改 env;9/27「代理 504」口径已过时,
+                             # 无代理环境 trust_env 下等价直连,行为不劣化
+    "osrm": PROXY_OFF,       # 境外轨驾车源(TASK-22 osrm.py):10/10 实测直连 1.3s 可用;10/18 复核仍 0.9s
 }
 
 

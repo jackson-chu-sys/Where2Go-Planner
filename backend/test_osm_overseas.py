@@ -34,7 +34,7 @@ if BACKEND_DIR not in sys.path:
 import data_sources as ds  # noqa: E402
 from app.api import places as places_api  # noqa: E402
 from data_sources import osm_overseas  # noqa: E402
-from data_sources._common import DEFAULT_SOURCE_PROXY, PROXY_OFF, apply_proxy_policy, proxy_mode  # noqa: E402
+from data_sources._common import DEFAULT_SOURCE_PROXY, PROXY_ENV, PROXY_OFF, apply_proxy_policy, proxy_mode  # noqa: E402
 from db import init_db, make_engine, session_factory  # noqa: E402
 from db import repository as repo  # noqa: E402
 from db.models import (  # noqa: E402
@@ -271,7 +271,8 @@ def test_osm_overseas_restores_the_full_overpass_surface() -> None:
         assert hasattr(osm_overseas.OverpassClient, name), f"OverpassClient 缺 {name}"
     # §1.1:SOURCE_NAME **保留原值**(_common 的代理表按源名小写查)
     assert osm_overseas.SOURCE_NAME == "Overpass"
-    assert proxy_mode(osm_overseas.SOURCE_NAME) == PROXY_OFF
+    # 2026-10-18:直连 502/不可达 → 口径从 off 改 env(详见 _common.DEFAULT_SOURCE_PROXY 注释)
+    assert proxy_mode(osm_overseas.SOURCE_NAME) == PROXY_ENV
     # 端点链 = 阶段1 实测口径(overpass-api.de / z.overpass-api.de / maps.mail.ru)
     assert osm_overseas.DEFAULT_ENDPOINT == "https://overpass-api.de/api/interpreter"
     assert osm_overseas.FALLBACK_ENDPOINTS == (
@@ -291,17 +292,19 @@ def test_osm_overseas_stays_out_of_the_package_export_surface() -> None:
     assert "osm_overseas" not in ds.__all__
 
 
-def test_overpass_proxy_policy_is_direct_connect() -> None:
-    """§1.1:代理表新增 ``"overpass": PROXY_OFF``(10/10 实测直连 8.5s、代理反而 504)。"""
-    assert DEFAULT_SOURCE_PROXY["overpass"] == PROXY_OFF
-    session = SimpleNamespace(trust_env=True, proxies={"http": "http://127.0.0.1:7892"})
-    assert apply_proxy_policy(session, "overpass") == {}, "off = 直连(proxies 清空)"
-    assert session.trust_env is False and session.proxies == {}
+def test_overpass_proxy_policy_is_env() -> None:
+    """§1.1(2026-10-18 更新):``"overpass": PROXY_ENV`` —— 国内直连 502/不可达,
+    走 NAS 代理 30.9s 可用(实测),9/27「代理 504」口径已过时;无代理环境
+    trust_env 下等价直连,行为不劣化。"""
+    assert DEFAULT_SOURCE_PROXY["overpass"] == PROXY_ENV
+    session = SimpleNamespace(trust_env=False, proxies={"http": "http://127.0.0.1:7892"})
+    assert apply_proxy_policy(session, "overpass") is None, "env = 沿用环境变量(trust_env=True, proxies 清空)"
+    assert session.trust_env is True and session.proxies == {}
     # 仍可用 WHERE2GO_PROXY_OVERPASS 覆盖(与其他源同一口径)
     previous = os.environ.get("WHERE2GO_PROXY_OVERPASS")
-    os.environ["WHERE2GO_PROXY_OVERPASS"] = "env"
+    os.environ["WHERE2GO_PROXY_OVERPASS"] = "off"
     try:
-        assert proxy_mode("overpass") == "env"
+        assert proxy_mode("overpass") == "off"
     finally:
         if previous is None:
             os.environ.pop("WHERE2GO_PROXY_OVERPASS", None)

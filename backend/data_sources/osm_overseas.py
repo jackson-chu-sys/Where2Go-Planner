@@ -86,6 +86,13 @@ from ._common import (
 )
 
 SOURCE_NAME = "Overpass"
+#: 主端点:**必须是官方全球实例**。2026-10-18 实测教训 —— ``overpass.osm.ch`` 虽然国内
+#: 直连 0.49s 最快,但它由瑞士 SOSM 运营、**只有瑞士数据**(皇后镇/札幌/巴黎/纽约/上海
+#: 一律 n=0,只有因特拉肯 n=10)。这类「部分数据实例」绝不能进端点链:空结果会被当成
+#: 「这个分段没有 POI」而不是「端点不适用」,是**静默错答**,比超时更难查。
+#: 官方 ``overpass-api.de`` 在国内**直连 502 / 34s+**,必须走代理(实测经 NAS mihomo
+#: 30.9s 可用)——所以境外轨要可用,容器必须配 ``HTTPS_PROXY``(见 .env.example 与
+#: README「境外目的地」一节)。这是部署配置问题,不是端点选择问题。
 DEFAULT_ENDPOINT = "https://overpass-api.de/api/interpreter"
 FALLBACK_ENDPOINTS: tuple[str, ...] = (
     "https://z.overpass-api.de/api/interpreter",

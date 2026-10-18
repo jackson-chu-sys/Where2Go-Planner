@@ -66,6 +66,7 @@ Open **http://localhost:8000**, follow the banner into the **/setup wizard**, pa
 | `WHERE2GO_OSRM_ENDPOINT` | — | 官方 | **境外轨** OSRM 驾车路线端点 |
 | `WHERE2GO_WIKI_API` / `WHERE2GO_COMMONS_API` | — | 官方 | 维基/Commons 图片兜底端点 |
 | `WHERE2GO_PROXY_<源>` | — | 见 .env.example | 分数据源代理口径:`off` 直连 / `env` 沿用 `HTTP(S)_PROXY` / 其他值=代理 URL(源名:AMAP/NOMINATIM/PHOTON/LLM/OVERPASS/OSRM/WIKIMEDIA) |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 境外目的地建议配 | — | 境外轨 Nominatim/Overpass 在国内**直连不通**,必须走代理(实测配后 0.69s / 30.9s 可用);不配 = 境外目的地搜不出结果,境内功能不受影响 |
 
 兼容口径:`DEEPSEEK_API_KEY` / `DASHSCOPE_API_KEY` / `QWEN_API_KEY` / `ALIBABA_TOKEN_PLAN_API_KEY` 也会被识别为对应 LLM 预置档的 key。
 
@@ -85,6 +86,9 @@ Open **http://localhost:8000**, follow the banner into the **/setup wizard**, pa
 
 **Q: 不配 LLM key 会怎样?**
 服务照常:地图、检索、路线、收藏、行程方案全部可用;POI 简介与 AI 推荐/行程规划降级为空,不报错。
+
+**Q: 搜境外目的地(因特拉肯/皇后镇/札幌)搜不出来或报城市定位失败?**
+先看容器有没有配代理(`HTTPS_PROXY`)。境外轨走 OSM 系数据源,其中 Nominatim 与 Overpass 在国内**直连不通**,不配代理境外目的地不可用(境内功能不受影响)。配置后境外城市搜索首次冷抓约 30~60s(需实时抓 OSM 数据),之后读本地库秒回。另外**中文境外城市名**在 Photon 上可能匹配到国内同名地物(如「因特拉肯大道」),服务端已按行政区级判据过滤,若仍定位错误请把城市名换成英文(Interlaken / Queenstown)再试。
 
 **Q: 怎么升级?**
 `docker compose pull && docker compose up -d`。数据与配置都在 `./data` 卷里,不丢。

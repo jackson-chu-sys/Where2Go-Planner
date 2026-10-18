@@ -80,6 +80,7 @@ from data_sources.amap import geocode as ds_amap_geocode
 from data_sources.amap import reverse_geocode as ds_amap_reverse
 from data_sources.nominatim import SOURCE_NAME as NOMINATIM_SOURCE
 from data_sources.photon import SOURCE_NAME as PHOTON_SOURCE
+from data_sources.photon import admin_place_verdict as ds_photon_admin_verdict
 from data_sources.photon import geocode as ds_photon_geocode
 from data_sources.photon import reverse as ds_photon_reverse
 from db import init_db, make_engine, open_session
@@ -351,14 +352,44 @@ class DomesticMismatchError(DataSourceError):
 def photon_geocode_overseas(city: str) -> dict[str, Any]:
     """Photon 正向(**境外兜底腿**):一次调用同时拿坐标与国家码,**不打第二次网络**。
 
-    ``include_country=True`` 让每条结果多带 ``countrycode``;空结果、答不出国家码、
-    或国家码判成境内都当失败(交给 :func:`geocode_overseas` 报两腿原因)。
+    ``include_country=True`` 让每条结果多带 ``countrycode`` + 行政区级判据
+    (``osm_type``/``type``,TASK-27);空结果、答不出国家码、或国家码判成境内都当失败
+    (交给 :func:`geocode_overseas` 报两腿原因)。
+
+    **TASK-27 关键分流**(修神朱 2026-10-18 直报:容器里勾境外模式搜「上海」→ 400):
+    CN 结果要分两种情况,不能一刀切——
+    * **行政区级**(``osm_type ∈ R/N`` 且 ``type ∈ ADMIN_PLACE_TYPES``,如「上海市 state」)
+      → 抛 :class:`DomesticMismatchError`,即**境内正面证据**:API 层据此自动降级回高德链。
+      此前只有 Nominatim 的 CN 算证据,而 Nominatim 在没配代理的容器里**直连不通**
+      (2026-10-18 实测 ``Network is unreachable``),导致降级永远触发不了、直接 400。
+    * **非行政区级**(如「因特拉肯大道 street」「巴黎村 district」「皇后镇度假村 house」)
+      → 只是同名 POI 错配,**不算证据**,当该腿失败。TASK-25 防「巴黎→高雄」的口径不松:
+      实测那些错配结果全是 W/house/street/locality,行政区级判据正好把它们挡在证据之外。
     """
     places = ds_photon_geocode(city, limit=PHOTON_LIMIT, include_country=True)
     if not places:
         raise DataSourceError(PHOTON_SOURCE, f"未找到与 {city!r} 匹配的地名(结果为空)")
     place = dict(places[0])
-    _require_overseas_code(city, PHOTON_SOURCE, _country_code_of(place, "countrycode"))
+    code = _country_code_of(place, "countrycode")
+    verdict = ds_photon_admin_verdict(place)
+    if code and verdict is False:
+        # 明确是 POI 级同名地物(实测:因特拉肯大道 street / 巴黎村 district /
+        # 皇后镇度假村 house)= 该腿失败,**不当境内证据**(TASK-25「巴黎→高雄」防线)
+        raise DataSourceError(
+            PHOTON_SOURCE,
+            f"{city!r} 在 {PHOTON_SOURCE} 只匹配到非行政区级的同名地物"
+            f"(type={place.get('type') or '?'}/osm_type={place.get('osm_type') or '?'},"
+            f"国家码 {code}),不足以判定城市位置",
+        )
+    if code and classify_country_code(code) == REGION_DOMESTIC and verdict is not True:
+        # 判成境内但**拿不到行政区级确认**(响应缺 osm_type/type,如旧替身/异常形状):
+        # 只当该腿错配失败,不当证据——宁可 400 也不把「巴黎」降级到高德吸附成国内 POI。
+        raise DataSourceError(
+            PHOTON_SOURCE,
+            f"{city!r} 被 {PHOTON_SOURCE} 判成境内(国家码 {code})但无法确认是行政区级结果,"
+            f"境外链不接受这个结果",
+        )
+    _require_overseas_code(city, PHOTON_SOURCE, code)
     return _geo_shape(place)
 
 
@@ -396,13 +427,18 @@ def geocode_overseas(city: str) -> tuple[dict[str, Any], str]:
         reasons.append(f"{NOMINATIM_SOURCE}={_failure_text(exc)}")
     try:
         return photon_geocode_overseas(cleaned), GEOCODER_PHOTON
+    except DomesticMismatchError as exc:
+        # TASK-27:Photon 的**行政区级** CN(如「上海市 state」)同样是境内正面证据。
+        # 没有代理时 Nominatim 直连不通、拿不到证据,这条腿就成了唯一能触发自动降级的来源。
+        domestic_evidence = domestic_evidence or exc
+        reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
     except DataSourceError as exc:
         reasons.append(f"{PHOTON_SOURCE}={_failure_text(exc)}")
-        message = f"境外地理编码两个源都失败,无法解析 {cleaned!r}:" + ";".join(reasons)
-        if domestic_evidence is not None:
-            # 有 CN 正面证据 → 抛 DomesticMismatchError,API 层据此自动降级回境内链(TASK-26)
-            raise DomesticMismatchError(GEOCODER_CHAIN_OVERSEAS, message) from exc
-        raise DataSourceError(GEOCODER_CHAIN_OVERSEAS, message) from exc
+    message = f"境外地理编码两个源都失败,无法解析 {cleaned!r}:" + ";".join(reasons)
+    if domestic_evidence is not None:
+        # 有 CN 正面证据 → 抛 DomesticMismatchError,API 层据此自动降级回境内链(TASK-26)
+        raise DomesticMismatchError(GEOCODER_CHAIN_OVERSEAS, message)
+    raise DataSourceError(GEOCODER_CHAIN_OVERSEAS, message)
 
 
 def geocode_with_fallback(city: str, *, region: Optional[str] = None) -> tuple[dict[str, Any], str]:

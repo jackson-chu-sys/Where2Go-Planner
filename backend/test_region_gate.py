@@ -389,12 +389,38 @@ def test_photon_parse_feature_default_shape_is_unchanged() -> None:
 def test_photon_include_country_appends_two_keys() -> None:
     feature = PHOTON_CH["features"][0]
     parsed = photon.parse_feature(feature, include_country=True)
+    # TASK-27:include_country=True 除 country/countrycode 外,还追加行政区级判据
+    # osm_type/type(境外链与 region gate 用它挡「因特拉肯大道」这类同名 POI)。
     assert parsed == {"lat": 46.6863, "lng": 7.8632, "display_name": "Interlaken, Schweiz",
-                      "country": "Schweiz", "countrycode": "CH"}
+                      "country": "Schweiz", "countrycode": "CH",
+                      "osm_type": "R", "type": ""}
     assert photon.parse_features(PHOTON_CH, include_country=True) == [parsed]
-    # 缺国家码 → 空串(不是 None、不抛);countrycode 一律大写
+    # 缺国家码 → 空串(不是 None、不抛);countrycode 一律大写;判据字段缺失也为空串
     missing = photon.parse_feature(PHOTON_NO_COUNTRY["features"][0], include_country=True)
     assert missing["country"] == "" and missing["countrycode"] == ""
+    assert missing["osm_type"] == "" and missing["type"] == ""
+
+
+def test_photon_admin_place_verdict_three_state() -> None:
+    """TASK-27 三态判据:True=行政区级 / False=POI 级同名地物 / None=判据缺失不猜。"""
+    # True:relation + city/state/district…
+    assert photon.admin_place_verdict({"osm_type": "R", "type": "city"}) is True
+    assert photon.admin_place_verdict({"osm_type": "N", "type": "town"}) is True
+    assert photon.admin_place_verdict({"osm_type": "R", "type": "state"}) is True
+    # False:实测的境外中文名错配形态(W/house/street/locality)
+    assert photon.admin_place_verdict({"osm_type": "W", "type": "house"}) is False
+    assert photon.admin_place_verdict({"osm_type": "W", "type": "street"}) is False
+    assert photon.admin_place_verdict({"osm_type": "W", "type": "locality"}) is False
+    assert photon.admin_place_verdict({"osm_type": "R", "type": "house"}) is False
+    # None:判据字段缺失(旧替身/异常响应)→ 不猜,调用方沿用旧口径
+    assert photon.admin_place_verdict({"osm_type": "R"}) is None
+    assert photon.admin_place_verdict({"type": "city"}) is None
+    assert photon.admin_place_verdict({}) is None
+    assert photon.admin_place_verdict(None) is None
+    # is_admin_place 是严格版:只有 True 才算
+    assert photon.is_admin_place({"osm_type": "R", "type": "city"}) is True
+    assert photon.is_admin_place({"osm_type": "R"}) is False
+    assert "city" in photon.ADMIN_PLACE_TYPES and "house" not in photon.ADMIN_PLACE_TYPES
 
 
 def test_photon_client_passes_include_country_through() -> None:

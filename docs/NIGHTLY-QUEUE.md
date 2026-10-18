@@ -1203,6 +1203,24 @@
 
 ---
 
+## [TASK-WORLDMAP] 备忘:高德「世界地图」权限工单(等神朱结果,勿执行)
+
+- 状态: blocked(2026-10-17 神朱拍板:他去高德控制台提工单商务咨询问价;结果回填本条前,夜班执行器**不得启动本条**)
+- 背景: 神朱提供高德「国内国外地图切换」SDK 示例(原生 App 双 SDK 方案,JS 无法直接复用),顺藤查到 **JS API 2.0 官方世界地图能力**(lbs.amap.com/api/javascript-api-v2/guide/map/world-map):
+  - 接入 = 现有 AMap 初始化加 `showOversea: true`,海外显示道路+POI,**覆盖 200+ 国家和地区**;官方验收口径「海外中心点 zoom≥10 不空白」恰是我们 10/10 实测痛点(高德境外栅格 z≥10 全空白);
+  - 坐标系兼容:境外 GCJ-02≡WGS-84,境外轨 OSM/Overpass 数据可直接打 pin 无需转换;
+  - 若拿到权限:**可下线 Leaflet 双轨**(#mapLeaflet/isOverseasTrack 引擎切换/leaflet.css 懒加载/osm.de 瓦片镜像轮换),境内外同引擎同代码;
+  - ⚠️ 门槛:文档明示「高级地图能力,需**工单商务咨询**」,大概率企业认证/付费,个人 key 能否批未知;另有国际站部署(sg/de-webapi.opnavi.com,独立 key 体系),本备忘不涉及;
+  - ⚠️ 它**只解决底图**:高德 REST 检索/geocode 仍只服务境内,境外 POI/geocode/路线(Overpass/Nominatim/OSRM)照旧保留。
+- 决策记录(同日):
+  1. 神朱提工单问价,Leaflet 轨照旧推进(境外修复主线不变,世界地图是「谈下来就简化」的机会项);
+  2. 高德 **MCP Server 不采纳**:16 个能力=我们已直连的境内 REST 的 MCP 包装(给 LLM Agent 用),后端确定性代码走 MCP 反而多一层且对境外零帮助;「生成专属地图/行程导入高德 App」增强神朱裁定**不要**(维持现有 deep-link)。
+- 涉及(若工单批下来): backend/app/static/index.html、/api/map-config(权限开关透出)、境外轨下线改造
+- 验收(届时另立 TASK): 海外中心点 zoom≥10 有图;境外 pin 位置与 OSM 数据吻合;pytest+browser QA
+- 结果: (待神朱工单结果回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 ## [TASK-xxx] 标题
 - 状态: 示例(勿执行;新任务复制本段并改成 pending)

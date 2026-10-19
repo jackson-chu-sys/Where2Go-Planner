@@ -2,7 +2,7 @@
 
 > 📁 **给访客的说明**:本仓库的 `docs/` 目录与根目录下的中文 md/txt(需求文档、开发队列、契约等)是**开发过程记录**,普通用户只需要看这份 README。
 >
-> 🤝 **给接手的开发者/Agent**:先读 [`docs/HANDOVER/README.md`](docs/HANDOVER/README.md)(架构、开发流程、踩坑手册、部署发版、当前状态、配置与密钥,共六份),再看 `AGENTS.md` 速查表。
+> 🤝 **给接手的开发者/Agent**:先读 [`docs/HANDOVER/README.md`](docs/HANDOVER/README.md)(架构、开发流程、踩坑手册、部署发版、当前状态、配置与密钥、换机器重建,共七份)。**换机器接手请直接看 [`07-new-machine-setup.md`](docs/HANDOVER/07-new-machine-setup.md)**;同一台机器接手看 `AGENTS.md` 速查表。
 >
 > 📁 **Note for visitors**: `docs/` and the Chinese markdown/txt files at the repo root are **development-process records**. As a user, you only need this README.
 

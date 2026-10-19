@@ -2,6 +2,8 @@
 
 > 📁 **给访客的说明**:本仓库的 `docs/` 目录与根目录下的中文 md/txt(需求文档、开发队列、契约等)是**开发过程记录**,普通用户只需要看这份 README。
 >
+> 🤝 **给接手的开发者/Agent**:先读 [`docs/HANDOVER/README.md`](docs/HANDOVER/README.md)(架构、开发流程、踩坑手册、部署发版、当前状态、配置与密钥,共六份),再看 `AGENTS.md` 速查表。
+>
 > 📁 **Note for visitors**: `docs/` and the Chinese markdown/txt files at the repo root are **development-process records**. As a user, you only need this README.
 
 以「起点城市 + 距离分段」为核心的自由行目的地发现工具:在地图上按 0-50 / 50-100 / 100-200 / 200-300 / 300-500 km 环形分段浏览目的地(自然风光 / 小城人文美食 / 滑雪场 / 运动四分类),点任意目的地看驾车/铁路/飞机路线对比与费用估算、周边住宿 AI 预估价,收藏后组合成行程方案看总花费,并可一键跳转高德/12306/携程等官方渠道预订(**不代订、不抓实时价**)。支持境外目的地(OSM/Leaflet 双轨)。

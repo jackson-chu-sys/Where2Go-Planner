@@ -1242,6 +1242,39 @@
 
 ---
 
+## [TASK-28] 高德 geocode `level` 判据落码:让 origin_cache 脏行能自愈(交接后 P0)
+
+- 状态: pending(交接给新机器 Agent;**本机不排夜班,需要会话里直接做**)
+- 目标: 境内地理编码采信前加 `level` 判据 —— 真行政区(省/市/区县)才写 `origin_cache`,POI 级吸附(兴趣点/道路/村庄)不写或写短 TTL,让下次搜索能重新解析。解决「一次误判错 7 天」的存量问题。
+- 背景数据(2026-10-18 实测 12/12 正确,零额外请求 0.05s):上海→省、崇礼→区县;因特拉肯→兴趣点、北海道→道路、东京→村庄、新加坡→村庄、苏黎世→兴趣点。
+- 涉及: backend/data_sources/amap.py、backend/services/place_loader.py、对应 test_*.py
+- 验收: 单测覆盖「真城市采信 / POI 吸附不采信 / 字段缺失沿用旧行为」三态;全量 pytest 不回归(当前 1739);构造一行假脏数据验证第二次搜索自愈。
+- 结果: (待回填)
+
+---
+
+## [TASK-29] 无代理环境下境外链路的可读提示(交接后 P0,新机器无代理特有)
+
+- 状态: pending(同上,会话内直接做)
+- 目标: 无代理时搜境外城市,当前返回 400 + 英文异常(Nominatim `Network is unreachable` / Overpass `502`)。改为中文可读提示(如「当前环境未配置代理,境外目的地暂不可用」),release UI 不暴露技术细节。
+- **不许**: 改成静默返回空列表 —— 用户会误以为「这里没有地方可去」。
+- 涉及: backend/services/place_loader.py(失败聚合)、backend/services/region_gate.py、backend/app/static/index.html(提示样式)、测试
+- 验收: 无代理下 `curl "localhost:8000/api/geocode?city=苏黎世&region=overseas"` 返回中文提示;配 `WHERE2GO_PROXY_NOMINATIM=<代理>` 做对照时有代理行为不变;pytest 不回归。
+- 结果: (待回填)
+
+---
+
+## [TASK-30] 容器冒烟 + 打 v1.0.0(交接后 P0,发版收尾)
+
+- 状态: pending(同上)
+- 目标: `v0.2.0-beta` 镜像已发布且含全部修复,但正式版未打(原计划=beta 真机冒烟通过后再打 v1.0.0)。在新机器 `docker compose up -d` 起 `:latest`,按 docs/HANDOVER/04-deploy-release.md 冒烟清单验完,申请 push 授权后打 tag `v1.0.0`。
+- 冒烟清单: /api/health=ok;首页 200 且 release UI;`/api/places/meta` 的 ui_mode=release;境内搜一个城市出 pin;`docker compose down && up -d` 后数据与配置不丢。
+- 涉及: 无代码改动;docker-compose.yml、.github/workflows/release.yml、README 版本号
+- 验收: GHCR 出现 `1.0.0` tag 且 manifests 含 amd64+arm64;README 版本说明同步。
+- 结果: (待回填)
+
+---
+
 ## 追加模板(新任务复制此段)
 ## [TASK-xxx] 标题
 - 状态: 示例(勿执行;新任务复制本段并改成 pending)
